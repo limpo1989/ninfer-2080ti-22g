@@ -41,6 +41,7 @@ Runtime and Op references:
 
 - [Small-scale concurrent inference architecture](maintainer/concurrent-inference-architecture.md)
 - [Paged KV context storage, ownership, and capacity model](maintainer/paged-kv-cache.md)
+- [KVarN structured KV records](maintainer/kvarn-records.md)
 - [Op admission, contracts, ownership, qualification, and performance rules](maintainer/op-development.md)
 - [ReplaySSM GDN technical reference](maintainer/replayssm-gdn.md)
 - [Linear benchmark contract and registered suites](maintainer/linear-benchmark.md)
