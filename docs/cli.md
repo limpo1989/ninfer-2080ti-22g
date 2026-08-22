@@ -140,7 +140,7 @@ measured recommendation rather than a semantic limit.
 | `--prefill-chunk N` | positive text-prefill chunk, in multiples of 128 | `1024` |
 | `--max-new N` | requested output-token limit | `128` |
 | `--device N` | CUDA device index | `0` |
-| `--kv-dtype bf16\|int8` | KV-cache storage | `bf16` |
+| `--kv-dtype bf16\|int8\|kvarn\|kvarn-k4v4` | KV-cache storage | `bf16` |
 | `--spec mtp\|dflash` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; DFlash `1..15` | unset |
 | `--lm-head-draft` | optimized proposal head | off |
@@ -183,7 +183,29 @@ Run `./build/apps/ninfer --help` for the exact option contract.
 The registered model IDs have a native context limit of 262,144 tokens. The practical
 allocation on one RTX 5090 depends on the selected artifact, media workload, output budget, and
 KV-cache type.
-Use `--kv-dtype int8` for large context allocations. The prepared prompt must fit
+Use `--kv-dtype int8` for large context allocations, or `--kv-dtype kvarn` for the largest ones.
+The four storage options cost, per context token on the 27B geometry:
+
+| `--kv-dtype` | KiB/token | Relative to BF16 |
+|---|---:|---:|
+| `bf16` | 64.0 | 1.00x |
+| `int8` | 33.0 | 0.52x |
+| `kvarn-k4v4` | 17.9 | 0.28x |
+| `kvarn` (`kvarn-k4v2`) | 13.9 | 0.22x |
+
+KVarN keeps each sequence's first 128 positions and its still-filling 64-token tail page in an
+unquantized BF16 stage buffer, and compresses every complete page between them into one structured
+record; see [KVarN structured KV records](maintainer/kvarn-records.md). The stage buffer is a fixed
+cost independent of `--max-context`, so KVarN's advantage grows with the context you ask for. It is
+a capacity format, not a speed one: decode throughput is slightly ahead of BF16 (17.9 vs 15.2 tok/s
+on a 24,920-token prompt), but prefill is slower and falls further behind as the prompt grows
+(0.80x BF16 at 10k tokens, 0.64x at 25k), because the record attention kernel rescans history per
+query token instead of tiling the query. Prefer KVarN when the context you need does not fit
+otherwise, not to make a prompt that already fits go faster.
+`--spec dflash` is rejected under KVarN because DFlash's context append needs a per-token BF16
+plane; `--spec mtp` works normally.
+
+The prepared prompt must fit
 `--max-context`; generation stops at the remaining context capacity when necessary.
 `--kv-capacity N` controls the shared physical Main Text KV pool independently and is rounded up to
 the 64-token page size. `--kv-capacity auto` loads the selected weights, measures the remaining GPU

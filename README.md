@@ -25,8 +25,11 @@ NInfer uses standalone `.ninfer` container artifacts embedding packed weights an
 On an RTX 2080 Ti 22GB (~22,528 MiB addressable), available device memory is allocated between model weights, speculative draft structures, CUDA runtime workspaces, and the paged KV cache pool.
 
 ### 1. KV Cache Quantization: `--kv-dtype int8` (Recommended)
-- **INT8 Group-64 (`--kv-dtype int8`)**: Consumes **~33.8 KiB per token** (~33 MiB per 1,000 context tokens on 27B), halving KV memory footprint relative to BF16.
 - **BF16 (`--kv-dtype bf16`)**: Consumes **64.0 KiB per token** (64 MiB per 1,000 context tokens on 27B).
+- **INT8 Group-64 (`--kv-dtype int8`)**: Consumes **33.0 KiB per token**, halving KV memory footprint relative to BF16.
+- **KVarN (`--kv-dtype kvarn`, 4-bit key / 2-bit value)**: Consumes **13.9 KiB per token**, ~4.6x smaller than BF16. `--kv-dtype kvarn-k4v4` (4-bit value) costs 17.9 KiB per token.
+
+KVarN keeps each sequence's first 128 positions and its still-filling tail page unquantized in BF16 and compresses every complete 64-token page into one structured record, so the extra fixed cost is independent of `--max-context` and its advantage grows with context length. It is a **capacity** format, not a speed one — decode is marginally faster than BF16, but prefill is slower and the gap widens with prompt length (0.80x BF16 at 10K tokens, 0.64x at 25K). `--spec dflash` is not supported under KVarN; `--spec mtp` is.
 
 ### 2. Context Limits & Concurrency
 

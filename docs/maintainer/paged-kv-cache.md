@@ -19,7 +19,7 @@ Op 的状态效果、kernel 寻址约束和性能准入条件。具体 allocator
 - active request 一旦 admission，其声明范围内的 prefill、decode 和 speculative temporary growth
   都有 completion capacity guarantee；
 - 一个 GPU execution unit 期间，page mappings 和 logical valid frontiers 保持稳定；
-- BF16、INT8-G64 以及 target 定义的其他固定 bytes-per-token layouts 使用同一管理语义；
+- BF16、INT8-G64、KVarN record 以及 target 定义的其他固定 bytes-per-token layouts 使用同一管理语义；
 - common allocator 不理解 GQA、MHA、MLA、MTP 或 DFlash 等模型语义；
 - single-sequence prefill/cached consumers 和 batched ordinary/MTP/DFlash decode consumers 都直接消费
   paged KV，不要求任何 sequence 的 growing KV 物理连续；
@@ -240,8 +240,8 @@ allocator、runtime repartition 或 compaction。
 
 | Pool | Grouped planes | Pool frontier |
 |---|---|---|
-| Main Text | 所有 target full-attention layers 的 K、V 和 optional code/scale planes | target materialized KV frontier |
-| MTP | MTP layer 的 K、V 和 optional code/scale planes | MTP KV frontier |
+| Main Text | 所有 target full-attention layers 的 K、V 和 optional code/scale planes，或 KVarN 下每层一个 record plane | target materialized KV frontier |
+| MTP | MTP layer 的 K、V 和 optional code/scale planes，或 KVarN 下一个 record plane | MTP KV frontier |
 | DFlash Full | DFlash full-context layer 的 K、V planes | DFlash context frontier |
 
 Text、MTP 和 DFlash 不组成同一个 physical page group，因为它们可以具有不同 valid/provisional
@@ -265,10 +265,14 @@ Consumer 对 K/V plane 使用统一的逻辑坐标 `K/V[d,h,p]`。Physical axis 
 固定，不由 allocator 或单次 request 选择：
 
 ```text
-Pool            K/V or code plane       INT8-G64 scale plane
-Main Text/MTP   [D, P, Hkv, Nphysical]  [D/64, P, Hkv, Nphysical]
-DFlash Full     [D, P, Nphysical, Hkv]  not used
+Pool            K/V or code plane       INT8-G64 scale plane    KVarN record plane
+Main Text/MTP   [D, P, Hkv, Nphysical]  [D/64, P, Hkv, Nphysical]  [slot_bytes, P, Hkv, Nphysical]
+DFlash Full     [D, P, Nphysical, Hkv]  not used                   not supported
 ```
+
+KVarN 把整个 page 的 K 与 V 合并成一条 record，因此它是**每层一个 plane**（U8），而不是 K/V 两个；
+`slot_bytes = record_bytes / P` 是整数，所以它仍然是普通的 page-major plane，寻址公式不变。KVarN 的
+未量化 sink 与尾页不在 pool 中，见 [KVarN 结构化 KV 记录](kvarn-records.md) §4。
 
 Main Text/MTP 使用 contiguous page-major order。对 element bytes `E` 和第一维 extent `X`（K/V/code
 为 `D`，scale 为 `D/64`）：
@@ -363,7 +367,14 @@ BF16 bytes/token
 INT8-G64 bytes/token
     = 2(K,V) * L * H * D
     + 2(K,V) * L * H * (D/64) * sizeof(FP16 scale)
+
+KVarN bytes/token
+    = L * H * (kvarn_record_bytes(D, format) / P)
 ```
+
+KVarN 另有一块与 `max_context` 无关的固定 stage 开销
+`2(K,V) * L * H * D * kKvarnStageTokens * table_rows * 2`，它不属于任何 pool；因此 KVarN 相对 BF16 的
+容量优势随 `max_context` 单调变好。
 
 一个 homogeneous pool 的 logical page-group payload 是其全部 grouped planes 的 bytes/token 之和乘以
 该 pool 的 `P`。Startup physical pool bytes 则由 registered plane storage spans 之和再加 slab/head
