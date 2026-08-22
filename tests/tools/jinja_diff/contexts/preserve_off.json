@@ -1,0 +1,22 @@
+{
+  "messages": [
+    {
+      "role": "system",
+      "content": "Be precise."
+    },
+    {
+      "role": "user",
+      "content": "Hello there."
+    },
+    {
+      "role": "assistant",
+      "content": "<think>\nponder\n</think>\n\nHi!"
+    },
+    {
+      "role": "user",
+      "content": "Now do it."
+    }
+  ],
+  "preserve_thinking": false,
+  "add_generation_prompt": true
+}

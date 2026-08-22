@@ -235,6 +235,15 @@ int main() {
     failures += check(!secret_present, "startup argv retained the API key");
     failures += check(redaction_present, "startup argv omitted the API-key redaction marker");
 
+    const ServeOptions templated =
+        parse({"ninfer-serve", "model.ninfer", "--chat-template", "custom/tpl.jinja"});
+    failures += check(templated.chat_template_path == "custom/tpl.jinja",
+                      "--chat-template did not preserve its path");
+    failures += check(parse({"ninfer-serve", "model.ninfer"}).chat_template_path.empty(),
+                      "omitted --chat-template did not leave the artifact template in use");
+    failures += check(serve_usage_text("ninfer-serve").find("--chat-template") != std::string::npos,
+                      "serve help omits --chat-template");
+
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

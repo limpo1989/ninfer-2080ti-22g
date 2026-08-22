@@ -1,10 +1,13 @@
 #pragma once
 
+#include "targets/qwen3_6/impl/frontend/jinja.h"
+
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
 #include <ninfer/types.h>
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <utility>
@@ -92,10 +95,17 @@ struct RenderedChat {
 enum class ChatTemplateSemantics : std::uint8_t {
     ThinkingToggle,
     ReasoningEffort,
+    // Any template outside the built-in allowlist: rendered by interpreting the
+    // Jinja source rather than by a C++ transcription of it.
+    Interpreted,
 };
 
 class CompiledChatTemplate {
 public:
+    // Recognises the two built-in templates by sha256 and renders them through
+    // the verified C++ transcriptions. Any other template is parsed and
+    // interpreted, which is what makes a user-supplied chat template usable.
+    // Throws std::invalid_argument if the source is not valid Jinja.
     [[nodiscard]] static CompiledChatTemplate resolve(std::string_view source,
                                                       ChatStyle chat_style = ChatStyle::Default);
 
@@ -114,8 +124,14 @@ private:
                                   ChatStyle chat_style = ChatStyle::Default) noexcept
         : semantics_(semantics), chat_style_(chat_style) {}
 
+    [[nodiscard]] RenderedChat render_interpreted(const std::vector<ChatMessage>& messages,
+                                                  const ChatRenderOptions& options) const;
+
     ChatTemplateSemantics semantics_;
     ChatStyle chat_style_ = ChatStyle::Default;
+    // Set only when semantics_ == Interpreted.
+    std::shared_ptr<const jinja::Template> program_;
+    PromptCapabilities interpreted_capabilities_;
 };
 
 } // namespace ninfer::targets::qwen3_6::frontend_internal

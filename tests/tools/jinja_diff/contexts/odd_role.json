@@ -1,0 +1,17 @@
+{
+  "messages": [
+    {
+      "role": "user",
+      "content": "a"
+    },
+    {
+      "role": "critic",
+      "content": "b"
+    },
+    {
+      "role": "user",
+      "content": "c"
+    }
+  ],
+  "add_generation_prompt": true
+}

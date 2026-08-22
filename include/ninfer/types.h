@@ -96,6 +96,9 @@ struct EngineOptions {
     bool use_cuda_graph                    = true;
     LoadProgress load_progress;
     ChatStyle chat_style                   = ChatStyle::Default;
+    // Optional Jinja chat template replacing the one inside the artifact.
+    // Empty means use the artifact's own frontend/chat_template.jinja.
+    std::string chat_template_override;
 };
 
 enum class SamplingMode : std::uint8_t {

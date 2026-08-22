@@ -1,0 +1,21 @@
+{
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "image"
+        },
+        {
+          "type": "text",
+          "text": "what is this"
+        },
+        {
+          "type": "video"
+        }
+      ]
+    }
+  ],
+  "add_vision_id": true,
+  "add_generation_prompt": true
+}

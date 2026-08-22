@@ -76,6 +76,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--vision] [--no-cuda-graph] [--no-prefix-reuse] "
            "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--cors] "
            "[--chat-style default|sharp-v22.1] "
+           "[--chat-template <file.jinja>] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
            "       serves OpenAI Responses/Chat Completions and Anthropic Messages endpoints\n"
@@ -232,6 +233,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.speculative.proposal_head = ProposalHead::Optimized;
         } else if (arg == "--no-thinking") {
             options.enable_thinking = false;
+        } else if (arg == "--chat-template") {
+            options.chat_template_path = require_value("--chat-template");
         } else if (arg == "--chat-style") {
             const std::string value = require_value("--chat-style");
             if (value == "default") {

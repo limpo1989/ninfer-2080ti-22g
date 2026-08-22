@@ -4,6 +4,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cctype>
 #include <stdexcept>
@@ -296,6 +297,182 @@ std::string_view resolve_sharp_reasoning_instructions(const ChatRenderOptions& o
     throw std::invalid_argument("invalid reasoning effort");
 }
 
+
+// --- interpreted-template support -----------------------------------------
+
+namespace jj = jinja;
+
+std::string_view reasoning_effort_name(ReasoningEffort effort) {
+    switch (effort) {
+    case ReasoningEffort::None:
+        return "none";
+    case ReasoningEffort::Minimal:
+        return "minimal";
+    case ReasoningEffort::Low:
+        return "low";
+    case ReasoningEffort::Medium:
+        return "medium";
+    case ReasoningEffort::High:
+        return "high";
+    case ReasoningEffort::XHigh:
+        return "xhigh";
+    case ReasoningEffort::Max:
+        return "max";
+    }
+    throw std::invalid_argument("invalid reasoning effort");
+}
+
+std::string_view chat_role_name(ChatRole role) {
+    switch (role) {
+    case ChatRole::System:
+        return "system";
+    case ChatRole::Developer:
+        return "developer";
+    case ChatRole::User:
+        return "user";
+    case ChatRole::Assistant:
+        return "assistant";
+    case ChatRole::Tool:
+        return "tool";
+    }
+    throw std::invalid_argument("unsupported chat role value");
+}
+
+jj::Value json_to_jinja(const OrderedJson& node) {
+    if (node.is_null()) { return jj::Value::none(); }
+    if (node.is_boolean()) { return jj::Value::boolean(node.get<bool>()); }
+    if (node.is_number_integer() || node.is_number_unsigned()) {
+        return jj::Value::integer(node.get<std::int64_t>());
+    }
+    if (node.is_number_float()) { return jj::Value::number(node.get<double>()); }
+    if (node.is_string()) { return jj::Value::string(node.get<std::string>()); }
+    if (node.is_array()) {
+        jj::Array items;
+        items.reserve(node.size());
+        for (const OrderedJson& item : node) { items.push_back(json_to_jinja(item)); }
+        return jj::Value::array(std::move(items));
+    }
+    jj::Object entries;
+    for (auto it = node.begin(); it != node.end(); ++it) {
+        entries.emplace_back(it.key(), json_to_jinja(it.value()));
+    }
+    return jj::Value::object(std::move(entries));
+}
+
+// Message content is a plain string unless the turn carries media, in which
+// case it becomes the list-of-parts form that templates branch on.
+jj::Value message_content_value(const ChatMessage& message) {
+    if (!message.has_media()) { return jj::Value::string(message.rendered_content()); }
+    jj::Array parts;
+    for (const ChatPart& part : message.parts) {
+        jj::Object entry;
+        switch (part.kind) {
+        case ChatPartKind::Text:
+            entry.emplace_back("type", jj::Value::string("text"));
+            entry.emplace_back("text", jj::Value::string(part.text));
+            break;
+        case ChatPartKind::Image:
+            entry.emplace_back("type", jj::Value::string("image"));
+            break;
+        case ChatPartKind::Video:
+            entry.emplace_back("type", jj::Value::string("video"));
+            break;
+        }
+        parts.push_back(jj::Value::object(std::move(entry)));
+    }
+    return jj::Value::array(std::move(parts));
+}
+
+jj::Value tool_calls_value(const std::vector<ToolCall>& calls) {
+    jj::Array rendered;
+    for (const ToolCall& call : calls) {
+        jj::Object function;
+        function.emplace_back("name", jj::Value::string(call.name));
+        // Templates expect a mapping so they can iterate `.items()`; fall back to
+        // the raw string when the payload is not a JSON object.
+        jj::Value arguments = jj::Value::string(call.arguments_json);
+        if (!call.arguments_json.empty()) {
+            try {
+                const OrderedJson parsed = OrderedJson::parse(call.arguments_json);
+                if (parsed.is_object()) { arguments = json_to_jinja(parsed); }
+            } catch (const OrderedJson::exception&) {
+                // Keep the string form.
+            }
+        }
+        function.emplace_back("arguments", std::move(arguments));
+
+        jj::Object entry;
+        if (!call.id.empty()) { entry.emplace_back("id", jj::Value::string(call.id)); }
+        entry.emplace_back("type", jj::Value::string("function"));
+        entry.emplace_back("function", jj::Value::object(std::move(function)));
+        rendered.push_back(jj::Value::object(std::move(entry)));
+    }
+    return jj::Value::array(std::move(rendered));
+}
+
+jj::Value build_render_context(const std::vector<ChatMessage>& messages,
+                               const ChatRenderOptions& options) {
+    jj::Array rendered_messages;
+    for (const ChatMessage& message : messages) {
+        jj::Object entry;
+        entry.emplace_back("role", jj::Value::string(std::string(chat_role_name(message.role))));
+        entry.emplace_back("content", message_content_value(message));
+        if (!message.reasoning_content.empty()) {
+            entry.emplace_back("reasoning_content", jj::Value::string(message.reasoning_content));
+        }
+        if (!message.tool_calls.empty()) {
+            entry.emplace_back("tool_calls", tool_calls_value(message.tool_calls));
+        }
+        if (!message.tool_call_id.empty()) {
+            entry.emplace_back("tool_call_id", jj::Value::string(message.tool_call_id));
+        }
+        rendered_messages.push_back(jj::Value::object(std::move(entry)));
+    }
+
+    jj::Object context;
+    context.emplace_back("messages", jj::Value::array(std::move(rendered_messages)));
+    context.emplace_back("add_generation_prompt", jj::Value::boolean(options.add_generation_prompt));
+    context.emplace_back("enable_thinking", jj::Value::boolean(options.enable_thinking));
+    context.emplace_back("add_vision_id", jj::Value::boolean(options.add_vision_id));
+    if (options.reasoning_effort) {
+        context.emplace_back(
+            "reasoning_effort",
+            jj::Value::string(std::string(reasoning_effort_name(*options.reasoning_effort))));
+    }
+    if (options.preserve_thinking) {
+        context.emplace_back("preserve_thinking", jj::Value::boolean(*options.preserve_thinking));
+    }
+    if (!options.tool_jsons.empty()) {
+        jj::Array tools;
+        for (const std::string& tool : options.tool_jsons) {
+            tools.push_back(json_to_jinja(OrderedJson::parse(tool)));
+        }
+        context.emplace_back("tools", jj::Value::array(std::move(tools)));
+    }
+    return jj::Value::object(std::move(context));
+}
+
+// A custom template only honours an option if it actually reads the
+// corresponding variable, so the advertised capabilities are derived from the
+// names the parsed template references rather than assumed.
+PromptCapabilities derive_capabilities(const jj::Template& program) {
+    const std::vector<std::string>& globals = program.referenced_globals();
+    const auto reads = [&](std::string_view name) {
+        return std::find(globals.begin(), globals.end(), name) != globals.end();
+    };
+
+    PromptCapabilities result;
+    result.enable_thinking = reads("enable_thinking");
+    if (reads("reasoning_effort")) {
+        result.reasoning_effort.low            = true;
+        result.reasoning_effort.medium         = true;
+        result.reasoning_effort.high           = true;
+        result.reasoning_effort.xhigh          = true;
+        result.reasoning_effort.default_effort = ReasoningEffort::Medium;
+    }
+    return result;
+}
+
 } // namespace
 
 bool ChatMessage::has_media() const noexcept {
@@ -341,11 +518,21 @@ CompiledChatTemplate CompiledChatTemplate::resolve(std::string_view source,
     if (digest == kReasoningEffortTemplateDigest) {
         return CompiledChatTemplate(ChatTemplateSemantics::ReasoningEffort, chat_style);
     }
-    throw std::invalid_argument("unsupported frontend/chat_template.jinja (sha256 " +
-                                sha256_hex(digest) + ")");
+    // Not one of the transcribed templates: interpret it. This is the path a
+    // user-supplied template takes.
+    CompiledChatTemplate compiled(ChatTemplateSemantics::Interpreted, chat_style);
+    try {
+        compiled.program_ = std::make_shared<jinja::Template>(jinja::Template::parse(source));
+    } catch (const jinja::Error& error) {
+        throw std::invalid_argument("failed to parse chat template (sha256 " + sha256_hex(digest) +
+                                    "): " + error.what());
+    }
+    compiled.interpreted_capabilities_ = derive_capabilities(*compiled.program_);
+    return compiled;
 }
 
 PromptCapabilities CompiledChatTemplate::capabilities() const noexcept {
+    if (semantics_ == ChatTemplateSemantics::Interpreted) { return interpreted_capabilities_; }
     PromptCapabilities result;
     result.enable_thinking = true;
     if (semantics_ == ChatTemplateSemantics::ReasoningEffort) {
@@ -364,6 +551,10 @@ PromptCapabilities CompiledChatTemplate::capabilities() const noexcept {
 RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messages,
                                           ChatRenderOptions options) const {
     if (messages.empty()) { throw std::invalid_argument("chat messages must not be empty"); }
+
+    if (semantics_ == ChatTemplateSemantics::Interpreted) {
+        return render_interpreted(messages, options);
+    }
 
     const bool effort_template = semantics_ == ChatTemplateSemantics::ReasoningEffort;
     const std::string_view reasoning_instructions =
@@ -498,6 +689,30 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         }
     }
     return RenderedChat{.text = std::move(rendered), .rewrite_checkpoint = rewrite_checkpoint};
+}
+
+RenderedChat CompiledChatTemplate::render_interpreted(const std::vector<ChatMessage>& messages,
+                                                      const ChatRenderOptions& options) const {
+    std::string text;
+    try {
+        text = program_->render(build_render_context(messages, options));
+    } catch (const jinja::Error& error) {
+        throw std::invalid_argument(std::string("chat template failed to render: ") +
+                                    error.what());
+    }
+
+    // The rendered prefix ends exactly where generation begins, so the response
+    // replay frontier is the end of the text. This holds for any template and
+    // matches what the transcribed renderers emit under preserve_thinking. The
+    // TurnClosure checkpoint is deliberately not synthesised: locating the final
+    // assistant turn would require assumptions about the template's markup, and
+    // omitting it only forgoes a prefix-reuse optimisation.
+    std::optional<RewriteCheckpointByteSpec> rewrite_checkpoint;
+    if (options.add_generation_prompt) {
+        rewrite_checkpoint = RewriteCheckpointByteSpec{
+            .kind = RewriteCheckpointKind::ResponseReplay, .offset = text.size()};
+    }
+    return RenderedChat{.text = std::move(text), .rewrite_checkpoint = rewrite_checkpoint};
 }
 
 } // namespace ninfer::targets::qwen3_6::frontend_internal

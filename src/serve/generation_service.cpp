@@ -7,11 +7,36 @@
 
 #include <algorithm>
 #include <chrono>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
 #include <cstddef>
 #include <mutex>
 #include <stdexcept>
 #include <string>
 #include <utility>
+
+namespace {
+
+// Reads an overriding chat template from disk. Returns an empty string when no
+// override was requested, which leaves the artifact's own template in use.
+std::string load_chat_template(const std::filesystem::path& path) {
+    if (path.empty()) { return {}; }
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+        throw std::invalid_argument("cannot open --chat-template file: " + path.string());
+    }
+    std::ostringstream buffer;
+    buffer << input.rdbuf();
+    std::string source = buffer.str();
+    if (source.empty()) {
+        throw std::invalid_argument("--chat-template file is empty: " + path.string());
+    }
+    return source;
+}
+
+} // namespace
+
 
 namespace ninfer::serve {
 
@@ -243,6 +268,7 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.media_preprocess_threads = options_.media_preprocess_threads;
     engine_options.load_progress            = std::move(load_progress);
     engine_options.chat_style               = options_.chat_style;
+    engine_options.chat_template_override   = load_chat_template(options_.chat_template_path);
     engine_              = std::make_unique<ninfer::Engine>(std::move(engine_options));
     prompt_capabilities_ = engine_->prompt_capabilities();
     request_capacity_    = std::make_shared<RequestCapacity>(

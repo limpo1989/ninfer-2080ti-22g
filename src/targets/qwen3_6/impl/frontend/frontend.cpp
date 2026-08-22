@@ -180,7 +180,7 @@ fi::ProcessorOptions processor_options(const FrontendResources& resources) {
     return options;
 }
 
-void validate_tokenizer_config(const FrontendResources& resources) {
+void validate_tokenizer_config(const FrontendResources& resources, bool template_overridden) {
     const Json tokenizer_config =
         parse_resource_json(resources.tokenizer_config_json, "tokenizer_config.json");
     if (tokenizer_config.value("add_bos_token", true) ||
@@ -198,17 +198,25 @@ void validate_tokenizer_config(const FrontendResources& resources) {
         throw std::invalid_argument(
             "tokenizer_config.json.chat_template must contain the loaded chat template");
     }
-    if (tokenizer_config.at("chat_template").get_ref<const std::string&>() !=
-        resources.chat_template_jinja) {
+    if (!template_overridden &&
+        tokenizer_config.at("chat_template").get_ref<const std::string&>() !=
+            resources.chat_template_jinja) {
         throw std::invalid_argument(
             "tokenizer_config.json.chat_template does not match frontend/chat_template.jinja");
     }
 }
 
 fi::CompiledChatTemplate compile_chat_template(const FrontendResources& resources,
-                                            ChatStyle chat_style) {
-    validate_tokenizer_config(resources);
-    return fi::CompiledChatTemplate::resolve(resources.chat_template_jinja, chat_style);
+                                              ChatStyle chat_style,
+                                              const std::string& chat_template_override) {
+    const bool overridden = !chat_template_override.empty();
+    validate_tokenizer_config(resources, overridden);
+    // An overriding template is deliberately different from the artifact's, so it
+    // never matches the built-in digests and always takes the interpreted path.
+    return fi::CompiledChatTemplate::resolve(
+        overridden ? std::string_view(chat_template_override)
+                   : std::string_view(resources.chat_template_jinja),
+        chat_style);
 }
 
 [[noreturn]] void throw_processor_error(const fi::ProcessorError& error) {
@@ -597,7 +605,7 @@ DecoderState terminal_state(DecoderState state) {
 class Frontend::Impl {
 public:
     Impl(const FrontendResources& resources, bool registered_checkpoint, FrontendOptions options)
-        : chat_template(compile_chat_template(resources, options.chat_style)),
+        : chat_template(compile_chat_template(resources, options.chat_style, options.chat_template_override)),
           tokenizer(std::make_shared<const fi::Tokenizer>(
               fi::TokenizerResources{.tokenizer_json         = resources.tokenizer_json,
                                      .tokenizer_config_json  = resources.tokenizer_config_json,

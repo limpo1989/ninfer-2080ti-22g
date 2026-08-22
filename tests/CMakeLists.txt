@@ -322,3 +322,10 @@ ninfer_add_test(ninfer_qwen3_6_chat_template_sharp_test
 target_include_directories(ninfer_qwen3_6_chat_template_sharp_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/impl)
+
+ninfer_add_test(ninfer_qwen3_6_jinja_chat_template_test
+  SOURCES targets/qwen3_6/test_jinja_chat_template.cpp
+  LIBRARIES ninfer_engine ninfer_core)
+target_include_directories(ninfer_qwen3_6_jinja_chat_template_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/impl)

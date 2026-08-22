@@ -1,0 +1,18 @@
+{
+  "messages": [
+    {
+      "role": "user",
+      "content": "q"
+    },
+    {
+      "role": "assistant",
+      "content": "answer",
+      "reasoning_content": "because"
+    },
+    {
+      "role": "user",
+      "content": "more"
+    }
+  ],
+  "add_generation_prompt": true
+}

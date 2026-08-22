@@ -1,0 +1,39 @@
+{
+  "messages": [
+    {
+      "role": "system",
+      "content": "Be precise."
+    },
+    {
+      "role": "user",
+      "content": "Hello there."
+    },
+    {
+      "role": "assistant",
+      "content": "<think>\nponder\n</think>\n\nHi!"
+    },
+    {
+      "role": "user",
+      "content": "Now do it."
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "f",
+        "description": "d",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "x": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    }
+  ],
+  "auto_disable_thinking_with_tools": true,
+  "add_generation_prompt": true
+}

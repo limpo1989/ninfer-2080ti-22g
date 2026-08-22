@@ -1,0 +1,26 @@
+{
+  "add_generation_prompt": true,
+  "reasoning_effort": "high",
+  "tools": [
+    {"type": "function", "function": {"name": "read_file",
+      "description": "Read a file from disk",
+      "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "lines": {"type": "integer"}}, "required": ["path"]}}},
+    {"type": "function", "function": {"name": "run", "description": "Run a shell command",
+      "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}}}}
+  ],
+  "messages": [
+    {"role": "system", "content": "You are a careful engineer."},
+    {"role": "user", "content": "Fix the build."},
+    {"role": "assistant", "content": "<think>\nI should look at the file first.\n</think>\n\nLet me check.",
+     "tool_calls": [
+       {"type": "function", "function": {"name": "read_file", "arguments": {"path": "src/main.cpp", "lines": 40}}},
+       {"type": "function", "function": {"name": "run", "arguments": "{\"cmd\": \"make\"}"}}
+     ]},
+    {"role": "tool", "content": "int main() { return 0; }"},
+    {"role": "tool", "content": "fatal: no rule to make target 'all'. exit code: 2"},
+    {"role": "assistant", "content": "<think>\nThat failed.\n</think>\n\nRetrying.",
+     "tool_calls": [{"function": {"name": "run", "arguments": {"cmd": "make clean"}}}]},
+    {"role": "tool", "content": "error: still broken"},
+    {"role": "user", "content": "Try harder."}
+  ]
+}

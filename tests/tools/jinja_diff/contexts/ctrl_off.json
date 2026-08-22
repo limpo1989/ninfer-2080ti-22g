@@ -1,0 +1,13 @@
+{
+  "messages": [
+    {
+      "role": "system",
+      "content": "sys <|think_off|>"
+    },
+    {
+      "role": "user",
+      "content": "hi"
+    }
+  ],
+  "add_generation_prompt": true
+}

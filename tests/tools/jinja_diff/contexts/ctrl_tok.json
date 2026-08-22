@@ -1,0 +1,9 @@
+{
+  "messages": [
+    {
+      "role": "user",
+      "content": "<|think_xhigh|> go deep"
+    }
+  ],
+  "add_generation_prompt": true
+}

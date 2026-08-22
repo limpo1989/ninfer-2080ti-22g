@@ -55,6 +55,8 @@ struct ServeOptions {
     SamplingOverrides sampling_overrides;
     bool greedy = false; // --greedy: force temperature 0 (exact argmax)
     ChatStyle chat_style = ChatStyle::Default;
+    // Path to a Jinja chat template replacing the artifact's own.
+    std::filesystem::path chat_template_path;
 
     // Exact process argv for the server-start record. Secret-bearing option values are redacted
     // while parsing; this is provenance only and never affects execution.

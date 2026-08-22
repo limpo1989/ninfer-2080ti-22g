@@ -21,6 +21,8 @@ struct FrontendOptions {
     std::size_t media_live_bytes           = kDefaultMediaLiveBytes;
     std::uint32_t media_preprocess_threads = 0;
     ChatStyle chat_style                   = ChatStyle::Default;
+    // Jinja source overriding the artifact's chat template; empty to keep it.
+    std::string chat_template_override;
 };
 
 struct FrontendResources;
