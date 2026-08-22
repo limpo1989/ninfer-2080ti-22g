@@ -125,6 +125,7 @@ Package::Frontend Package::make_frontend(const LoadedModel& model, const EngineO
                                       .media_live_bytes         = options.media_live_bytes,
                                       .media_preprocess_threads = options.media_preprocess_threads,
                                       .chat_style                = options.chat_style,
+                                      .chat_template_override = options.chat_template_override,
                                   });
 }
 
