@@ -83,6 +83,12 @@ void test_filters_and_tests() {
     expect_eq("tojson keeps utf8", render("{{ {'k': 'ok \xE2\x9A\xA0'} | tojson }}", ctx),
               "{\"k\": \"ok \xE2\x9A\xA0\"}");
 
+    // Autoescaping is off, so `safe` is an identity. Both shipped templates apply
+    // it after `tojson` when rendering a non-string tool-call argument, so a
+    // missing `safe` breaks tool calls specifically.
+    expect_eq("safe is an identity", render("{{ {'a': [1, 2]} | tojson | safe }}", ctx),
+              "{\"a\": [1, 2]}");
+
     expect_eq("defined tests", render("{{ missing is defined }}{{ missing is undefined }}", ctx),
               "FalseTrue");
     expect_eq("type tests", render("{{ 'a' is string }}{{ [1] is mapping }}{{ [1] is iterable }}",

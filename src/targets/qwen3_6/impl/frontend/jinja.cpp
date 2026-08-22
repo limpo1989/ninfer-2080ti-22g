@@ -2105,6 +2105,10 @@ private:
         const std::vector<Value> args = evaluate_args(expr);
 
         if (name == "string") { return Value::string(value.to_display_string()); }
+        // Autoescaping is off, so `safe` only marks a value as already-escaped
+        // and is an identity here. Chat templates apply it after `tojson` when
+        // rendering non-string tool-call arguments.
+        if (name == "safe") { return value; }
         if (name == "trim") { return Value::string(trim_both(value.to_display_string())); }
         if (name == "lower" || name == "upper" || name == "replace") {
             return call_string_method(value.to_display_string(), name, args);
