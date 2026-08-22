@@ -58,7 +58,15 @@ __device__ __forceinline__ unsigned q4_small_t_bf16_pair(std::uint8_t packed) {
 
 template <class Geometry, int TileCols, int ActiveCols, class Epilogue = Q4SmallTMmaStoreEpilogue,
           class RowPolicy = Q4SmallTMmaIdentityRows>
-__launch_bounds__(256, 6) __global__
+#if defined(NINFER_SM75)
+// 6 x 256 = 1536 resident threads exceeds Turing's 1024-per-SM limit, so ptxas
+// drops .minnctapersm entirely and the kernel lands at ~100 registers (2 CTAs
+// per SM). Three CTAs fit the register file and keep the weight stream busier.
+__launch_bounds__(256, 3)
+#else
+    __launch_bounds__(256, 6)
+#endif
+    __global__
     void q4_small_t_mma_kernel(const __nv_bfloat16* __restrict__ x,
                                const std::uint8_t* __restrict__ codes,
                                const std::uint8_t* __restrict__ scales,
@@ -102,6 +110,7 @@ __launch_bounds__(256, 6) __global__
     const int k_split = warp;
     const int row0    = static_cast<int>(blockIdx.x) * RowPolicy::kOutputRowsPerCta;
 
+#if !defined(NINFER_SM75)
     const auto stage_x = [&](int group_k0) {
         constexpr int kItemsPerSplit = ActiveCols * (kTileK / 8);
         for (int item = lane; item < kItemsPerSplit; item += 32) {
@@ -134,12 +143,125 @@ __launch_bounds__(256, 6) __global__
                                       2);
         }
     };
+#endif
 
     const int b_rin     = lane & 7;
     const int b_koff    = ((lane >> 3) & 1) << 3;
     const int warp_koff = k_split * kTileK;
     float acc[kNt][4]   = {};
 
+#if defined(NINFER_SM75)
+    // Turing has no cp.async: the generic staging path drains the memory
+    // pipeline between two barriers at every group boundary. Prefetch the next
+    // group into registers before the current group's MMA block instead, so
+    // the global-load latency hides under compute. The arithmetic order and
+    // therefore the produced bits are unchanged.
+    static_assert(kGroupK / 32 <= 32);
+    constexpr int kXItems      = ActiveCols * (kTileK / 8);
+    constexpr int kXRegsPerLane = (kXItems + 31) / 32;
+
+    uint4 code_reg[Schedule::kRowsPerLoaderWarp];
+    uint4 x_reg[kXRegsPerLane];
+    uint4 scale_reg;
+
+    const auto load_group_regs = [&](int group_index) {
+        const int group_k0 = group_index * kGroupK;
+#pragma unroll
+        for (int ri = 0; ri < Schedule::kRowsPerLoaderWarp; ++ri) {
+            if (lane < kGroupK / 32) {
+                const int row        = warp * Schedule::kRowsPerLoaderWarp + ri;
+                const int weight_row = row_policy.weight_row(row0, row);
+                code_reg[ri]         = __ldg(reinterpret_cast<const uint4*>(
+                    codes + static_cast<std::int64_t>(weight_row) * kCodeRowBytes +
+                    group_k0 / 2 + lane * 16));
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < kXRegsPerLane; ++i) {
+            const int item = lane + i * 32;
+            if (item < kXItems) {
+                const int col = item / (kTileK / 8);
+                const int k8  = item - col * (kTileK / 8);
+                x_reg[i]      = __ldg(reinterpret_cast<const uint4*>(
+                    &x[static_cast<std::int64_t>(col) * kHidden + group_k0 + warp * kTileK +
+                       k8 * 8]));
+            }
+        }
+        if (tid < kRowsPerCta) {
+            const int weight_row = row_policy.weight_row(row0, tid);
+            scale_reg            = __ldg(reinterpret_cast<const uint4*>(
+                &scales[(static_cast<std::int64_t>(weight_row) * Geometry::kGroupsPerRow +
+                         group_k0 / 64) *
+                            2]));
+        }
+    };
+
+    const auto spill_group_regs = [&]() {
+#pragma unroll
+        for (int ri = 0; ri < Schedule::kRowsPerLoaderWarp; ++ri) {
+            if (lane < kGroupK / 32) {
+                const int row = warp * Schedule::kRowsPerLoaderWarp + ri;
+                store_vec(&code_shared[row][lane * 16], code_reg[ri]);
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < kXRegsPerLane; ++i) {
+            const int item = lane + i * 32;
+            if (item < kXItems) {
+                const int col = item / (kTileK / 8);
+                const int k8  = item - col * (kTileK / 8);
+                store_vec(&x_shared[warp][col * kTileK + q4_small_t_swizzle_64(col, k8 * 8)],
+                          x_reg[i]);
+            }
+        }
+        if (tid < kRowsPerCta) { store_vec(&scale_shared[tid][0], scale_reg); }
+    };
+
+    load_group_regs(0);
+    spill_group_regs();
+    __syncthreads();
+
+#pragma unroll
+    for (int group_index = 0; group_index < kGroups; ++group_index) {
+        const bool has_next = group_index + 1 < kGroups;
+        if (has_next) { load_group_regs(group_index + 1); }
+
+        float group_acc[kNt][4] = {};
+#pragma unroll
+        for (int ks = 0; ks < 4; ++ks) {
+            const int byte_col = warp_koff / 2 + ks * 8 + lid;
+            const unsigned af0 = q4_small_t_bf16_pair(code_shared[gid][byte_col]);
+            const unsigned af1 = q4_small_t_bf16_pair(code_shared[gid + 8][byte_col]);
+            const unsigned af2 = q4_small_t_bf16_pair(code_shared[gid][byte_col + 4]);
+            const unsigned af3 = q4_small_t_bf16_pair(code_shared[gid + 8][byte_col + 4]);
+#pragma unroll
+            for (int nt = 0; nt < kNt; ++nt) {
+                unsigned bf0, bf1;
+                const int br = nt * 8 + b_rin;
+                ldmatrix_x2(bf0, bf1,
+                            smem_addr(&x_shared[k_split][br * kTileK + q4_small_t_swizzle_64(
+                                                                           br, ks * 16 + b_koff)]));
+                mma_bf16(group_acc[nt][0], group_acc[nt][1], group_acc[nt][2], group_acc[nt][3],
+                         af0, af1, af2, af3, bf0, bf1);
+            }
+        }
+        const float top_scale = __half2float(__ushort_as_half(scale_shared[gid][k_split]));
+        const float bot_scale = __half2float(__ushort_as_half(scale_shared[gid + 8][k_split]));
+#pragma unroll
+        for (int nt = 0; nt < kNt; ++nt) {
+            acc[nt][0] = fmaf(group_acc[nt][0], top_scale, acc[nt][0]);
+            acc[nt][1] = fmaf(group_acc[nt][1], top_scale, acc[nt][1]);
+            acc[nt][2] = fmaf(group_acc[nt][2], bot_scale, acc[nt][2]);
+            acc[nt][3] = fmaf(group_acc[nt][3], bot_scale, acc[nt][3]);
+        }
+
+        if (has_next) {
+            __syncthreads();
+            spill_group_regs();
+            __syncthreads();
+        }
+    }
+#else
     stage_weight(0);
     stage_x(0);
     cp_commit();
@@ -189,6 +311,7 @@ __launch_bounds__(256, 6) __global__
             __syncthreads();
         }
     }
+#endif
 
     __syncthreads();
     auto* partial = shared.partial;
