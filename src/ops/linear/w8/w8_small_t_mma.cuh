@@ -152,6 +152,114 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void w8_small_t
         }
     };
 
+#if defined(NINFER_SM75)
+    // Turing has no async copies: generic staging drains the memory pipeline
+    // between two barriers at every group boundary. For decode-shaped
+    // schedules whose per-lane payload fits registers, prefetch the next
+    // group's codes, activations, and staged scales into registers while the
+    // current group computes. The arithmetic order and produced bits are
+    // unchanged.
+    constexpr bool kPrefetchPaddedStage =
+        Schedule::kActivationStage == W8SmallTMmaActivationStage::PaddedZero;
+    constexpr int kStagedCols      = kPrefetchPaddedStage ? kTileCols : ActiveCols;
+    constexpr int kXPayloadItems   = kStagedCols * (kTileK / 8);
+    constexpr int kXRegsPerLane    = (kXPayloadItems + 31) / 32;
+    constexpr int kScaleVecs       = Schedule::kScaleAccess == W8SmallTMmaScaleAccess::Shared
+                                         ? Schedule::kScaleBytesPerRow / 16
+                                         : 0;
+    constexpr int kCodeChunks      = kGroupK / 16;
+    // Every prefetched payload must fit one uint4 per lane per iteration, and the
+    // staged scales must be coverable by a single pass over the CTA's threads.
+    constexpr bool kUseRegPrefetch = Schedule::kRowsPerLoaderWarp <= 2 && kXRegsPerLane <= 2 &&
+                                     kCodeChunks <= 32 &&
+                                     kMmaRows * (kScaleVecs == 0 ? 1 : kScaleVecs) <=
+                                         Schedule::kThreads;
+
+    // Sized away when the schedule does not take the prefetch path, so those
+    // instantiations keep their baseline register footprint. The lambdas below
+    // are only ODR-used under `if constexpr (kUseRegPrefetch)`, so they are
+    // eliminated entirely there.
+    uint4 code_reg[kUseRegPrefetch ? Schedule::kRowsPerLoaderWarp : 1];
+    uint4 x_reg[kUseRegPrefetch ? kXRegsPerLane : 1];
+    uint4 scale_reg[kUseRegPrefetch && kScaleVecs != 0 ? kScaleVecs : 1];
+
+    const auto load_group_regs = [&](int group_index) {
+        const int group_k0 = group_index * kGroupK;
+#pragma unroll
+        for (int ri = 0; ri < Schedule::kRowsPerLoaderWarp; ++ri) {
+            if (lane < kCodeChunks) {
+                const int row        = warp * Schedule::kRowsPerLoaderWarp + ri;
+                const int weight_row = row_policy.weight_row(cta_row0, row);
+                code_reg[ri]         = __ldg(reinterpret_cast<const uint4*>(
+                    codes + static_cast<std::int64_t>(weight_row) * kHidden + group_k0 +
+                    lane * 16));
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < kXRegsPerLane; ++i) {
+            const int item = lane + i * 32;
+            if (item < kXPayloadItems) {
+                const int col = item / (kTileK / 8);
+                const int k8  = item - col * (kTileK / 8);
+                if constexpr (kPrefetchPaddedStage && ActiveCols != kTileCols) {
+                    if (col < ActiveCols) {
+                        x_reg[i] = __ldg(reinterpret_cast<const uint4*>(
+                            &x[static_cast<std::int64_t>(col) * kHidden + group_k0 +
+                               warp * kTileK + k8 * 8]));
+                    } else {
+                        x_reg[i] = make_uint4(0u, 0u, 0u, 0u);
+                    }
+                } else {
+                    x_reg[i] = __ldg(reinterpret_cast<const uint4*>(
+                        &x[static_cast<std::int64_t>(col) * kHidden + group_k0 + warp * kTileK +
+                           k8 * 8]));
+                }
+            }
+        }
+        if constexpr (kScaleVecs != 0) {
+            constexpr int kScaleChunksPerRow = Schedule::kScaleBytesPerRow / 16;
+            if (tid < kMmaRows * kScaleChunksPerRow) {
+                const int srow       = tid / kScaleChunksPerRow;
+                const int schunk     = tid - srow * kScaleChunksPerRow;
+                const int weight_row = row_policy.weight_row(cta_row0, srow);
+                scale_reg[schunk]    = __ldg(reinterpret_cast<const uint4*>(
+                    scales + (static_cast<std::int64_t>(weight_row) * Geometry::kGroupsPerRow +
+                              group_k0 / 32 + schunk * 8) *
+                                 2));
+            }
+        }
+    };
+
+    const auto spill_group_regs = [&]() {
+#pragma unroll
+        for (int ri = 0; ri < Schedule::kRowsPerLoaderWarp; ++ri) {
+            if (lane < kCodeChunks) {
+                const int row            = warp * Schedule::kRowsPerLoaderWarp + ri;
+                const int swizzled_chunk = lane ^ (row & 7);
+                store_vec(&code_shared[row][swizzled_chunk * 16], code_reg[ri]);
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < kXRegsPerLane; ++i) {
+            const int item = lane + i * 32;
+            if (item < kXPayloadItems) {
+                const int col = item / (kTileK / 8);
+                const int k8  = item - col * (kTileK / 8);
+                store_vec(&b_shared[warp][col * kTileK + w8_small_t_swizzle_64(col, k8 * 8)],
+                          x_reg[i]);
+            }
+        }
+        if constexpr (kScaleVecs != 0) {
+            constexpr int kScaleChunksPerRow = Schedule::kScaleBytesPerRow / 16;
+            if (tid < kMmaRows * kScaleChunksPerRow) {
+                const int srow   = tid / kScaleChunksPerRow;
+                const int schunk = tid - srow * kScaleChunksPerRow;
+                store_vec(&scale_shared[srow][schunk * 16], scale_reg[schunk]);
+            }
+        }
+    };
+#endif
+
     const int b_rin     = lane & 7;
     const int b_koff    = ((lane >> 3) & 1) << 3;
     const int warp_koff = k_split * kTileK;
@@ -164,16 +272,30 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void w8_small_t
         acc[ni][3] = 0.0f;
     }
 
-    stage_codes(0);
-    stage_x(0);
-    cp_commit();
-    cp_wait<0>();
+#if defined(NINFER_SM75)
+    if constexpr (kUseRegPrefetch) {
+        load_group_regs(0);
+        spill_group_regs();
+    } else
+#endif
+    {
+        stage_codes(0);
+        stage_x(0);
+        cp_commit();
+        cp_wait<0>();
+    }
     __syncthreads();
 
     constexpr int kGroupUnroll = kHidden <= 6144 ? kGroups : 12;
 #pragma unroll kGroupUnroll
     for (int group_index = 0; group_index < kGroups; ++group_index) {
         const int group_k0 = group_index * kGroupK;
+
+#if defined(NINFER_SM75)
+        if constexpr (kUseRegPrefetch) {
+            if (group_index + 1 < kGroups) { load_group_regs(group_index + 1); }
+        }
+#endif
 
         unsigned lane_scale_pair = 0;
         if (lid < 2) {
@@ -246,10 +368,17 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void w8_small_t
 
         if (group_index + 1 < kGroups) {
             __syncthreads();
-            stage_codes(group_k0 + kGroupK);
-            stage_x(group_k0 + kGroupK);
-            cp_commit();
-            cp_wait<0>();
+#if defined(NINFER_SM75)
+            if constexpr (kUseRegPrefetch) {
+                spill_group_regs();
+            } else
+#endif
+            {
+                stage_codes(group_k0 + kGroupK);
+                stage_x(group_k0 + kGroupK);
+                cp_commit();
+                cp_wait<0>();
+            }
             __syncthreads();
         }
     }
