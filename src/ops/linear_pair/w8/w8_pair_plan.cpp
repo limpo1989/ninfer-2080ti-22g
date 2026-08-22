@@ -27,6 +27,18 @@ constexpr std::array<W8PairRouteSpec, 3> kK5120Routes{{
     {57, kAnyCols, W8PairScheduleId::DualMmaR32C128},
 }};
 
+// The medium split-K kernel statically allocates KSplits * TileCols * 128 bytes of
+// activation tile plus a 2 KiB code tile. Turing caps static shared memory at 48 KiB,
+// so TileCols > 184 cannot be built for SM75 at the minimum KSplits of 2 (a 192-column
+// tile needs 50 KiB). T=161..192 therefore joins the concat MMA route that already
+// serves 193..384, rather than a 160-column tile that would silently drop columns.
+constexpr W8PairScheduleId kK2048Route161To192 =
+#if defined(NINFER_SM75)
+    W8PairScheduleId::ConcatMmaR32C64;
+#else
+    W8PairScheduleId::DualSplitKMediumC192;
+#endif
+
 constexpr std::array<W8PairRouteSpec, 37> kK2048Routes{{
     {1, 1, W8PairScheduleId::DualDecodeR4},
     {2, 32, W8PairScheduleId::DualSplitKMmaExactT},
@@ -39,7 +51,7 @@ constexpr std::array<W8PairRouteSpec, 37> kK2048Routes{{
     {105, 112, W8PairScheduleId::DualSplitKMediumC112},
     {113, 128, W8PairScheduleId::DualSplitKMediumC128},
     {129, 160, W8PairScheduleId::DualSplitKMediumC160},
-    {161, 192, W8PairScheduleId::DualSplitKMediumC192},
+    {161, 192, kK2048Route161To192},
     {193, 384, W8PairScheduleId::ConcatMmaR32C64},
     {385, 480, W8PairScheduleId::ConcatMmaR32C96},
     {481, 640, W8PairScheduleId::ConcatMmaR32C128},
