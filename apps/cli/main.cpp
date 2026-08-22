@@ -1,3 +1,5 @@
+#include "core/kv_storage.h"
+
 #include "options.h"
 #include "product/load_progress/load_progress.h"
 #include "product/prompt_input/prompt_input.h"
@@ -93,7 +95,7 @@ std::string format_finish(ninfer::FinishReason reason) {
 }
 
 std::string format_kv_cache(ninfer::KvCacheStorage storage) {
-    return storage == ninfer::KvCacheStorage::BFloat16 ? "bf16" : "int8-group64";
+    return std::string(ninfer::kv_storage_name(storage));
 }
 
 std::string format_kv_capacity_mode(ninfer::KvCapacityMode mode) {

@@ -1,3 +1,5 @@
+#include "core/kv_storage.h"
+
 #include "serve/serve_options.h"
 #include "product/speculative_options.h"
 
@@ -46,10 +48,10 @@ std::uint64_t parse_u64(const char* text, const char* label) {
 }
 
 KvCacheStorage parse_kv_dtype(const char* text) {
-    const std::string value(text);
-    if (value == "bf16") { return KvCacheStorage::BFloat16; }
-    if (value == "int8") { return KvCacheStorage::Int8Group64; }
-    throw std::invalid_argument("invalid kv-dtype: " + value);
+    if (const std::optional<KvCacheStorage> storage = kv_storage_from_name(text)) {
+        return *storage;
+    }
+    throw std::invalid_argument("invalid kv-dtype: " + std::string(text));
 }
 
 KvCapacityPolicy parse_kv_capacity(const char* text) {
@@ -71,7 +73,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--media-preprocess-threads N] "
            "[--request-log-jsonl FILE] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
-           "[--kv-dtype bf16|int8] [--spec mtp|dflash --draft-tokens N] "
+           "[--kv-dtype bf16|int8|kvarn|kvarn-k4v4] [--spec mtp|dflash --draft-tokens N] "
            "[--default-max-tokens N] "
            "[--vision] [--no-cuda-graph] [--no-prefix-reuse] "
            "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--cors] "

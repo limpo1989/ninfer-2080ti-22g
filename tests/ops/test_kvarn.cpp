@@ -248,146 +248,281 @@ int run_case(const Case& test_case) {
     return failures;
 }
 
-// ── attention over records ──────────────────────────────────────────────────────────────────
+// ── composed attention: sink, records, tail, and fresh K/V ──────────────────────────────────
 
-struct AttentionCase {
+struct SequenceCase {
     KvarnFormat format;
     const char* name;
     std::int32_t kv_heads;
     std::int32_t q_heads;
-    std::int32_t record_pages;
-    std::int32_t tokens;
+    std::int32_t batch;
+    std::int32_t prefill;   // first call's width
+    std::int32_t steps;     // decode calls after it
+    std::int32_t step_width;
 };
 
-int run_attention_case(const AttentionCase& test_case) {
+// Mirrors the Op's own storage rule so the oracle can say where each committed position lives.
+std::int32_t stage_slot(std::int32_t position, std::int32_t group) {
+    const std::int32_t sink = 2 * group;
+    return position < sink ? position : sink + position % group;
+}
+
+int run_sequence_case(const SequenceCase& test_case) {
     const KvarnRecordLayout layout = kvarn_record_layout(kHeadDim, test_case.format);
     const std::int32_t group       = layout.group;
-    const std::int32_t keys        = test_case.record_pages * group;
-    const std::int32_t pages       = test_case.record_pages + 2;
     const std::int32_t group_size  = test_case.q_heads / test_case.kv_heads;
+    const std::int32_t total = test_case.prefill + test_case.steps * test_case.step_width;
+    const std::int32_t pages = total / group + 4;
+    const std::int32_t stage_tokens = ops::kKvarnStageTokens;
 
-    const std::vector<float> staged_k = staged_keys(test_case.kv_heads, keys, 0x2f11);
-    const std::vector<float> staged_v = staged_values(test_case.kv_heads, keys, 0x77c3);
-
-    // Logical page i lives in a physical page chosen so the table is not the identity.
-    std::vector<int> block_table(static_cast<std::size_t>(test_case.record_pages));
-    for (std::int32_t i = 0; i < test_case.record_pages; ++i) {
-        block_table[static_cast<std::size_t>(i)] = (i * 3 + 1) % pages;
+    // Whole-sequence K/V per row; each call feeds the Op its own slice.
+    std::vector<std::vector<float>> keys(static_cast<std::size_t>(test_case.batch));
+    std::vector<std::vector<float>> values(static_cast<std::size_t>(test_case.batch));
+    for (std::int32_t b = 0; b < test_case.batch; ++b) {
+        keys[static_cast<std::size_t>(b)] =
+            staged_keys(test_case.kv_heads, total, 0x3300u + static_cast<std::uint32_t>(b));
+        values[static_cast<std::size_t>(b)] =
+            staged_values(test_case.kv_heads, total, 0x8800u + static_cast<std::uint32_t>(b));
     }
 
-    DeviceBuffer device_k     = to_device_bf16(staged_k);
-    DeviceBuffer device_v     = to_device_bf16(staged_v);
-    DeviceBuffer device_pages = to_device_i32(block_table);
-    const std::size_t plane_bytes =
-        layout.record_bytes * static_cast<std::size_t>(test_case.kv_heads) * pages;
+    // Distinct table rows and a non-identity page map, so row and page addressing are exercised.
+    std::vector<int> table_rows(static_cast<std::size_t>(test_case.batch));
+    for (std::int32_t b = 0; b < test_case.batch; ++b) { table_rows[static_cast<std::size_t>(b)] = b; }
+    std::vector<int> block_tables(static_cast<std::size_t>(pages) * test_case.batch);
+    for (std::int32_t r = 0; r < test_case.batch; ++r) {
+        for (std::int32_t p = 0; p < pages; ++p) {
+            block_tables[static_cast<std::size_t>(r) * pages + p] =
+                (r * pages + p * 5 + 1) % (pages * test_case.batch);
+        }
+    }
+
+    const std::size_t plane_bytes = layout.record_bytes *
+                                    static_cast<std::size_t>(test_case.kv_heads) * pages *
+                                    test_case.batch;
     DeviceBuffer device_records(plane_bytes);
+    cuda_check(cudaMemset(device_records.p, 0, plane_bytes), "clear records");
+    DeviceBuffer device_stage_k(static_cast<std::size_t>(kHeadDim) * test_case.kv_heads *
+                                stage_tokens * test_case.batch * sizeof(std::uint16_t));
+    DeviceBuffer device_stage_v(device_stage_k.bytes);
+    cuda_check(cudaMemset(device_stage_k.p, 0, device_stage_k.bytes), "clear stage k");
+    cuda_check(cudaMemset(device_stage_v.p, 0, device_stage_v.bytes), "clear stage v");
+    DeviceBuffer device_tables = to_device_i32(block_tables);
+    DeviceBuffer device_rows   = to_device_i32(table_rows);
 
-    Tensor k(device_k.p, DType::BF16, {kHeadDim, test_case.kv_heads, keys, 1});
-    Tensor v(device_v.p, DType::BF16, {kHeadDim, test_case.kv_heads, keys, 1});
-    Tensor ids(device_pages.p, DType::I32, {test_case.record_pages, 1, 1, 1});
-    Tensor records(device_records.p, DType::U8,
-                   {static_cast<std::int32_t>(layout.slot_bytes), group, test_case.kv_heads,
-                    pages});
-    ops::kvarn_compress(k, v, ids, test_case.format, test_case.kv_heads, records, nullptr);
-    cuda_check_last_launch("kvarn_compress");
+    ops::KvarnBatchLayerView cache{};
+    cache.records = Tensor(device_records.p, DType::U8,
+                           {static_cast<std::int32_t>(layout.slot_bytes), group,
+                            test_case.kv_heads, pages * test_case.batch});
+    cache.block_tables = Tensor(device_tables.p, DType::I32, {pages, test_case.batch, 1, 1});
+    cache.stage_k      = Tensor(device_stage_k.p, DType::BF16,
+                                {kHeadDim, test_case.kv_heads, stage_tokens, test_case.batch});
+    cache.stage_v      = Tensor(device_stage_v.p, DType::BF16,
+                                {kHeadDim, test_case.kv_heads, stage_tokens, test_case.batch});
+    cache.format       = test_case.format;
+    cache.head_dim     = kHeadDim;
+    cache.kv_heads     = test_case.kv_heads;
 
-    std::vector<float> query(static_cast<std::size_t>(kHeadDim) * test_case.q_heads *
-                             test_case.tokens);
-    fill_uniform(query, 0x1357, -1.0F, 1.0F);
-    round_to_bf16(query);
-    DeviceBuffer device_query = to_device_bf16(query);
-    DeviceBuffer device_out(query.size() * sizeof(std::uint16_t));
-
-    Tensor q(device_query.p, DType::BF16, {kHeadDim, test_case.q_heads, test_case.tokens, 1});
-    Tensor out(device_out.p, DType::BF16, {kHeadDim, test_case.q_heads, test_case.tokens, 1});
-
-    ops::KvarnAttentionCache cache{records, ids, test_case.format, test_case.kv_heads,
-                                   test_case.record_pages};
-    WorkspaceArena workspace(ops::kvarn_attention_workspace_capacity_bytes(
-        test_case.q_heads, kHeadDim, test_case.tokens, test_case.record_pages));
     const float scale = 1.0F / std::sqrt(static_cast<float>(kHeadDim));
-    ops::kvarn_attention_cached(q, scale, cache, workspace, out, nullptr);
-    cuda_check_last_launch("kvarn_attention_cached");
-    cuda_synchronize();
+    WorkspaceArena workspace(ops::kvarn_gqa_attention_workspace_capacity_bytes(
+        test_case.q_heads, kHeadDim,
+        std::max(test_case.prefill, test_case.step_width), test_case.batch));
 
-    const std::vector<double> device_out_host = from_device_bf16(device_out, query.size());
+    std::int32_t frontier = 0;
+    int failures          = 0;
+    std::vector<double> final_out;
+    std::vector<float> final_query;
+    std::int32_t final_first = 0;
+    std::int32_t final_width = 0;
 
-    // Oracle: the records' own logical K/V, returned to the original frame, then FP64 attention.
+    const std::int32_t calls = 1 + test_case.steps;
+    for (std::int32_t call = 0; call < calls; ++call) {
+        const std::int32_t width = call == 0 ? test_case.prefill : test_case.step_width;
+
+        std::vector<float> call_k(static_cast<std::size_t>(kHeadDim) * test_case.kv_heads * width *
+                                  test_case.batch);
+        std::vector<float> call_v(call_k.size());
+        std::vector<int> positions(static_cast<std::size_t>(width) * test_case.batch);
+        for (std::int32_t b = 0; b < test_case.batch; ++b) {
+            for (std::int32_t j = 0; j < width; ++j) {
+                positions[static_cast<std::size_t>(b) * width + j] = frontier + j;
+                const std::size_t destination =
+                    static_cast<std::size_t>(kHeadDim) * test_case.kv_heads * (j + width * b);
+                const std::size_t source =
+                    static_cast<std::size_t>(kHeadDim) * test_case.kv_heads * (frontier + j);
+                std::copy_n(keys[static_cast<std::size_t>(b)].begin() +
+                                static_cast<std::ptrdiff_t>(source),
+                            static_cast<std::size_t>(kHeadDim) * test_case.kv_heads,
+                            call_k.begin() + static_cast<std::ptrdiff_t>(destination));
+                std::copy_n(values[static_cast<std::size_t>(b)].begin() +
+                                static_cast<std::ptrdiff_t>(source),
+                            static_cast<std::size_t>(kHeadDim) * test_case.kv_heads,
+                            call_v.begin() + static_cast<std::ptrdiff_t>(destination));
+            }
+        }
+
+        std::vector<float> query(static_cast<std::size_t>(kHeadDim) * test_case.q_heads * width *
+                                 test_case.batch);
+        fill_uniform(query, 0x4000u + static_cast<std::uint32_t>(call), -1.0F, 1.0F);
+        round_to_bf16(query);
+
+        DeviceBuffer device_k         = to_device_bf16(call_k);
+        DeviceBuffer device_v         = to_device_bf16(call_v);
+        DeviceBuffer device_query     = to_device_bf16(query);
+        DeviceBuffer device_positions = to_device_i32(positions);
+        DeviceBuffer device_out(query.size() * sizeof(std::uint16_t));
+
+        Tensor q(device_query.p, DType::BF16,
+                 {kHeadDim, test_case.q_heads, width, test_case.batch});
+        Tensor k(device_k.p, DType::BF16,
+                 {kHeadDim, test_case.kv_heads, width, test_case.batch});
+        Tensor v(device_v.p, DType::BF16,
+                 {kHeadDim, test_case.kv_heads, width, test_case.batch});
+        Tensor pos(device_positions.p, DType::I32, {width, test_case.batch, 1, 1});
+        Tensor rows(device_rows.p, DType::I32, {test_case.batch, 1, 1, 1});
+        Tensor out(device_out.p, DType::BF16,
+                   {kHeadDim, test_case.q_heads, width, test_case.batch});
+
+        ops::kvarn_gqa_attention(q, k, v, pos, Tensor{}, rows, scale, cache, workspace, out,
+                                 nullptr);
+        cuda_check_last_launch("kvarn_gqa_attention");
+        cuda_synchronize();
+
+        if (call + 1 == calls) {
+            final_out   = from_device_bf16(device_out, query.size());
+            final_query = query;
+            final_first = frontier;
+            final_width = width;
+        }
+        frontier += width;
+    }
+
+    // Oracle: rebuild each committed position's logical value from the storage the Op left
+    // behind, then evaluate ideal FP64 attention for the final call's queries.
     std::vector<std::uint8_t> host_plane(plane_bytes);
-    cuda_check(cudaMemcpy(host_plane.data(), device_records.p, plane_bytes,
-                          cudaMemcpyDeviceToHost),
-               "copy records");
+    cuda_check(cudaMemcpy(host_plane.data(), device_records.p, plane_bytes, cudaMemcpyDeviceToHost),
+               "read records");
+    const std::vector<double> host_stage_k =
+        from_device_bf16(device_stage_k, device_stage_k.bytes / sizeof(std::uint16_t));
+    const std::vector<double> host_stage_v =
+        from_device_bf16(device_stage_v, device_stage_v.bytes / sizeof(std::uint16_t));
 
-    // logical[head][key][channel]
-    std::vector<std::vector<double>> logical_k(static_cast<std::size_t>(test_case.kv_heads));
-    std::vector<std::vector<double>> logical_v(static_cast<std::size_t>(test_case.kv_heads));
-    for (std::int32_t head = 0; head < test_case.kv_heads; ++head) {
-        logical_k[static_cast<std::size_t>(head)].resize(static_cast<std::size_t>(keys) * kHeadDim);
-        logical_v[static_cast<std::size_t>(head)].resize(static_cast<std::size_t>(keys) * kHeadDim);
-        for (std::int32_t page = 0; page < test_case.record_pages; ++page) {
-            const std::size_t offset =
-                layout.record_bytes *
-                (static_cast<std::size_t>(head) +
-                 static_cast<std::size_t>(test_case.kv_heads) *
-                     static_cast<std::size_t>(block_table[static_cast<std::size_t>(page)]));
-            std::vector<float> k_tile(static_cast<std::size_t>(kHeadDim) * group);
-            std::vector<float> v_tile(k_tile.size());
-            kvarn_decode_record_rotated({host_plane.data() + offset, layout.record_bytes}, layout,
-                                        k_tile, v_tile);
-            inverse_rotate_columns(k_tile, group);
-            inverse_rotate_rows(v_tile, group, kHeadDim);
-            for (std::int32_t t = 0; t < group; ++t) {
-                const std::size_t key = static_cast<std::size_t>(page) * group + t;
+    const std::int32_t record_page_end = final_first >= 2 * group ? final_first / group : 2;
+    std::vector<double> reference(final_query.size());
+
+    for (std::int32_t b = 0; b < test_case.batch; ++b) {
+        const std::int32_t table_row = table_rows[static_cast<std::size_t>(b)];
+        // logical[head][position][channel] over the committed history.
+        std::vector<std::vector<double>> logical_k(static_cast<std::size_t>(test_case.kv_heads));
+        std::vector<std::vector<double>> logical_v(static_cast<std::size_t>(test_case.kv_heads));
+        for (std::int32_t head = 0; head < test_case.kv_heads; ++head) {
+            auto& lk = logical_k[static_cast<std::size_t>(head)];
+            auto& lv = logical_v[static_cast<std::size_t>(head)];
+            lk.assign(static_cast<std::size_t>(final_first) * kHeadDim, 0.0);
+            lv.assign(lk.size(), 0.0);
+
+            for (std::int32_t position = 0; position < final_first; ++position) {
+                if (position >= 2 * group && position < record_page_end * group) { continue; }
+                const std::int32_t slot = stage_slot(position, group);
                 for (std::int32_t d = 0; d < kHeadDim; ++d) {
-                    logical_k[static_cast<std::size_t>(head)][key * kHeadDim + d] =
-                        k_tile[static_cast<std::size_t>(d) * group + t];
-                    logical_v[static_cast<std::size_t>(head)][key * kHeadDim + d] =
-                        v_tile[static_cast<std::size_t>(t) * kHeadDim + d];
+                    const std::size_t index =
+                        static_cast<std::size_t>(d) +
+                        static_cast<std::size_t>(kHeadDim) *
+                            (head + static_cast<std::size_t>(test_case.kv_heads) *
+                                        (slot + static_cast<std::size_t>(stage_tokens) * table_row));
+                    lk[static_cast<std::size_t>(position) * kHeadDim + d] = host_stage_k[index];
+                    lv[static_cast<std::size_t>(position) * kHeadDim + d] = host_stage_v[index];
+                }
+            }
+            for (std::int32_t page = 2; page < record_page_end; ++page) {
+                const std::size_t offset =
+                    layout.record_bytes *
+                    (static_cast<std::size_t>(head) +
+                     static_cast<std::size_t>(test_case.kv_heads) *
+                         static_cast<std::size_t>(
+                             block_tables[static_cast<std::size_t>(table_row) * pages + page]));
+                std::vector<float> k_tile(static_cast<std::size_t>(kHeadDim) * group);
+                std::vector<float> v_tile(k_tile.size());
+                kvarn_decode_record_rotated({host_plane.data() + offset, layout.record_bytes},
+                                            layout, k_tile, v_tile);
+                inverse_rotate_columns(k_tile, group);
+                inverse_rotate_rows(v_tile, group, kHeadDim);
+                for (std::int32_t t = 0; t < group; ++t) {
+                    const std::size_t position = static_cast<std::size_t>(page) * group + t;
+                    for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                        lk[position * kHeadDim + d] = k_tile[static_cast<std::size_t>(d) * group + t];
+                        lv[position * kHeadDim + d] = v_tile[static_cast<std::size_t>(t) * kHeadDim + d];
+                    }
+                }
+            }
+        }
+
+        for (std::int32_t j = 0; j < final_width; ++j) {
+            const std::int32_t position = final_first + j;
+            for (std::int32_t q_head = 0; q_head < test_case.q_heads; ++q_head) {
+                const std::int32_t head = q_head / group_size;
+                const auto& lk          = logical_k[static_cast<std::size_t>(head)];
+                const auto& lv          = logical_v[static_cast<std::size_t>(head)];
+                const std::size_t q_base =
+                    static_cast<std::size_t>(kHeadDim) *
+                    (q_head + static_cast<std::size_t>(test_case.q_heads) * (j + final_width * b));
+
+                std::vector<double> scores(static_cast<std::size_t>(position) + 1);
+                double maximum = -std::numeric_limits<double>::infinity();
+                for (std::int32_t x = 0; x <= position; ++x) {
+                    const double* key = nullptr;
+                    std::vector<double> fresh(static_cast<std::size_t>(kHeadDim));
+                    if (x < final_first) {
+                        key = lk.data() + static_cast<std::size_t>(x) * kHeadDim;
+                    } else {
+                        const std::size_t base = static_cast<std::size_t>(kHeadDim) *
+                                                 (head + static_cast<std::size_t>(test_case.kv_heads) *
+                                                             static_cast<std::size_t>(x));
+                        for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                            fresh[static_cast<std::size_t>(d)] =
+                                keys[static_cast<std::size_t>(b)][base + d];
+                        }
+                        key = fresh.data();
+                    }
+                    double dot = 0.0;
+                    for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                        dot += static_cast<double>(final_query[q_base + d]) * key[d];
+                    }
+                    scores[static_cast<std::size_t>(x)] = dot * scale;
+                    maximum = std::max(maximum, scores[static_cast<std::size_t>(x)]);
+                }
+                double total = 0.0;
+                for (double& score : scores) {
+                    score = std::exp(score - maximum);
+                    total += score;
+                }
+                for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                    double sum = 0.0;
+                    for (std::int32_t x = 0; x <= position; ++x) {
+                        double value = 0.0;
+                        if (x < final_first) {
+                            value = lv[static_cast<std::size_t>(x) * kHeadDim + d];
+                        } else {
+                            const std::size_t base =
+                                static_cast<std::size_t>(kHeadDim) *
+                                (head + static_cast<std::size_t>(test_case.kv_heads) *
+                                            static_cast<std::size_t>(x));
+                            value = values[static_cast<std::size_t>(b)][base + d];
+                        }
+                        sum += scores[static_cast<std::size_t>(x)] * value;
+                    }
+                    reference[q_base + d] = sum / total;
                 }
             }
         }
     }
 
-    std::vector<double> reference(query.size());
-    for (std::int32_t token = 0; token < test_case.tokens; ++token) {
-        for (std::int32_t q_head = 0; q_head < test_case.q_heads; ++q_head) {
-            const std::int32_t head = q_head / group_size;
-            const std::size_t q_base =
-                static_cast<std::size_t>(kHeadDim) * (q_head + test_case.q_heads * token);
-            std::vector<double> scores(static_cast<std::size_t>(keys));
-            double maximum = -std::numeric_limits<double>::infinity();
-            for (std::int32_t key = 0; key < keys; ++key) {
-                double dot = 0.0;
-                for (std::int32_t d = 0; d < kHeadDim; ++d) {
-                    dot += static_cast<double>(query[q_base + d]) *
-                           logical_k[static_cast<std::size_t>(head)]
-                                    [static_cast<std::size_t>(key) * kHeadDim + d];
-                }
-                scores[static_cast<std::size_t>(key)] = dot * scale;
-                maximum = std::max(maximum, scores[static_cast<std::size_t>(key)]);
-            }
-            double total = 0.0;
-            for (double& score : scores) {
-                score = std::exp(score - maximum);
-                total += score;
-            }
-            for (std::int32_t d = 0; d < kHeadDim; ++d) {
-                double sum = 0.0;
-                for (std::int32_t key = 0; key < keys; ++key) {
-                    sum += scores[static_cast<std::size_t>(key)] *
-                           logical_v[static_cast<std::size_t>(head)]
-                                    [static_cast<std::size_t>(key) * kHeadDim + d];
-                }
-                reference[q_base + d] = sum / total;
-            }
-        }
-    }
-
-    std::printf("%-42s keys=%d splits<=%d\n", test_case.name, keys,
-                test_case.record_pages < 32 ? test_case.record_pages : 32);
-    const ReductionCriterion criterion{/*relative_l2*/ 6.0e-3, /*gross_absolute*/ 2.0e-3,
-                                       /*gross_relative_to_max_reference*/ 2.0e-2};
-    return verify_reduction(test_case.name, device_out_host, reference, criterion);
+    std::printf("%-38s B=%d prefill=%d steps=%d frontier=%d records=[2,%d)\n", test_case.name,
+                test_case.batch, test_case.prefill, test_case.steps, final_first + final_width,
+                record_page_end);
+    const ReductionCriterion criterion{/*relative_l2*/ 8.0e-3, /*gross_absolute*/ 3.0e-3,
+                                       /*gross_relative_to_max_reference*/ 3.0e-2};
+    failures += verify_reduction(test_case.name, final_out, reference, criterion);
+    return failures;
 }
 
 } // namespace
@@ -412,14 +547,23 @@ int main() {
     };
     for (const Case& test_case : cases) { failures += run_case(test_case); }
 
-    const AttentionCase attention_cases[] = {
-        {KvarnFormat::K4V2G64, "kvarn attention k4v2 pages=5 tokens=2", 4, 24, 5, 2},
-        {KvarnFormat::K4V4G64, "kvarn attention k4v4 pages=1 tokens=1", 4, 24, 1, 1},
-        {KvarnFormat::K4V2G64, "kvarn attention k4v2 pages=40 tokens=1", 4, 24, 40, 1},
-        {KvarnFormat::K4V2G64, "kvarn attention 35b k4v2 pages=3 tokens=1", 2, 16, 3, 1},
+    const SequenceCase sequence_cases[] = {
+        // Prefill past the sink, then decode across a page boundary.
+        {KvarnFormat::K4V2G64, "kvarn gqa k4v2 prefill+decode", 4, 24, 1, 256, 70, 1},
+        // Every position still in the sink: no record is ever built.
+        {KvarnFormat::K4V2G64, "kvarn gqa k4v2 sink only", 4, 24, 1, 32, 8, 1},
+        // Batched decode with independent rows and table rows.
+        {KvarnFormat::K4V4G64, "kvarn gqa k4v4 batched decode", 4, 24, 3, 192, 40, 1},
+        // Speculative-width decode that crosses a page boundary inside one call.
+        {KvarnFormat::K4V2G64, "kvarn gqa k4v2 wide decode", 4, 24, 2, 190, 12, 5},
+        // The 35B head geometry.
+        {KvarnFormat::K4V2G64, "kvarn gqa 35b k4v2", 2, 16, 1, 320, 20, 1},
+        // A prefill width that leaves a short trailing column chunk, verified directly.
+        {KvarnFormat::K4V2G64, "kvarn gqa k4v2 ragged prefill", 4, 24, 1, 914, 0, 1},
+        {KvarnFormat::K4V2G64, "kvarn gqa k4v2 ragged prefill B=2", 4, 24, 2, 332, 0, 1},
     };
-    for (const AttentionCase& test_case : attention_cases) {
-        failures += run_attention_case(test_case);
+    for (const SequenceCase& test_case : sequence_cases) {
+        failures += run_sequence_case(test_case);
     }
 
     if (failures != 0) {

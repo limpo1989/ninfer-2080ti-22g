@@ -26,6 +26,10 @@ inline constexpr std::size_t kDefaultMediaLiveBytes   = 2ULL << 30;
 enum class KvCacheStorage : std::uint8_t {
     BFloat16,
     Int8Group64,
+    // KVarN structured records: one Hadamard-rotated, variance-normalized low-bit record per KV
+    // page, with the leading sink tokens and the still-filling tail page kept in BF16.
+    KvarnK4V2,
+    KvarnK4V4,
 };
 
 enum class KvCapacityMode : std::uint8_t {

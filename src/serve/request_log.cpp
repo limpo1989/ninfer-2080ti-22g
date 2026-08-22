@@ -1,3 +1,5 @@
+#include "core/kv_storage.h"
+
 #include "serve/request_log.h"
 #include "product/speculative_options.h"
 #include "serve/console_log.h"
@@ -91,8 +93,8 @@ std::string tool_choice_name(const ToolChoice& choice) {
     return "unknown";
 }
 
-const char* kv_cache_name(ninfer::KvCacheStorage storage) {
-    return storage == ninfer::KvCacheStorage::BFloat16 ? "bf16" : "int8-group64";
+std::string_view kv_cache_name(ninfer::KvCacheStorage storage) {
+    return ninfer::kv_storage_name(storage);
 }
 
 const char* kv_capacity_mode_name(ninfer::KvCapacityMode mode) {

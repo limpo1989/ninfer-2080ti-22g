@@ -16,6 +16,7 @@
 #include "ninfer/ops/gdn_gating_proj.h"
 #include "ninfer/ops/gdn_input_proj.h"
 #include "ninfer/ops/gqa_attention.h"
+#include "ninfer/ops/kvarn.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/linear_pair.h"
@@ -396,9 +397,25 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
         Tensor v_batch        = v.view({kCfg.head_dim, kCfg.n_kv, width, active_sequence_batch_});
         Tensor a_batch        = a.view({kCfg.head_dim, kCfg.n_q, width, active_sequence_batch_});
         Tensor position_batch = positions.view({width, active_sequence_batch_});
-        ops::gqa_attention(q_batch, k_batch, v_batch, position_batch, *active_valid_columns_,
-                           *active_backend_kv_table_rows_, kAttnScale,
-                           batch_mtp_kv_->batch_layer_view(0), envelope, work_, a_batch, s);
+        if (batch_mtp_kv_->kvarn()) {
+            ops::kvarn_gqa_attention(q_batch, k_batch, v_batch, position_batch,
+                                     *active_valid_columns_, *active_backend_kv_table_rows_,
+                                     kAttnScale, batch_mtp_kv_->kvarn_batch_layer_view(0), work_,
+                                     a_batch, s);
+        } else {
+            ops::gqa_attention(q_batch, k_batch, v_batch, position_batch, *active_valid_columns_,
+                               *active_backend_kv_table_rows_, kAttnScale,
+                               batch_mtp_kv_->batch_layer_view(0), envelope, work_, a_batch, s);
+        }
+    } else if (batch_mtp_kv_->kvarn()) {
+        Tensor q_batch  = qn.view({kCfg.head_dim, kCfg.n_q, T, 1});
+        Tensor k_batch  = kn.view({kCfg.head_dim, kCfg.n_kv, T, 1});
+        Tensor v_batch  = v.view({kCfg.head_dim, kCfg.n_kv, T, 1});
+        Tensor a_batch  = a.view({kCfg.head_dim, kCfg.n_q, T, 1});
+        Tensor position = positions.view({T, 1});
+        ops::kvarn_gqa_attention(q_batch, k_batch, v_batch, position, Tensor{},
+                                 io_.backend_kv_table_row, kAttnScale,
+                                 batch_mtp_kv_->kvarn_batch_layer_view(0), work_, a_batch, s);
     } else {
         ops::gqa_attention(qn, kn, v, positions, Tensor{}, io_.backend_kv_table_row, kAttnScale,
                            batch_mtp_kv_->batch_layer_view(0), envelope, work_, a, s);
@@ -466,6 +483,15 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
 
     cudaStream_t s     = ctx_.stream;
     auto scratch_scope = work_.scope();
+    // KVarN fuses the commit with the attention, and the final chunk's query is only projected
+    // after the stem, so its K/V has to outlive the bulk scope.
+    const bool kvarn = batch_mtp_kv_ != nullptr && batch_mtp_kv_->kvarn();
+    Tensor kept_k;
+    Tensor kept_v;
+    if (kvarn && final_chunk) {
+        kept_k = work_.alloc(DType::BF16, {kCfg.head_dim, kCfg.n_kv, T});
+        kept_v = work_.alloc(DType::BF16, {kCfg.head_dim, kCfg.n_kv, T});
+    }
     Tensor x_last;
     Tensor ah_last;
     if (final_chunk) {
@@ -487,7 +513,26 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
         Tensor kn = work_.alloc(DType::BF16, {kCfg.head_dim, kCfg.n_kv, T});
         ops::rmsnorm(k, *mtp_.k_norm, kCfg.rms_eps, true, kn, s);
         ops::rope(rope_positions, kCfg.rotary_dim, kCfg.rope_theta, kn, s);
-        ops::gqa_kv_append(kn, v, positions, mtp_kv_.layer_view(0), s);
+        if (kvarn) {
+            if (final_chunk) {
+                const std::size_t kv_bytes = static_cast<std::size_t>(kCfg.kv_size) * T *
+                                             dtype_size(DType::BF16);
+                CUDA_CHECK(cudaMemcpyAsync(kept_k.data, kn.data, kv_bytes, cudaMemcpyDeviceToDevice,
+                                           s));
+                CUDA_CHECK(cudaMemcpyAsync(kept_v.data, v.data, kv_bytes, cudaMemcpyDeviceToDevice,
+                                           s));
+            } else {
+                // Commit-only: this chunk contributes no attention output.
+                Tensor empty;
+                ops::kvarn_gqa_attention(empty, kn.view({kCfg.head_dim, kCfg.n_kv, T, 1}),
+                                         v.view({kCfg.head_dim, kCfg.n_kv, T, 1}),
+                                         positions.view({T, 1}), Tensor{},
+                                         io_.backend_kv_table_row, kAttnScale,
+                                         batch_mtp_kv_->kvarn_batch_layer_view(0), work_, empty, s);
+            }
+        } else {
+            ops::gqa_kv_append(kn, v, positions, mtp_kv_.layer_view(0), s);
+        }
 
         if (final_chunk) {
             const std::size_t column_bytes =
@@ -529,8 +574,18 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
         ops::rope(last_rope_position, kCfg.rotary_dim, kCfg.rope_theta, qn, s);
 
         Tensor a = work_.alloc(DType::BF16, {kCfg.head_dim, kCfg.n_q, 1});
-        ops::gqa_attention_cached(qn, last_position, kAttnScale, mtp_kv_.layer_view(0), envelope,
-                                  work_, a, s);
+        if (kvarn) {
+            Tensor a_batch = a.view({kCfg.head_dim, kCfg.n_q, 1, 1});
+            ops::kvarn_gqa_attention(qn.view({kCfg.head_dim, kCfg.n_q, 1, 1}),
+                                     kept_k.view({kCfg.head_dim, kCfg.n_kv, T, 1}),
+                                     kept_v.view({kCfg.head_dim, kCfg.n_kv, T, 1}),
+                                     positions.view({T, 1}), Tensor{}, io_.backend_kv_table_row,
+                                     kAttnScale, batch_mtp_kv_->kvarn_batch_layer_view(0), work_,
+                                     a_batch, s);
+        } else {
+            ops::gqa_attention_cached(qn, last_position, kAttnScale, mtp_kv_.layer_view(0),
+                                      envelope, work_, a, s);
+        }
         ops::sigmoid_mul(gate, a, s);
 
         Tensor o = work_.alloc(DType::BF16, {kCfg.hidden, 1});
@@ -837,9 +892,25 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
         Tensor a_batch        = a.view({kCfg.head_dim, kCfg.n_q, width, active_sequence_batch_});
         Tensor position_batch = cache_positions.view({width, active_sequence_batch_});
         const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
-        ops::gqa_attention(q_batch, k_batch, v_batch, position_batch, valid, kv_table_rows,
-                           kAttnScale, batch_text_kv_->batch_layer_view(fidx),
-                           *active_gqa_envelope_, work_, a_batch, s);
+        if (batch_text_kv_->kvarn()) {
+            ops::kvarn_gqa_attention(q_batch, k_batch, v_batch, position_batch, valid,
+                                     kv_table_rows, kAttnScale,
+                                     batch_text_kv_->kvarn_batch_layer_view(fidx), work_, a_batch,
+                                     s);
+        } else {
+            ops::gqa_attention(q_batch, k_batch, v_batch, position_batch, valid, kv_table_rows,
+                               kAttnScale, batch_text_kv_->batch_layer_view(fidx),
+                               *active_gqa_envelope_, work_, a_batch, s);
+        }
+    } else if (batch_text_kv_->kvarn()) {
+        Tensor q_batch  = qn.view({kCfg.head_dim, kCfg.n_q, T, 1});
+        Tensor k_batch  = kn.view({kCfg.head_dim, kCfg.n_kv, T, 1});
+        Tensor v_batch  = v.view({kCfg.head_dim, kCfg.n_kv, T, 1});
+        Tensor a_batch  = a.view({kCfg.head_dim, kCfg.n_q, T, 1});
+        Tensor position = cache_positions.view({T, 1});
+        ops::kvarn_gqa_attention(q_batch, k_batch, v_batch, position, Tensor{}, kv_table_rows,
+                                 kAttnScale, batch_text_kv_->kvarn_batch_layer_view(fidx), work_,
+                                 a_batch, s);
     } else {
         ops::gqa_attention(qn, kn, v, cache_positions, Tensor{}, kv_table_rows, kAttnScale,
                            batch_text_kv_->batch_layer_view(fidx), *active_gqa_envelope_, work_, a,

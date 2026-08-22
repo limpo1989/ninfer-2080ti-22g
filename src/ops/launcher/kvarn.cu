@@ -1,9 +1,9 @@
 // ninfer::ops - KVarN record codec launcher.
 #include "ops/launcher/kvarn.h"
 
-#include "ops/kernel/kvarn_attention.cuh"
-#include "ops/kernel/kvarn_compress.cuh"
+#include "ops/kernel/kvarn_gqa.cuh"
 
+#include <algorithm>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
@@ -31,29 +31,77 @@ void decompress_one(const Tensor& records, const Tensor& page_ids, std::int32_t 
         static_cast<__nv_bfloat16*>(v.data));
 }
 
-// One CTA covers one (kv_head, split, token), so the split count sets occupancy. 32 keeps every
-// SM of the smallest supported device busy at kv_heads=2 without splitting below one page.
-constexpr std::int32_t kKvarnMaxSplits = 32;
+// One CTA covers one (kv_head, split, column). Wide prefill calls already saturate the device
+// through their columns, so the split count only has to rescue narrow decode calls; the column
+// chunk keeps the split-local partial workspace bounded at large W.
+constexpr std::int32_t kKvarnMaxSplits    = 32;
+constexpr std::int32_t kKvarnChunkColumns = 64;
+constexpr std::int32_t kKvarnBusyColumns  = 64;
 
 template <typename Spec, typename Geometry>
-void attention_one(const Tensor& q, float scale, const Tensor& records, const Tensor& block_table,
-                   std::int32_t record_pages, std::int32_t tokens, const Tensor& partial_acc,
-                   const Tensor& partial_max, const Tensor& partial_sum, Tensor& out,
-                   std::int32_t splits, cudaStream_t stream) {
-    const dim3 grid(static_cast<unsigned>(Geometry::KVHeads), static_cast<unsigned>(splits),
-                    static_cast<unsigned>(tokens));
-    kvarn_attention_partial_kernel<Spec, Geometry><<<grid, Spec::HeadDim, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(q.data), static_cast<const std::uint8_t*>(records.data),
-        static_cast<const std::int32_t*>(block_table.data), record_pages, tokens, scale,
-        static_cast<__nv_bfloat16*>(partial_acc.data), static_cast<float*>(partial_max.data),
-        static_cast<float*>(partial_sum.data));
+void gqa_one(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& positions,
+             const Tensor& valid_columns, const Tensor& kv_table_rows, float scale,
+             const KvarnBatchLayerView& cache, std::int32_t width, std::int32_t query_columns,
+             std::int32_t batch_size, const Tensor& partial_acc, const Tensor& partial_max,
+             const Tensor& partial_sum, Tensor& out, cudaStream_t stream) {
+    const auto* positions_data  = static_cast<const std::int32_t*>(positions.data);
+    const auto* valid_data      = static_cast<const std::int32_t*>(valid_columns.data);
+    const auto* rows_data       = static_cast<const std::int32_t*>(kv_table_rows.data);
+    const auto* tables_data     = static_cast<const std::int32_t*>(cache.block_tables.data);
+    const auto* q_data          = static_cast<const __nv_bfloat16*>(q.data);
+    const auto* k_data          = static_cast<const __nv_bfloat16*>(k.data);
+    const auto* v_data          = static_cast<const __nv_bfloat16*>(v.data);
+    auto* stage_k               = static_cast<__nv_bfloat16*>(cache.stage_k.data);
+    auto* stage_v               = static_cast<__nv_bfloat16*>(cache.stage_v.data);
+    auto* record_data           = static_cast<std::uint8_t*>(cache.records.data);
+    const std::int32_t stride   = cache.block_tables.ne[0];
 
-    const dim3 reduce_grid(static_cast<unsigned>(Geometry::QHeads),
-                           static_cast<unsigned>(tokens));
-    kvarn_attention_reduce_kernel<Spec, Geometry><<<reduce_grid, Spec::HeadDim, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(partial_acc.data),
-        static_cast<const float*>(partial_max.data), static_cast<const float*>(partial_sum.data),
-        splits, tokens, static_cast<__nv_bfloat16*>(out.data));
+    // Commit first: a page completing here is built from stage tokens plus this call's fresh
+    // K/V, and the attention below must not see it as a record yet.
+    const std::int32_t candidates = kvarn_compress_candidates(width);
+    const dim3 compress_grid(static_cast<unsigned>(Geometry::KVHeads),
+                             static_cast<unsigned>(candidates),
+                             static_cast<unsigned>(batch_size));
+    kvarn_stage_compress_kernel<Spec, Geometry><<<compress_grid, Spec::HeadDim, 0, stream>>>(
+        k_data, v_data, positions_data, valid_data, rows_data, tables_data, stride, width,
+        static_cast<const __nv_bfloat16*>(cache.stage_k.data),
+        static_cast<const __nv_bfloat16*>(cache.stage_v.data), record_data,
+        kKvarnSinkhornIterations);
+
+    const std::int32_t query_offset = width - query_columns;
+    const std::int32_t chunk = query_columns > 0 ? kvarn_attention_chunk_columns(query_columns) : 1;
+    // The split count and the partial stride are properties of the whole call, not of one chunk:
+    // the wrapper sized the workspace from them, and a short trailing chunk must not re-derive
+    // a larger split count and write past it.
+    const std::int32_t splits     = kvarn_attention_splits(query_columns, batch_size, chunk);
+    const std::int32_t flat_count = chunk * batch_size;
+    for (std::int32_t begin = 0; begin < query_columns; begin += chunk) {
+        const std::int32_t columns = std::min(chunk, query_columns - begin);
+        const dim3 grid(static_cast<unsigned>(Geometry::KVHeads), static_cast<unsigned>(splits),
+                        static_cast<unsigned>(columns * batch_size));
+        kvarn_gqa_partial_kernel<Spec, Geometry><<<grid, Spec::HeadDim, 0, stream>>>(
+            q_data, k_data, v_data, positions_data, valid_data, rows_data, tables_data, stride,
+            width, query_offset, query_columns, columns, begin, flat_count,
+            static_cast<const __nv_bfloat16*>(cache.stage_k.data),
+            static_cast<const __nv_bfloat16*>(cache.stage_v.data), record_data, scale,
+            static_cast<__nv_bfloat16*>(partial_acc.data),
+            static_cast<float*>(partial_max.data), static_cast<float*>(partial_sum.data));
+
+        const dim3 reduce_grid(static_cast<unsigned>(Geometry::QHeads),
+                               static_cast<unsigned>(columns * batch_size));
+        kvarn_gqa_reduce_kernel<Spec, Geometry><<<reduce_grid, Spec::HeadDim, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(partial_acc.data),
+            static_cast<const float*>(partial_max.data),
+            static_cast<const float*>(partial_sum.data), valid_data, width, query_offset,
+            query_columns, columns, begin, splits, flat_count,
+            static_cast<__nv_bfloat16*>(out.data));
+    }
+
+    // Last: the attention above still reads the tail slots this overwrites.
+    const dim3 append_grid(static_cast<unsigned>(Geometry::KVHeads), static_cast<unsigned>(width),
+                           static_cast<unsigned>(batch_size));
+    kvarn_stage_append_kernel<Spec, Geometry><<<append_grid, Spec::HeadDim, 0, stream>>>(
+        k_data, v_data, positions_data, valid_data, rows_data, width, stage_k, stage_v);
 }
 
 [[noreturn]] void unsupported() {
@@ -101,40 +149,53 @@ void kvarn_decompress_launch(const Tensor& records, const Tensor& page_ids, Kvar
 }
 
 
-std::int32_t kvarn_attention_splits(std::int32_t record_pages) {
-    if (record_pages <= 0) { return 1; }
-    return record_pages < kKvarnMaxSplits ? record_pages : kKvarnMaxSplits;
+std::int32_t kvarn_attention_chunk_columns(std::int32_t width) {
+    return width < kKvarnChunkColumns ? width : kKvarnChunkColumns;
 }
 
-void kvarn_attention_launch(const Tensor& q, float scale, const Tensor& records,
-                            const Tensor& block_table, KvarnFormat format, std::int32_t kv_heads,
-                            std::int32_t q_heads, std::int32_t record_pages, std::int32_t tokens,
-                            const Tensor& partial_acc, const Tensor& partial_max,
-                            const Tensor& partial_sum, Tensor& out, cudaStream_t stream) {
-    const std::int32_t splits = kvarn_attention_splits(record_pages);
-    if (kv_heads == 4 && q_heads == 24) {
-        if (format == KvarnFormat::K4V2G64) {
-            return attention_one<KvarnK4V2, Gqa27Geometry>(q, scale, records, block_table,
-                                                           record_pages, tokens, partial_acc,
-                                                           partial_max, partial_sum, out, splits,
-                                                           stream);
+std::int32_t kvarn_attention_splits(std::int32_t width, std::int32_t batch_size,
+                                    std::int32_t chunk_columns) {
+    (void)width;
+    const std::int32_t columns = chunk_columns * batch_size;
+    if (columns >= kKvarnBusyColumns) { return 1; }
+    const std::int32_t splits = (kKvarnBusyColumns + columns - 1) / columns;
+    return splits < kKvarnMaxSplits ? splits : kKvarnMaxSplits;
+}
+
+std::int32_t kvarn_compress_candidates(std::int32_t width) {
+    // A call can complete at most one page per Group new tokens, plus the page it started inside.
+    return width / kPagedKVPageSize + 2;
+}
+
+void kvarn_gqa_attention_launch(const Tensor& q, const Tensor& k, const Tensor& v,
+                                const Tensor& positions, const Tensor& valid_columns,
+                                const Tensor& kv_table_rows, float scale,
+                                const KvarnBatchLayerView& cache, std::int32_t q_heads,
+                                std::int32_t width, std::int32_t query_columns,
+                                std::int32_t batch_size, const Tensor& partial_acc,
+                                const Tensor& partial_max, const Tensor& partial_sum, Tensor& out,
+                                cudaStream_t stream) {
+    if (cache.kv_heads == 4 && q_heads == 24) {
+        if (cache.format == KvarnFormat::K4V2G64) {
+            return gqa_one<KvarnK4V2, Gqa27Geometry>(q, k, v, positions, valid_columns, kv_table_rows, scale,
+                                                     cache, width, query_columns, batch_size,
+                                                     partial_acc, partial_max, partial_sum, out,
+                                                     stream);
         }
-        return attention_one<KvarnK4V4, Gqa27Geometry>(q, scale, records, block_table,
-                                                       record_pages, tokens, partial_acc,
-                                                       partial_max, partial_sum, out, splits,
-                                                       stream);
+        return gqa_one<KvarnK4V4, Gqa27Geometry>(q, k, v, positions, valid_columns, kv_table_rows, scale,
+                                                 cache, width, query_columns, batch_size, partial_acc,
+                                                 partial_max, partial_sum, out, stream);
     }
-    if (kv_heads == 2 && q_heads == 16) {
-        if (format == KvarnFormat::K4V2G64) {
-            return attention_one<KvarnK4V2, Gqa35Geometry>(q, scale, records, block_table,
-                                                           record_pages, tokens, partial_acc,
-                                                           partial_max, partial_sum, out, splits,
-                                                           stream);
+    if (cache.kv_heads == 2 && q_heads == 16) {
+        if (cache.format == KvarnFormat::K4V2G64) {
+            return gqa_one<KvarnK4V2, Gqa35Geometry>(q, k, v, positions, valid_columns, kv_table_rows, scale,
+                                                     cache, width, query_columns, batch_size,
+                                                     partial_acc, partial_max, partial_sum, out,
+                                                     stream);
         }
-        return attention_one<KvarnK4V4, Gqa35Geometry>(q, scale, records, block_table,
-                                                       record_pages, tokens, partial_acc,
-                                                       partial_max, partial_sum, out, splits,
-                                                       stream);
+        return gqa_one<KvarnK4V4, Gqa35Geometry>(q, k, v, positions, valid_columns, kv_table_rows, scale,
+                                                 cache, width, query_columns, batch_size, partial_acc,
+                                                 partial_max, partial_sum, out, stream);
     }
     unsupported();
 }

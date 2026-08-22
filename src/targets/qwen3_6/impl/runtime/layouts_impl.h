@@ -13,6 +13,7 @@
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/speculative_round.h"
 #include "ninfer/ops/gqa_attention.h"
+#include "ninfer/ops/kvarn.h"
 #include "ninfer/ops/bidirectional_gqa_attention.h"
 #include "ninfer/ops/swa.h"
 
@@ -117,6 +118,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                      .attention_head_dim        = TextConfig::head_dim,
                      .kv_dtype                  = plan.kv_dtype,
                      .kv_quant_group            = plan.kv_quant_group,
+                     .kvarn                     = plan.kvarn,
                      .enable_mtp                = plan.features.mtp(),
                      .kv_table_rows             = static_cast<std::int32_t>(plan.max_concurrency),
                      .text_physical_page_groups = physical_pages,
@@ -244,6 +246,19 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         (void)layout.alloc_bytes(bytes);
     };
     const auto finish = [](const WorkspaceLayoutBuilder& layout) { return layout.peak_bytes(1); };
+    // KVarN carries its own split-local partials, so the two cache families size the attention
+    // scratch differently even at the same call shape.
+    const auto attention_scratch = [&](std::int32_t batch_size, std::int32_t min_width,
+                                       std::int32_t max_width,
+                                       ops::GqaExecutionEnvelope envelope) -> std::size_t {
+        if (plan.kvarn) {
+            return ops::kvarn_gqa_attention_workspace_capacity_bytes(
+                TextConfig::query_heads, TextConfig::head_dim, max_width, batch_size);
+        }
+        return ops::gqa_attention_workspace_capacity_bytes(TextConfig::query_heads, plan.kv_dtype,
+                                                           envelope, batch_size, min_width,
+                                                           max_width);
+    };
 
     const auto text_common_root = [&](WorkspaceLayoutBuilder& layout, std::int32_t tokens) {
         (void)workspace_recipe::text_prefill_roots<TextConfig>(
@@ -258,9 +273,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         scratch(layout, Variant::attention_projection_workspace_capacity_bytes(plan.weights_profile,
                                                                                phase, first, last));
         (void)workspace_recipe::text_attention_results<TextConfig>(layout, last);
-        scratch(layout, ops::gqa_attention_workspace_capacity_bytes(
-                            TextConfig::query_heads, plan.kv_dtype, envelope, batch_size, min_width,
-                            max_width));
+        scratch(layout, attention_scratch(batch_size, min_width, max_width, envelope));
         scratch(layout, Variant::attention_output_projection_workspace_capacity_bytes(
                             plan.weights_profile, phase, first, last));
     };
@@ -324,8 +337,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         (void)workspace_recipe::mtp_attention_projection<TextConfig>(layout, tokens);
         scratch(layout, Variant::mtp_attention_projection_workspace_capacity_bytes(tokens, tokens));
         (void)workspace_recipe::mtp_attention_results<TextConfig>(layout, tokens);
-        scratch(layout, ops::gqa_attention_workspace_capacity_bytes(
-                            TextConfig::query_heads, plan.kv_dtype, envelope, 1, tokens, tokens));
+        scratch(layout, attention_scratch(1, tokens, tokens, envelope));
         (void)workspace_recipe::mtp_post_attention<TextConfig>(layout, tokens);
         scratch(layout, Variant::mtp_post_mixer_workspace_capacity_bytes(tokens, tokens));
     };
@@ -342,6 +354,11 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     const auto mtp_prefill_chunk = [&](WorkspaceLayoutBuilder& layout, std::int32_t first,
                                        std::int32_t last, bool preembedded) {
         auto call = layout.scope();
+        if (plan.kvarn) {
+            // KVarN keeps the final chunk's K/V alive for the fused commit-and-attend call.
+            matrix(layout, DType::BF16, TextConfig::kv_size, last);
+            matrix(layout, DType::BF16, TextConfig::kv_size, last);
+        }
         matrix(layout, DType::BF16, TextConfig::hidden, 1);
         matrix(layout, DType::BF16, TextConfig::hidden, 1);
         {
@@ -358,8 +375,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         matrix(layout, DType::BF16, TextConfig::query_size, 1);
         matrix(layout, DType::I32, 3, 1);
         matrix(layout, DType::BF16, TextConfig::query_size, 1);
-        scratch(layout, ops::gqa_attention_workspace_capacity_bytes(
-                            TextConfig::query_heads, plan.kv_dtype, text_envelope, 1, 1, 1));
+        scratch(layout, attention_scratch(1, 1, 1, text_envelope));
         matrix(layout, DType::BF16, TextConfig::hidden, 1);
         matrix(layout, DType::BF16, TextConfig::hidden, 1);
         scratch(layout, Variant::mtp_post_mixer_workspace_capacity_bytes(1, 1));
@@ -431,9 +447,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                 scratch(layout,
                         Variant::mtp_attention_projection_workspace_capacity_bytes(tokens, tokens));
                 (void)workspace_recipe::mtp_attention_results<TextConfig>(layout, tokens);
-                scratch(layout, ops::gqa_attention_workspace_capacity_bytes(
-                                    TextConfig::query_heads, plan.kv_dtype, text_envelope, batch,
-                                    width, width));
+                scratch(layout, attention_scratch(batch, width, width, text_envelope));
                 (void)workspace_recipe::mtp_post_attention<TextConfig>(layout, tokens);
                 scratch(layout, Variant::mtp_post_mixer_workspace_capacity_bytes(tokens, tokens));
             };
@@ -539,6 +553,16 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
     if (options.max_context == 0 || options.max_context > Variant::maximum_context) {
         throw std::invalid_argument("max_context exceeds the variant native context capacity");
     }
+    if (kv_storage_is_kvarn(options.kv_cache)) {
+        // KVarN commits whole pages, so it has no per-token BF16 plane for the DFlash context
+        // append to write into.
+        if (options.speculative.backend == SpeculativeBackend::DFlash) {
+            throw std::invalid_argument("KVarN KV storage does not support the DFlash backend");
+        }
+        if (!kvarn_head_dim_supported(TextConfig::head_dim)) {
+            throw std::invalid_argument("KVarN does not support this attention head dimension");
+        }
+    }
     if (options.prefill_chunk == 0 || options.prefill_chunk % kPrefillChunkAlignment != 0) {
         throw std::invalid_argument("prefill_chunk must be a nonzero multiple of 128");
     }
@@ -633,6 +657,8 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->device              = inputs.device;
     impl->kv_dtype            = inputs.kv_dtype;
     impl->kv_quant_group      = inputs.kv_quant_group;
+    impl->kvarn               = inputs.kvarn;
+    impl->kv_storage          = inputs.kv_storage;
     impl->persistent          = persistent_layout(*impl);
     impl->workspace           = build_workspace_plan(*impl);
     if (impl->features.vision) {
@@ -714,8 +740,13 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .prefill_chunk       = std::min(options.prefill_chunk, options.max_context),
         .draft_window        = options.speculative.draft_tokens,
         .speculative_backend = options.speculative.backend,
-        .kv_dtype       = options.kv_cache == KvCacheStorage::BFloat16 ? DType::BF16 : DType::I8,
-        .kv_quant_group = options.kv_cache == KvCacheStorage::BFloat16 ? 0 : qwen3_6::kKvQuantGroup,
+        .kv_dtype       = kv_storage_is_kvarn(options.kv_cache) ? DType::U8
+                          : options.kv_cache == KvCacheStorage::BFloat16 ? DType::BF16
+                                                                         : DType::I8,
+        .kv_quant_group = options.kv_cache == KvCacheStorage::Int8Group64 ? qwen3_6::kKvQuantGroup
+                                                                         : 0,
+        .kvarn          = kv_storage_kvarn_format(options.kv_cache),
+        .kv_storage     = options.kv_cache,
         .proposal_head  = options.speculative.proposal_head,
         .features       = qwen3_6::startup_features(options),
         .use_cuda_graph = options.use_cuda_graph,

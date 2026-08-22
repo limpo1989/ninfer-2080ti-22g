@@ -13,16 +13,20 @@ std::uint32_t page_count(std::uint32_t capacity) {
 
 PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std::uint32_t capacity,
                               std::int32_t kv_heads, std::int32_t head_dim, DType dtype,
-                              std::int32_t quant_group, std::int32_t table_rows,
-                              std::uint32_t physical_page_groups) {
+                              std::int32_t quant_group, std::optional<KvarnFormat> kvarn,
+                              std::int32_t table_rows, std::uint32_t physical_page_groups) {
     if (layers == 0 ||
         layers > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) ||
         kv_heads <= 0 || head_dim <= 0 || table_rows <= 0) {
         throw std::invalid_argument("Paged KV cache geometry is invalid");
     }
     const bool quantized = dtype == DType::I8;
-    if ((!quantized && (dtype != DType::BF16 || quant_group != 0)) ||
-        (quantized && (quant_group != kKvQuantGroup || head_dim % quant_group != 0))) {
+    if (kvarn) {
+        if (dtype != DType::U8 || quant_group != 0) {
+            throw std::invalid_argument("KVarN KV cache must declare a U8 record plane");
+        }
+    } else if ((!quantized && (dtype != DType::BF16 || quant_group != 0)) ||
+               (quantized && (quant_group != kKvQuantGroup || head_dim % quant_group != 0))) {
         throw std::invalid_argument("Paged KV cache dtype or quantization is invalid");
     }
 
@@ -35,24 +39,50 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
     pool_spec.page_group_count      = physical_page_groups;
     pool_spec.logical_page_capacity = logical_pages;
     pool_spec.table_rows            = table_rows;
-    pool_spec.planes.reserve(static_cast<std::size_t>(layers) * (quantized ? 4ULL : 2ULL));
-    for (std::uint32_t layer = 0; layer < layers; ++layer) {
-        pool_spec.planes.push_back({dtype, head_dim, kv_heads, 256});
-        pool_spec.planes.push_back({dtype, head_dim, kv_heads, 256});
-        if (quantized) {
-            pool_spec.planes.push_back({DType::FP16, head_dim / quant_group, kv_heads, 256});
-            pool_spec.planes.push_back({DType::FP16, head_dim / quant_group, kv_heads, 256});
+
+    PagedKVCacheLayout layout;
+    if (kvarn) {
+        // One record plane per layer: the per-token slot is the record divided by the page, so a
+        // record occupies exactly the page-and-head extent the shared addressing already gives it.
+        const KvarnRecordLayout record = kvarn_record_layout(head_dim, *kvarn);
+        if (static_cast<std::int32_t>(record.group) != kPagedKVPageSize) {
+            throw std::invalid_argument("KVarN record group must equal the KV page size");
+        }
+        pool_spec.planes.reserve(layers);
+        for (std::uint32_t layer = 0; layer < layers; ++layer) {
+            pool_spec.planes.push_back(
+                {DType::U8, static_cast<std::int32_t>(record.slot_bytes), kv_heads, 256});
+        }
+        layout.stage.reserve(static_cast<std::size_t>(layers) * 2);
+        for (std::uint32_t layer = 0; layer < layers; ++layer) {
+            for (const char* label : {"KVarN stage K", "KVarN stage V"}) {
+                layout.stage.push_back(builder.add_tensor(
+                    DType::BF16, {head_dim, kv_heads, ops::kKvarnStageTokens, table_rows}, 256,
+                    label));
+            }
+        }
+    } else {
+        pool_spec.planes.reserve(static_cast<std::size_t>(layers) * (quantized ? 4ULL : 2ULL));
+        for (std::uint32_t layer = 0; layer < layers; ++layer) {
+            pool_spec.planes.push_back({dtype, head_dim, kv_heads, 256});
+            pool_spec.planes.push_back({dtype, head_dim, kv_heads, 256});
+            if (quantized) {
+                pool_spec.planes.push_back({DType::FP16, head_dim / quant_group, kv_heads, 256});
+                pool_spec.planes.push_back({DType::FP16, head_dim / quant_group, kv_heads, 256});
+            }
         }
     }
-    return PagedKVCacheLayout{
-        .pool        = plan_paged_kv_pool(builder, pool_spec),
-        .layers      = layers,
-        .max_context = capacity,
-        .kv_heads    = kv_heads,
-        .head_dim    = head_dim,
-        .dtype       = dtype,
-        .quant_group = quant_group,
-    };
+
+    layout.pool        = plan_paged_kv_pool(builder, pool_spec);
+    layout.layers      = layers;
+    layout.max_context = capacity;
+    layout.kv_heads    = kv_heads;
+    layout.head_dim    = head_dim;
+    layout.dtype       = dtype;
+    layout.quant_group = quant_group;
+    layout.kvarn       = kvarn;
+    layout.table_rows  = table_rows;
+    return layout;
 }
 
 } // namespace
@@ -61,20 +91,44 @@ DecoderStateLayout plan_decoder_state(LayoutBuilder& builder, const DecoderState
     DecoderStateLayout layout;
     layout.text_kv = plan_cache(builder, spec.full_attention_layers, spec.capacity, spec.kv_heads,
                                 spec.attention_head_dim, spec.kv_dtype, spec.kv_quant_group,
-                                spec.kv_table_rows, spec.text_physical_page_groups);
+                                spec.kvarn, spec.kv_table_rows, spec.text_physical_page_groups);
     if (spec.enable_mtp) {
         layout.mtp_kv = plan_cache(builder, spec.mtp_layers, spec.capacity, spec.kv_heads,
                                    spec.attention_head_dim, spec.kv_dtype, spec.kv_quant_group,
-                                   spec.kv_table_rows, spec.mtp_physical_page_groups);
+                                   spec.kvarn, spec.kv_table_rows, spec.mtp_physical_page_groups);
     }
     layout.linear_attention = plan_linear_attention_state_pool(builder, spec.linear_attention);
     return layout;
 }
 
+std::size_t PagedKVCacheLayout::payload_bytes() const noexcept {
+    std::size_t total = pool.payload_bytes();
+    for (const TensorRegion& region : stage) { total += region.region.bytes; }
+    return total;
+}
+
 PagedKVCache::PagedKVCache(DeviceSpan backing, const PagedKVCacheLayout& layout)
     : pool_(backing, layout.pool), layers_(layout.layers), max_context_(layout.max_context),
       kv_heads_(layout.kv_heads), head_dim_(layout.head_dim), dtype_(layout.dtype),
-      quant_group_(layout.quant_group) {}
+      quant_group_(layout.quant_group), kvarn_(layout.kvarn) {
+    stage_.reserve(layout.stage.size());
+    for (const TensorRegion& region : layout.stage) { stage_.push_back(region.bind(backing)); }
+}
+
+ops::KvarnBatchLayerView PagedKVCache::kvarn_batch_layer_view(std::uint32_t layer) const {
+    if (!kvarn_ || layer >= layers_ || 2 * layer + 1 >= stage_.size()) {
+        throw std::out_of_range("KVarN KV layer is out of range");
+    }
+    return ops::KvarnBatchLayerView{
+        .records      = pool_.plane(layer),
+        .block_tables = pool_.block_tables(),
+        .stage_k      = stage_[2 * layer],
+        .stage_v      = stage_[2 * layer + 1],
+        .format       = *kvarn_,
+        .head_dim     = head_dim_,
+        .kv_heads     = kv_heads_,
+    };
+}
 
 PagedKVCacheView::PagedKVCacheView(const PagedKVCache& cache, Tensor block_table) noexcept
     : cache_(&cache), block_table_(block_table) {}

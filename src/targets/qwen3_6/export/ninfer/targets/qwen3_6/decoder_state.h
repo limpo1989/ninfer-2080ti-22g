@@ -1,12 +1,16 @@
 #pragma once
 
 #include "core/linear_attention_state.h"
+#include "core/kv_storage.h"
 #include "core/layout.h"
 #include "core/paged_kv_cache.h"
+
+#include <ninfer/ops/kvarn.h>
 
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <vector>
 
 namespace ninfer::targets::qwen3_6 {
 
@@ -20,6 +24,7 @@ struct DecoderStateSpec {
     std::int32_t attention_head_dim         = 0;
     DType kv_dtype                          = DType::BF16;
     std::int32_t kv_quant_group             = 0;
+    std::optional<KvarnFormat> kvarn        = std::nullopt;
     bool enable_mtp                         = false;
     std::int32_t kv_table_rows              = 1;
     std::uint32_t text_physical_page_groups = 0;
@@ -35,8 +40,13 @@ struct PagedKVCacheLayout {
     std::int32_t head_dim     = 0;
     DType dtype               = DType::BF16;
     std::int32_t quant_group  = 0;
+    std::optional<KvarnFormat> kvarn = std::nullopt;
+    // Two BF16 stage regions per layer (K and V), each holding every table row's sink pages and
+    // its still-filling tail page. Empty unless `kvarn` is engaged.
+    std::vector<TensorRegion> stage;
+    std::int32_t table_rows = 0;
 
-    [[nodiscard]] std::size_t payload_bytes() const noexcept { return pool.payload_bytes(); }
+    [[nodiscard]] std::size_t payload_bytes() const noexcept;
 };
 
 class PagedKVCache;
@@ -79,6 +89,12 @@ public:
 
     [[nodiscard]] PagedKVBatchLayerView batch_layer_view(std::uint32_t layer) const;
 
+    [[nodiscard]] bool kvarn() const noexcept { return kvarn_.has_value(); }
+
+    // Valid only when kvarn() holds. Sink and tail live in this layer's stage regions; every
+    // committed page lives in the record plane addressed through the shared block tables.
+    [[nodiscard]] ops::KvarnBatchLayerView kvarn_batch_layer_view(std::uint32_t layer) const;
+
 private:
     friend class PagedKVCacheView;
     [[nodiscard]] PagedKVLayerView layer_view(std::uint32_t layer, Tensor block_table) const;
@@ -90,6 +106,8 @@ private:
     std::int32_t head_dim_     = 0;
     DType dtype_               = DType::BF16;
     std::int32_t quant_group_  = 0;
+    std::optional<KvarnFormat> kvarn_;
+    std::vector<Tensor> stage_;
 };
 
 struct DecoderStateLayout {

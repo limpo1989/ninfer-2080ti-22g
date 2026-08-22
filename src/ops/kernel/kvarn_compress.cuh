@@ -235,42 +235,55 @@ __device__ __forceinline__ void kvarn_variance_normalize(const float* values, in
     __syncthreads();
 }
 
+// Reads channel `channel` of token `t` of one page from a dense [HeadDim, KVHeads, tokens] plane.
 template <typename Spec, int KVHeads>
-__launch_bounds__(Spec::HeadDim) __global__
-    void kvarn_compress_kernel(const __nv_bfloat16* __restrict__ k_src,
-                               const __nv_bfloat16* __restrict__ v_src,
-                               const std::int32_t* __restrict__ page_ids,
-                               std::uint8_t* __restrict__ records, int iterations) {
-    constexpr int D          = Spec::HeadDim;
-    constexpr int G          = Spec::Group;
-    constexpr int KeyMax     = (1 << Spec::KeyBits) - 1;
-    constexpr int ValueMax   = (1 << Spec::ValueBits) - 1;
-    constexpr int KeyPack    = Spec::KeyPack;
-    constexpr int ValuePack  = Spec::ValuePack;
+struct KvarnDenseSource {
+    const __nv_bfloat16* base;
 
-    __shared__ KvarnCompressShared<Spec> shared;
+    __device__ __forceinline__ float operator()(int t, int channel) const {
+        return __bfloat162float(
+            base[static_cast<std::int64_t>(channel) +
+                 static_cast<std::int64_t>(Spec::HeadDim) * KVHeads * t]);
+    }
+};
 
-    const int kv_head = static_cast<int>(blockIdx.x);
-    const int tile    = static_cast<int>(blockIdx.y);
-    const int tid     = static_cast<int>(threadIdx.x);
-    const int lane    = tid & (kWarpSize - 1);
+// Reads a page whose leading `stage_count` tokens are still in the BF16 stage buffer and whose
+// remainder is in this call's fresh K/V. Used when a page completes across a call boundary.
+template <typename Spec, int KVHeads>
+struct KvarnSplitSource {
+    const __nv_bfloat16* stage; // one row's [HeadDim, KVHeads, stage_tokens]
+    const __nv_bfloat16* fresh; // this call's [HeadDim, KVHeads, tokens]
+    int stage_slot;             // stage token index of this page's first token
+    int stage_count;
+    int fresh_first;            // fresh token index of this page's token `stage_count`
 
-    std::uint8_t* record =
-        records + kvarn_record_offset<Spec, KVHeads>(page_ids[tile], kv_head);
+    __device__ __forceinline__ float operator()(int t, int channel) const {
+        constexpr std::int64_t stride = static_cast<std::int64_t>(Spec::HeadDim) * KVHeads;
+        const std::int64_t offset     = static_cast<std::int64_t>(channel);
+        if (t < stage_count) { return __bfloat162float(stage[offset + stride * (stage_slot + t)]); }
+        return __bfloat162float(fresh[offset + stride * (fresh_first + t - stage_count)]);
+    }
+};
 
-    const std::int64_t src_base =
-        static_cast<std::int64_t>(tid) +
-        static_cast<std::int64_t>(D) * kv_head +
-        static_cast<std::int64_t>(D) * KVHeads * (static_cast<std::int64_t>(tile) * G);
-    constexpr std::int64_t src_stride = static_cast<std::int64_t>(D) * KVHeads;
+// Encodes one (page, head) record from a key and a value token loader.
+template <typename Spec, typename KeySource, typename ValueSource>
+__device__ __forceinline__ void kvarn_encode_record_device(KeySource key, ValueSource value,
+                                                           int iterations, std::uint8_t* record,
+                                                           KvarnCompressShared<Spec>& shared,
+                                                           int tid) {
+    constexpr int D         = Spec::HeadDim;
+    constexpr int G         = Spec::Group;
+    constexpr int KeyMax    = (1 << Spec::KeyBits) - 1;
+    constexpr int ValueMax  = (1 << Spec::ValueBits) - 1;
+    constexpr int KeyPack   = Spec::KeyPack;
+    constexpr int ValuePack = Spec::ValuePack;
+    const int lane          = tid & (kWarpSize - 1);
 
     float values[G];
     float best_channel = 0.0f;
 
     // ── K tile: [HeadDim, Group], round-to-nearest per channel ──────────────────────────────
-    for (int t = 0; t < G; ++t) {
-        values[t] = __bfloat162float(k_src[src_base + src_stride * t]);
-    }
+    for (int t = 0; t < G; ++t) { values[t] = key(t, tid); }
     kvarn_rotate_tile<Spec>(values, shared.rotate, tid);
     kvarn_variance_normalize<Spec, true>(values, iterations, shared, tid, best_channel);
 
@@ -310,9 +323,7 @@ __launch_bounds__(Spec::HeadDim) __global__
     __syncthreads();
 
     // ── V tile: [Group, HeadDim], round-to-nearest per token ────────────────────────────────
-    for (int t = 0; t < G; ++t) {
-        values[t] = __bfloat162float(v_src[src_base + src_stride * t]);
-    }
+    for (int t = 0; t < G; ++t) { values[t] = value(t, tid); }
     kvarn_rotate_tile<Spec>(values, shared.rotate, tid);
     kvarn_variance_normalize<Spec, false>(values, iterations, shared, tid, best_channel);
 
@@ -369,6 +380,28 @@ __launch_bounds__(Spec::HeadDim) __global__
             }
         }
     }
+}
+
+template <typename Spec, int KVHeads>
+__launch_bounds__(Spec::HeadDim) __global__
+    void kvarn_compress_kernel(const __nv_bfloat16* __restrict__ k_src,
+                               const __nv_bfloat16* __restrict__ v_src,
+                               const std::int32_t* __restrict__ page_ids,
+                               std::uint8_t* __restrict__ records, int iterations) {
+    __shared__ KvarnCompressShared<Spec> shared;
+
+    const int kv_head = static_cast<int>(blockIdx.x);
+    const int tile    = static_cast<int>(blockIdx.y);
+    const int tid     = static_cast<int>(threadIdx.x);
+
+    const std::int64_t head_base =
+        static_cast<std::int64_t>(Spec::HeadDim) * kv_head +
+        static_cast<std::int64_t>(Spec::HeadDim) * KVHeads * (static_cast<std::int64_t>(tile) *
+                                                              Spec::Group);
+    kvarn_encode_record_device<Spec>(
+        KvarnDenseSource<Spec, KVHeads>{k_src + head_base},
+        KvarnDenseSource<Spec, KVHeads>{v_src + head_base}, iterations,
+        records + kvarn_record_offset<Spec, KVHeads>(page_ids[tile], kv_head), shared, tid);
 }
 
 template <typename Spec, int KVHeads>

@@ -80,64 +80,130 @@ void kvarn_decompress(const Tensor& records, const Tensor& page_ids, KvarnFormat
     detail::kvarn_decompress_launch(records, page_ids, format, kv_heads, shape.tiles, k, v, stream);
 }
 
-std::size_t kvarn_attention_workspace_capacity_bytes(std::int32_t q_heads, std::int32_t head_dim,
-                                                     std::int32_t tokens,
-                                                     std::int32_t record_pages) {
-    if (q_heads <= 0 || head_dim <= 0 || tokens <= 0 || record_pages < 0) {
-        throw std::invalid_argument("kvarn_attention: workspace profile is invalid");
+std::size_t kvarn_gqa_attention_workspace_capacity_bytes(std::int32_t q_heads,
+                                                         std::int32_t head_dim,
+                                                         std::int32_t query_columns,
+                                                         std::int32_t batch_size) {
+    if (q_heads <= 0 || head_dim <= 0 || query_columns <= 0 || batch_size <= 0) {
+        throw std::invalid_argument("kvarn_gqa_attention: workspace profile is invalid");
     }
-    const auto rows = static_cast<std::size_t>(q_heads) * tokens *
-                      static_cast<std::size_t>(detail::kvarn_attention_splits(record_pages));
-    // partial accumulator (BF16), plus the split-local max and sum (FP32), each 256-aligned.
+    const std::int32_t chunk  = detail::kvarn_attention_chunk_columns(query_columns);
+    const std::int32_t splits = detail::kvarn_attention_splits(query_columns, batch_size, chunk);
+    const auto rows           = static_cast<std::size_t>(q_heads) *
+                      static_cast<std::size_t>(chunk) * batch_size * splits;
     constexpr std::size_t kAlign = 256;
     const auto round_up = [](std::size_t bytes) { return (bytes + kAlign - 1) / kAlign * kAlign; };
     return round_up(rows * head_dim * sizeof(std::uint16_t)) + 2 * round_up(rows * sizeof(float));
 }
 
-void kvarn_attention_cached(const Tensor& q, float scale, const KvarnAttentionCache& cache,
-                            WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
-    constexpr const char* op = "kvarn_attention_cached";
-    if (q.dtype != DType::BF16 || out.dtype != DType::BF16 || !q.is_contiguous() ||
-        !out.is_contiguous()) {
-        throw std::invalid_argument(std::string(op) + ": q/out must be contiguous BF16");
+namespace {
+
+void require_i32_vector(const char* op, const Tensor& t, std::int32_t extent, const char* label) {
+    if (t.dtype != DType::I32 || !t.is_contiguous() || t.ne[0] != extent || t.ne[1] != 1 ||
+        t.ne[2] != 1 || t.ne[3] != 1) {
+        throw std::invalid_argument(std::string(op) + ": " + label + " must be contiguous I32 [" +
+                                    std::to_string(extent) + "]");
     }
-    for (int d = 0; d < 4; ++d) {
-        if (q.ne[d] != out.ne[d]) {
-            throw std::invalid_argument(std::string(op) + ": q/out shapes must match");
-        }
-    }
-    if (q.ne[3] != 1 || q.ne[2] <= 0 || q.ne[1] <= 0) {
-        throw std::invalid_argument(std::string(op) + ": q must be [head_dim, q_heads, tokens]");
-    }
-    const std::int32_t head_dim = q.ne[0];
-    const std::int32_t q_heads  = q.ne[1];
-    const std::int32_t tokens   = q.ne[2];
+}
+
+} // namespace
+
+void kvarn_gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v,
+                         const Tensor& positions, const Tensor& valid_columns,
+                         const Tensor& kv_table_rows, float scale, KvarnBatchLayerView cache,
+                         WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
+    constexpr const char* op = "kvarn_gqa_attention";
     if (!std::isfinite(scale)) {
         throw std::invalid_argument(std::string(op) + ": scale must be finite");
     }
-    if (cache.record_pages < 0) {
-        throw std::invalid_argument(std::string(op) + ": record_pages must be nonnegative");
+    const Tensor* const bf16_tensors[] = {&q, &k, &v, &out};
+    const bool commit_only = q.data == nullptr && out.data == nullptr;
+    for (const Tensor* t : bf16_tensors) {
+        if (t->data == nullptr && commit_only && (t == &q || t == &out)) { continue; }
+        if (t->dtype != DType::BF16 || !t->is_contiguous()) {
+            throw std::invalid_argument(std::string(op) + ": q/k/v/out must be contiguous BF16");
+        }
     }
-
-    validate_plane(op, cache.records, cache.format, cache.kv_heads, head_dim);
-    if (cache.block_table.dtype != DType::I32 || !cache.block_table.is_contiguous() ||
-        cache.block_table.ne[0] < cache.record_pages) {
-        throw std::invalid_argument(std::string(op) +
-                                    ": block_table must be contiguous I32 covering record_pages");
+    const std::int32_t head_dim      = k.ne[0];
+    const std::int32_t width         = k.ne[2];
+    const std::int32_t batch_size    = k.ne[3];
+    // A commit-only call carries no query, so the registered geometry is resolved from the KV
+    // head count alone.
+    const std::int32_t q_heads =
+        commit_only ? (cache.kv_heads == 4 ? 24 : cache.kv_heads == 2 ? 16 : 0) : q.ne[1];
+    const std::int32_t query_columns = commit_only ? 0 : q.ne[2];
+    if (head_dim != cache.head_dim || width <= 0 || batch_size <= 0 || q_heads <= 0 ||
+        query_columns > width) {
+        throw std::invalid_argument(std::string(op) + ": q must be [head_dim, q_heads, Wq<=W, B]");
+    }
+    if (!commit_only) {
+        if (q.ne[0] != head_dim || q.ne[3] != batch_size || query_columns <= 0) {
+            throw std::invalid_argument(std::string(op) + ": q must be [head_dim, q_heads, Wq, B]");
+        }
+        for (int d = 0; d < 4; ++d) {
+            if (out.ne[d] != q.ne[d]) {
+                throw std::invalid_argument(std::string(op) + ": q/out shapes must match");
+            }
+        }
+    }
+    const Tensor* const kv_tensors[] = {&k, &v};
+    for (const Tensor* t : kv_tensors) {
+        if (t->ne[0] != head_dim || t->ne[1] != cache.kv_heads || t->ne[2] != width ||
+            t->ne[3] != batch_size) {
+            throw std::invalid_argument(std::string(op) + ": k/v must be [head_dim, kv_heads, W, B]");
+        }
     }
     if (q_heads % cache.kv_heads != 0) {
         throw std::invalid_argument(std::string(op) + ": q_heads must be a multiple of kv_heads");
     }
+    if (positions.dtype != DType::I32 || !positions.is_contiguous() || positions.ne[0] != width ||
+        positions.ne[1] != batch_size || positions.ne[2] != 1 || positions.ne[3] != 1) {
+        throw std::invalid_argument(std::string(op) + ": positions must be contiguous I32 [W, B]");
+    }
+    require_i32_vector(op, kv_table_rows, batch_size, "kv_table_rows");
+    if (valid_columns.data != nullptr) {
+        require_i32_vector(op, valid_columns, batch_size, "valid_columns");
+    }
 
-    const std::int32_t splits         = detail::kvarn_attention_splits(cache.record_pages);
+    const KvarnRecordLayout layout =
+        validate_plane(op, cache.records, cache.format, cache.kv_heads, head_dim);
+    if (cache.block_tables.dtype != DType::I32 || !cache.block_tables.is_contiguous() ||
+        cache.block_tables.ne[0] <= 0) {
+        throw std::invalid_argument(std::string(op) +
+                                    ": block_tables must be contiguous I32 [logical_pages, rows]");
+    }
+    const std::int32_t stage_tokens = kKvarnStageTokens;
+    const Tensor* const stage_tensors[] = {&cache.stage_k, &cache.stage_v};
+    for (const Tensor* t : stage_tensors) {
+        if (t->dtype != DType::BF16 || !t->is_contiguous() || t->ne[0] != head_dim ||
+            t->ne[1] != cache.kv_heads || t->ne[2] != stage_tokens ||
+            t->ne[3] != cache.block_tables.ne[1]) {
+            throw std::invalid_argument(
+                std::string(op) + ": stage planes must be BF16 [head_dim, kv_heads, "
+                                  "kKvarnStageTokens, table_rows]");
+        }
+    }
+    if (static_cast<std::int32_t>(layout.group) != kPagedKVPageSize) {
+        throw std::invalid_argument(std::string(op) + ": record group must equal the KV page size");
+    }
+
     const WorkspaceArena::Scope scope = workspace.scope();
-    Tensor partial_acc = workspace.alloc(DType::BF16, {head_dim, q_heads, tokens, splits});
-    Tensor partial_max = workspace.alloc(DType::FP32, {q_heads, tokens, splits, 1});
-    Tensor partial_sum = workspace.alloc(DType::FP32, {q_heads, tokens, splits, 1});
+    Tensor partial_acc;
+    Tensor partial_max;
+    Tensor partial_sum;
+    if (!commit_only) {
+        const std::int32_t chunk = detail::kvarn_attention_chunk_columns(query_columns);
+        const std::int32_t splits =
+            detail::kvarn_attention_splits(query_columns, batch_size, chunk);
+        partial_acc =
+            workspace.alloc(DType::BF16, {head_dim, q_heads, chunk * batch_size, splits});
+        partial_max = workspace.alloc(DType::FP32, {q_heads, chunk * batch_size, splits, 1});
+        partial_sum = workspace.alloc(DType::FP32, {q_heads, chunk * batch_size, splits, 1});
+    }
 
-    detail::kvarn_attention_launch(q, scale, cache.records, cache.block_table, cache.format,
-                                   cache.kv_heads, q_heads, cache.record_pages, tokens,
-                                   partial_acc, partial_max, partial_sum, out, stream);
+    detail::kvarn_gqa_attention_launch(q, k, v, positions, valid_columns, kv_table_rows, scale,
+                                       cache, q_heads, width, query_columns, batch_size,
+                                       partial_acc, partial_max, partial_sum, out, stream);
 }
 
 } // namespace ninfer::ops
