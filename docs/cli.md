@@ -197,11 +197,13 @@ KVarN keeps each sequence's first 128 positions and its still-filling 64-token t
 unquantized BF16 stage buffer, and compresses every complete page between them into one structured
 record; see [KVarN structured KV records](maintainer/kvarn-records.md). The stage buffer is a fixed
 cost independent of `--max-context`, so KVarN's advantage grows with the context you ask for. It is
-a capacity format, not a speed one: decode throughput is slightly ahead of BF16 (17.9 vs 15.2 tok/s
-on a 24,920-token prompt), but prefill is slower and falls further behind as the prompt grows
-(0.80x BF16 at 10k tokens, 0.64x at 25k), because the record attention kernel rescans history per
-query token instead of tiling the query. Prefer KVarN when the context you need does not fit
-otherwise, not to make a prompt that already fits go faster.
+a capacity format first: decode throughput is slightly ahead of BF16 (17.9 vs 15.2 tok/s on a
+24,920-token prompt), while prefill is slower. The record attention kernel tiles the query during
+prefill so one decode of a record serves several query columns, which is worth 2.9x on the Op and
+1.43x on whole-prompt prefill at 31.2k tokens (124.2 -> 178.2 tok/s, against 208.9 for BF16 on the
+same prompt); attention is only about a quarter of prefill after that, so the remainder is not
+attention-bound. Prefer KVarN when the
+context you need does not fit otherwise, not to make a prompt that already fits go faster.
 `--spec dflash` is rejected under KVarN because DFlash's context append needs a per-token BF16
 plane; `--spec mtp` works normally.
 

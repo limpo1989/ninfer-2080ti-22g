@@ -94,13 +94,27 @@ K3 对 record 段不施加 mask：record 段整体位于 `positions[0]` 之下�
 K3 的 launch shape 只依赖 `W`、`B` 与 head geometry，不依赖 frontier，因此 decode 仍可被 CUDA graph
 捕获。已注册几何为 `[256, 24|4]`（group 6）与 `[256, 16|2]`（group 8）。
 
-K3 的实现 profile（非语义要求）：一个 CTA 负责一个 `(kv_head, split, query token)`，`HeadDim` 个
-线程。score 阶段把线程映射到 (page 内 token, 通道四分之一)，value 阶段映射到通道，两者都按 payload
-的存储顺序读取。record 段的 score 在旋转域中求值；split-local accumulator 在写出前旋转回原始域——
-旋转是线性的，与归约的加权求和可交换，所以它与 BF16 段的 partial 可以直接相加。
+K3 有两套实现 profile（均非语义要求），由 query column 数选择：
 
-split 数量由 wrapper 一次性按 `W`、`B` 定出并据此给 partials 定容；launcher 不得按 column chunk
-重新推导 split 数量。
+**decode profile**（`Wq < 128`）：一个 CTA 负责一个 `(kv_head, split, query token)`，`HeadDim` 个
+线程。score 阶段把线程映射到 (page 内 token, 通道四分之一)，value 阶段映射到通道，两者都按 payload
+的存储顺序读取。split-local partial 写入 workspace，由 reduce kernel 归并。split 数量由 wrapper
+一次性按 `W`、`B` 定出并据此给 partials 定容；launcher 不得按 column chunk 重新推导 split 数量。
+
+**prefill profile**（`Wq >= 128`）：一个 CTA 负责一个 `(kv_head, query tile, row)`，query tile 是
+`kKvarnPrefillRows / GroupSize` 个相邻 query column（27B 为 4，35B 为 3），因此每个 CTA 携带
+`kKvarnPrefillRows = 24` 行。record 段对一次调用的所有 query column 是同一段历史（record 只覆盖调用
+前已提交的整页），所以一个 record 在 CTA 内只解码一次、服务整个 tile：解码工作量按 tile 大小摊薄。
+这类调用天然只有一个 split，故该 kernel 自己做归一化并直接写 `out`，不经过 partial workspace 与
+reduce kernel。
+
+prefill profile 的 shape 是照 SM75 定的：24 行的预算把 shared memory 压在 32 KiB 以下，配合
+`__launch_bounds__(256, 2)`（128 寄存器、无 spill），让两个 CTA 同时驻留一个 SM 的 64 KiB shared
+memory；query tile 以 `[channel][row]` 存 `__half`，probability 以 `[key][row]` 存 FP32，于是内层
+循环用 128-bit shared load 一次取 8 个 query 或 4 个 weight。
+
+两套 profile 的数学相同：record 段的 score 在旋转域中求值；accumulator 在离开 record 段前旋转回原始
+域——旋转是线性的，与归约的加权求和可交换，所以它与 BF16 段的 partial 可以直接相加。
 
 ---
 
@@ -142,7 +156,15 @@ Sinkhorn 是带 best-so-far 选择的迭代浮点搜索，device kernel **不要
 `tests/ops/test_kvarn.cpp` 分两组：codec case 覆盖两个 preset、两种 head geometry 与多页 / 单页；
 sequence case 在 K3 上跑完整的 prefill + decode 序列，覆盖「全部位置仍在 sink 内」「decode 跨页」
 「批量 B=2/3 且 table row 各异」「speculative 宽度在一次调用内跨页」「35B head geometry」以及
-「留下短尾 column chunk 的 prefill 宽度」——最后一项是 split-count 回归的直接守卫。
+「留下短尾 column chunk 的 prefill 宽度」——倒数第二项是 split-count 回归的直接守卫。
+
+另有四个 chunked prefill case：最后一次调用既宽（走 prefill profile）又坐在一段 record 历史之上，
+这是唯一能覆盖 prefill profile record pass 的形状（其余 case 的末次调用都是 `records=[2,2)`）。
+其中三个的末次宽度不是 query tile 的整数倍，覆盖尾部残 tile；一个是 B=2。
+
+这些 case 的末次 `first` 都对齐到页边界，因为 oracle 只能表达这一种起点：它按调用**前**的
+record 边界从 stage 缓冲重建 `[record_end, first)` 段，而该调用自身的 append 已经把那些 tail slot
+让给了新的尾页。起点落在页中间时 oracle 读到的是错的 K/V——这是 oracle 的限制，不是 Op 的。
 
 ---
 
@@ -163,12 +185,35 @@ needle-in-a-haystack 提示：
 
 Decode 略快于 BF16：KV traffic 小了 4.6 倍，抵消掉了解码 record 的额外算术。
 
-Prefill 则随上下文变慢，且差距在拉大（10k 为 BF16 的 0.80x，25k 为 0.64x）。原因是 K3 的 CTA 划分
-是 decode 形状的：每个 query token 一个 CTA，各自重新扫描并解码整段 record 历史，没有像 flash
-attention 那样把 Q 分块、让一个 K/V tile 被整块 Q 复用。对 `W = prefill_chunk` 的调用，record 解码
-工作量因此被放大约 `W` 倍。要在长上下文 prefill 上追平，需要给 K3 增加 Q-tiling 的 prefill profile，
-让同一个 record 在 shared memory 中解码一次、服务整个 query tile。这是纯性能工作，不改变本文的任何
-数学或 storage 契约。
+上表中的两行 `kvarn` prefill 是 **Q-tiling 之前**的数字，只反映 decode profile 的形状代价，已被
+下面的 prefill profile 取代。
+
+### Q-tiled prefill profile
+
+`ninfer_kvarn_attention_bench`（27B 几何、K4V2、`W = Wq = 1024`、`B = 1`，每次 launch 的中位耗时；
+即一层一次 prefill chunk 的全部 K3 成本）：
+
+| 已提交上下文 | decode profile | prefill profile | 提速 |
+|---:|---:|---:|---:|
+| 2,048 | 45.95 ms | 18.54 ms | 2.48x |
+| 8,192 | 138.82 ms | 48.77 ms | 2.85x |
+| 16,384 | 260.44 ms | 91.28 ms | 2.85x |
+| 24,576 | 383.07 ms | 133.79 ms | 2.86x |
+
+同一条 31.2k token 的 needle 提示上端到端跑完整模型（`qwen3_8_27b`、greedy、单请求）：
+
+| KV dtype / K3 profile | prefill 墙钟 | prefill tok/s | 相对 bf16 | decode tok/s | needle |
+|---|---:|---:|---:|---:|---|
+| `bf16` | 149.3 s | 208.93 | 1.00x | 15.42 | 取回 |
+| `kvarn`，decode profile（Q-tiling 之前） | 251.4 s | 124.25 | 0.59x | 17.53 | 取回 |
+| `kvarn`，Q-tiled prefill profile | 175.1 s | 178.17 | 0.85x | 17.52 | 取回 |
+
+端到端 1.43x 小于 kernel 的 2.86x，因为 attention 只占 prefill 的一部分：按这两次 `kvarn` 测量
+反推，K3 从约 116 s 降到约 40 s，而同一条提示上的非 attention prefill 工作约 135 s 不变。也就是说
+K3 现在只占 prefill 的约 23%，即使把它做到零，这条提示的 prefill 上限也只有 1.86x——余下与 BF16
+的 0.85x 差距里，只有一小部分还能靠 K3 拿回来。
+
+decode 不受影响（`Wq < 128` 仍走 decode profile），三次运行都逐字取回了 needle。
 
 Capacity 侧的实测：在同一份约 2.66 GiB 的 runtime 预算下，`bf16` 的 `--max-context` 上限在 32,768
 附近，`kvarn` 在 131,072 成功、172,032 失败——与 bytes/token 的 4.6x 比值一致。

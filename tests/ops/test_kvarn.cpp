@@ -561,6 +561,17 @@ int main() {
         // A prefill width that leaves a short trailing column chunk, verified directly.
         {KvarnFormat::K4V2G64, "kvarn gqa k4v2 ragged prefill", 4, 24, 1, 914, 0, 1},
         {KvarnFormat::K4V2G64, "kvarn gqa k4v2 ragged prefill B=2", 4, 24, 2, 332, 0, 1},
+        // Chunked prefill: the last call is wide AND sits on a record history, which is the only
+        // shape that exercises the Q-tiled prefill kernel's record pass.
+        {KvarnFormat::K4V2G64, "kvarn gqa k4v2 chunked prefill", 4, 24, 1, 512, 3, 512},
+        // A chunk width that is not a whole number of query tiles, over records. The oracle can
+        // only reconstruct a page-aligned `first` (it reads the stage tail after the call's own
+        // append has already reused those slots), so the ragged width is the LAST call's.
+        {KvarnFormat::K4V4G64, "kvarn gqa k4v4 chunked prefill ragged", 4, 24, 1, 512, 1, 258},
+        // Two rows advancing together over records, with a chunk narrower than a page.
+        {KvarnFormat::K4V2G64, "kvarn gqa k4v2 chunked prefill B=2", 4, 24, 2, 384, 1, 190},
+        // The 35B geometry over records, where the query tile is three columns rather than four.
+        {KvarnFormat::K4V2G64, "kvarn gqa 35b chunked prefill", 2, 16, 1, 320, 2, 320},
     };
     for (const SequenceCase& test_case : sequence_cases) {
         failures += run_sequence_case(test_case);

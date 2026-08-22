@@ -35,6 +35,9 @@ void decompress_one(const Tensor& records, const Tensor& page_ids, std::int32_t 
 // through their columns, so the split count only has to rescue narrow decode calls; the column
 // chunk keeps the split-local partial workspace bounded at large W.
 constexpr std::int32_t kKvarnMaxSplits    = 32;
+// Below this many query columns a call is a decode or a speculative round: the Q-tiled prefill
+// kernel would not have enough tiles to fill the device, so the split path serves it instead.
+constexpr std::int32_t kKvarnPrefillMinColumns = 128;
 constexpr std::int32_t kKvarnChunkColumns = 64;
 constexpr std::int32_t kKvarnBusyColumns  = 64;
 
@@ -69,6 +72,39 @@ void gqa_one(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& po
         kKvarnSinkhornIterations);
 
     const std::int32_t query_offset = width - query_columns;
+
+    // Prefill: one CTA carries a tile of query columns through a single decode of each record,
+    // and normalizes its own output because such a call is always one split.
+    if (query_columns >= kKvarnPrefillMinColumns) {
+        constexpr int Tile = KvarnPrefillTile<Geometry>::value;
+        auto* kernel       = kvarn_gqa_prefill_kernel<Spec, Geometry, Tile>;
+        static const bool carveout = [kernel] {
+            // Turing splits 64 KiB between L1 and shared per SM; ask for all of it so two CTAs
+            // of this kernel's ~27 KiB footprint stay resident.
+            cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+            return true;
+        }();
+        (void)carveout;
+        const dim3 grid(static_cast<unsigned>(Geometry::KVHeads),
+                        static_cast<unsigned>((query_columns + Tile - 1) / Tile),
+                        static_cast<unsigned>(batch_size));
+        kernel<<<grid, Spec::HeadDim, 0, stream>>>(
+            q_data, k_data, v_data, positions_data, valid_data, rows_data, tables_data, stride,
+            width, query_offset, query_columns,
+            static_cast<const __nv_bfloat16*>(cache.stage_k.data),
+            static_cast<const __nv_bfloat16*>(cache.stage_v.data), record_data, scale,
+            static_cast<__nv_bfloat16*>(out.data));
+
+        const dim3 tiled_append_grid(static_cast<unsigned>(Geometry::KVHeads),
+                                     static_cast<unsigned>(width),
+                                     static_cast<unsigned>(batch_size));
+        kvarn_stage_append_kernel<Spec, Geometry>
+            <<<tiled_append_grid, Spec::HeadDim, 0, stream>>>(k_data, v_data, positions_data,
+                                                              valid_data, rows_data, width,
+                                                              stage_k, stage_v);
+        return;
+    }
+
     const std::int32_t chunk = query_columns > 0 ? kvarn_attention_chunk_columns(query_columns) : 1;
     // The split count and the partial stride are properties of the whole call, not of one chunk:
     // the wrapper sized the workspace from them, and a short trailing chunk must not re-derive

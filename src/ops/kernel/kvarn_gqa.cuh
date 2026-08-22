@@ -454,6 +454,402 @@ __launch_bounds__(Spec::HeadDim) __global__ void kvarn_gqa_partial_kernel(
     }
 }
 
+
+// ── Q-tiled prefill attention (SM75) ────────────────────────────────────────────────────────
+//
+// kvarn_gqa_partial_kernel maps one CTA to one query token, which is right for decode and wrong
+// for prefill: every CTA re-reads and re-dequantizes the whole record history, so a W-column
+// call decodes each record W times. The record region is identical for all of a call's query
+// columns (records cover only pages already committed before the call), so a prefill CTA can
+// carry a tile of QueryTile columns through one decode of each record.
+//
+// The tile is sized so QueryTile * Geometry::GroupSize == kKvarnPrefillRows for every registered
+// geometry: that fixes the shared-memory footprint under 32 KiB, which is what lets two CTAs of
+// 256 threads share a Turing SM's 64 KiB of shared memory.
+//
+// The call is one split by construction (a prefill call has query columns to spare for
+// occupancy), so this kernel normalizes and writes `out` itself instead of going through the
+// partial workspace and the reducer.
+
+inline constexpr int kKvarnPrefillRows = 24;
+
+// Query columns per prefill CTA, chosen so the accumulated row count is kKvarnPrefillRows.
+template <typename Geometry>
+struct KvarnPrefillTile {
+    static constexpr int value = kKvarnPrefillRows / Geometry::GroupSize;
+    static_assert(value * Geometry::GroupSize == kKvarnPrefillRows,
+                  "the prefill row budget must divide into whole query columns");
+};
+
+template <typename Spec, typename Geometry, int QueryTile>
+struct KvarnPrefillShared {
+    static constexpr int D     = Spec::HeadDim;
+    static constexpr int G     = Spec::Group;
+    static constexpr int Rows  = Geometry::GroupSize;
+    static constexpr int R     = QueryTile * Rows;
+    static constexpr int Quads = D / G;
+    static constexpr int Chunk = D / G; // rows folded per cross-quad reduction round
+
+    static_assert(R % 8 == 0, "the row tile is read eight halves at a time");
+    static_assert(R % 4 == 0, "the row tile is read four probabilities at a time");
+    static_assert(Chunk * G == D, "one reduction round must cover the block exactly");
+
+    // [channel][row], so a thread reads a whole row tile of one channel as two 128-bit loads.
+    __align__(16) __half query[D * R];
+    // [key][row], for the same reason on the value pass.
+    __align__(16) float probability[G * R];
+    // The score buffer and the rotation scratch never overlap in time.
+    __align__(16) float work[Quads * Chunk * G > D ? Quads * Chunk * G : D];
+    float key_scale[D];
+    float key_zero[D];
+    float value_channel[D];
+    float key_token[G];
+    float value_scale[G];
+    float value_zero[G];
+    float running_max[R];
+    float running_sum[R];
+    float rescale[R];
+    int position[QueryTile];
+};
+
+// Eight consecutive halves of one channel's row tile, as floats.
+__device__ __forceinline__ void kvarn_load_row_octet(const __half* base, float (&out)[8]) {
+    const uint4 packed = *reinterpret_cast<const uint4*>(base);
+    const unsigned words[4] = {packed.x, packed.y, packed.z, packed.w};
+#pragma unroll
+    for (int w = 0; w < 4; ++w) {
+        out[2 * w + 0] =
+            __half2float(__ushort_as_half(static_cast<unsigned short>(words[w] & 0xffffu)));
+        out[2 * w + 1] =
+            __half2float(__ushort_as_half(static_cast<unsigned short>(words[w] >> 16)));
+    }
+}
+
+// Folds one page's R x Group scores into the running online-softmax state, leaving the per-key
+// weights in shared.probability. One warp owns whole rows, so the fold costs a few shuffles
+// instead of a serial scan by a single warp's worth of live threads.
+template <typename Spec, typename Geometry, int QueryTile>
+__device__ __forceinline__ void kvarn_prefill_fold(
+    KvarnPrefillShared<Spec, Geometry, QueryTile>& shared, int warp, int lane) {
+    using Shared          = KvarnPrefillShared<Spec, Geometry, QueryTile>;
+    constexpr int R       = Shared::R;
+    constexpr int G       = Shared::G;
+    constexpr int Warps   = Shared::D / kWarpSize;
+    constexpr float Log2E = 1.4426950408889634074f;
+
+    for (int r = warp; r < R; r += Warps) {
+        float page_max = -CUDART_INF_F;
+        for (int key = lane; key < G; key += kWarpSize) {
+            page_max = fmaxf(page_max, shared.probability[key * R + r]);
+        }
+        page_max            = warp_max(page_max);
+        const float updated = fmaxf(shared.running_max[r], page_max);
+
+        float page_sum = 0.0f;
+        for (int key = lane; key < G; key += kWarpSize) {
+            const float score  = shared.probability[key * R + r];
+            const float weight = score == -CUDART_INF_F ? 0.0f : exp2f((score - updated) * Log2E);
+            shared.probability[key * R + r] = weight;
+            page_sum += weight;
+        }
+        page_sum = warp_sum(page_sum);
+
+        if (lane == 0) {
+            const float rescale = shared.running_max[r] == -CUDART_INF_F
+                                      ? 0.0f
+                                      : exp2f((shared.running_max[r] - updated) * Log2E);
+            shared.running_sum[r] = shared.running_sum[r] * rescale + page_sum;
+            shared.running_max[r] = updated;
+            shared.rescale[r]     = rescale;
+        }
+    }
+    __syncthreads();
+}
+
+template <typename Spec, typename Geometry, int QueryTile>
+__launch_bounds__(Spec::HeadDim, 2) __global__ void kvarn_gqa_prefill_kernel(
+    const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k,
+    const __nv_bfloat16* __restrict__ v, const std::int32_t* __restrict__ positions,
+    const std::int32_t* __restrict__ valid_columns, const std::int32_t* __restrict__ table_rows,
+    const std::int32_t* __restrict__ block_tables, std::int32_t table_stride, std::int32_t width,
+    std::int32_t query_offset, std::int32_t query_columns,
+    const __nv_bfloat16* __restrict__ stage_k, const __nv_bfloat16* __restrict__ stage_v,
+    const std::uint8_t* __restrict__ records, float scale, __nv_bfloat16* __restrict__ out) {
+    using Shared          = KvarnPrefillShared<Spec, Geometry, QueryTile>;
+    constexpr int D       = Shared::D;
+    constexpr int G       = Shared::G;
+    constexpr int Rows    = Shared::Rows;
+    constexpr int R       = Shared::R;
+    constexpr int Quads   = Shared::Quads;
+    constexpr int Chunk   = Shared::Chunk;
+    constexpr int Warps   = D / kWarpSize;
+
+    __shared__ Shared shared;
+
+    const int kv_head = static_cast<int>(blockIdx.x);
+    const int tile    = static_cast<int>(blockIdx.y);
+    const int row     = static_cast<int>(blockIdx.z);
+    const int tid     = static_cast<int>(threadIdx.x);
+    const int lane    = tid & (kWarpSize - 1);
+    const int warp    = tid >> 5;
+    const int slot    = tid % G;
+    const int quad    = tid / G;
+    const int q_begin = tile * QueryTile;
+
+    const int columns = kvarn_row_columns(valid_columns, row, width);
+
+    // Positions of the tile's query columns; -1 marks a column this row does not own.
+    if (tid < QueryTile) {
+        const int query  = q_begin + tid;
+        const int column = query_offset + query;
+        shared.position[tid] =
+            (query < query_columns && column < columns) ? positions[column + width * row] : -1;
+    }
+    if (tid < R) {
+        shared.running_max[tid] = -CUDART_INF_F;
+        shared.running_sum[tid] = 0.0f;
+    }
+    __syncthreads();
+
+    int last_position = -1;
+#pragma unroll
+    for (int j = 0; j < QueryTile; ++j) { last_position = max(last_position, shared.position[j]); }
+
+    const auto write_out = [&](const float* accumulator) {
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const int j     = r / Rows;
+            const int query = q_begin + j;
+            if (query >= query_columns) { continue; }
+            const int q_head = kv_head * Rows + (r - j * Rows);
+            const float sum  = accumulator == nullptr ? 0.0f : shared.running_sum[r];
+            const float value =
+                (shared.position[j] < 0 || !(sum > 0.0f)) ? 0.0f : accumulator[r] / sum;
+            out[static_cast<std::int64_t>(tid) +
+                static_cast<std::int64_t>(D) *
+                    (q_head + Geometry::QHeads * (query + query_columns * row))] =
+                __float2bfloat16(value);
+        }
+    };
+
+    if (columns <= 0 || last_position < 0) {
+        write_out(nullptr);
+        return;
+    }
+
+    const int first     = positions[width * row];
+    const int table_row = table_rows[row];
+    const std::int32_t* table =
+        block_tables + static_cast<std::int64_t>(table_row) * table_stride;
+
+    const int sink_end        = kKvarnSinkPages * G;
+    const int record_page_end = first >= sink_end ? first / G : kKvarnSinkPages;
+
+    // Rotate the tile's queries into the record frame, one row at a time through the scratch.
+    for (int r = 0; r < R; ++r) {
+        const int j      = r / Rows;
+        const int query  = q_begin + j;
+        const int q_head = kv_head * Rows + (r - j * Rows);
+        shared.work[tid] =
+            shared.position[j] < 0
+                ? 0.0f
+                : __bfloat162float(
+                      q[static_cast<std::int64_t>(tid) +
+                        static_cast<std::int64_t>(D) *
+                            (q_head + Geometry::QHeads * (query + query_columns * row))]);
+        kvarn_hadamard_shared<D>(shared.work, tid);
+        shared.query[tid * R + r] = __float2half(shared.work[tid]);
+    }
+    __syncthreads();
+
+    float accumulator[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) { accumulator[r] = 0.0f; }
+
+    // ── pass 1: record pages, evaluated in the rotated frame ────────────────────────────────
+    for (int page = kKvarnSinkPages; page < record_page_end; ++page) {
+        const std::uint8_t* record =
+            records + kvarn_record_offset<Spec, Geometry::KVHeads>(table[page], kv_head);
+
+        shared.key_scale[tid]     = kvarn_load_f16(record, Spec::KScaleOff, tid);
+        shared.key_zero[tid]      = kvarn_load_f16(record, Spec::KZeroOff, tid);
+        shared.value_channel[tid] = kvarn_load_f16(record, Spec::VChannelOff, tid);
+        if (tid < G) {
+            shared.key_token[tid]   = kvarn_load_f16(record, Spec::KTokenOff, tid);
+            shared.value_scale[tid] = kvarn_load_f16(record, Spec::VScaleOff, tid);
+            shared.value_zero[tid]  = kvarn_load_f16(record, Spec::VZeroOff, tid);
+        }
+        __syncthreads();
+
+        const std::uint8_t* key_payload = record + Spec::KPayloadOff;
+        const float token_scale         = shared.key_token[slot];
+        float partial[R];
+#pragma unroll
+        for (int r = 0; r < R; ++r) { partial[r] = 0.0f; }
+        for (int d = quad * G; d < (quad + 1) * G; ++d) {
+            const int code =
+                kvarn_unpack<Spec::KeyBits>(key_payload, static_cast<std::int64_t>(d) * G + slot);
+            const float key = (code * shared.key_scale[d] + shared.key_zero[d]) * token_scale;
+#pragma unroll
+            for (int octet = 0; octet < R / 8; ++octet) {
+                float tile_q[8];
+                kvarn_load_row_octet(shared.query + d * R + octet * 8, tile_q);
+#pragma unroll
+                for (int i = 0; i < 8; ++i) { partial[octet * 8 + i] += tile_q[i] * key; }
+            }
+        }
+
+        // Sum the four quads' partial scores, Chunk rows at a time.
+#pragma unroll
+        for (int base = 0; base < R; base += Chunk) {
+            __syncthreads();
+#pragma unroll
+            for (int i = 0; i < Chunk; ++i) {
+                shared.work[(quad * Chunk + i) * G + slot] = partial[base + i];
+            }
+            __syncthreads();
+            for (int index = tid; index < Chunk * G; index += D) {
+                const int i   = index / G;
+                const int key = index - i * G;
+                float total   = 0.0f;
+#pragma unroll
+                for (int qi = 0; qi < Quads; ++qi) {
+                    total += shared.work[(qi * Chunk + i) * G + key];
+                }
+                shared.probability[key * R + base + i] = total * scale;
+            }
+        }
+        __syncthreads();
+
+        kvarn_prefill_fold(shared, warp, lane);
+#pragma unroll
+        for (int r = 0; r < R; ++r) { accumulator[r] *= shared.rescale[r]; }
+
+        const std::uint8_t* value_payload = record + Spec::VPayloadOff;
+        const float channel               = shared.value_channel[tid];
+        for (int key = 0; key < G; ++key) {
+            const int code = kvarn_unpack<Spec::ValueBits>(
+                value_payload, static_cast<std::int64_t>(key) * D + tid);
+            const float value =
+                (code * shared.value_scale[key] + shared.value_zero[key]) * channel;
+            const float4* weights =
+                reinterpret_cast<const float4*>(shared.probability + key * R);
+#pragma unroll
+            for (int quartet = 0; quartet < R / 4; ++quartet) {
+                const float4 w = weights[quartet];
+                accumulator[quartet * 4 + 0] += w.x * value;
+                accumulator[quartet * 4 + 1] += w.y * value;
+                accumulator[quartet * 4 + 2] += w.z * value;
+                accumulator[quartet * 4 + 3] += w.w * value;
+            }
+        }
+        __syncthreads();
+    }
+
+    // Leave the record frame, then refill the query tile in the original frame for pass 2.
+    if (record_page_end > kKvarnSinkPages) {
+        for (int r = 0; r < R; ++r) {
+            shared.work[tid] = accumulator[r];
+            kvarn_hadamard_shared<D>(shared.work, tid);
+            accumulator[r] = shared.work[tid];
+        }
+    }
+    for (int r = 0; r < R; ++r) {
+        const int j      = r / Rows;
+        const int query  = q_begin + j;
+        const int q_head = kv_head * Rows + (r - j * Rows);
+        const float value =
+            shared.position[j] < 0
+                ? 0.0f
+                : __bfloat162float(
+                      q[static_cast<std::int64_t>(tid) +
+                        static_cast<std::int64_t>(D) *
+                            (q_head + Geometry::QHeads * (query + query_columns * row))]);
+        shared.query[tid * R + r] = __float2half(value);
+    }
+    __syncthreads();
+
+    // ── pass 2: sink, tail, and fresh pages, evaluated in the original frame ────────────────
+    const int last_page = last_position / G;
+    for (int page = 0; page <= last_page; ++page) {
+        if (page >= kKvarnSinkPages && page < record_page_end) { continue; }
+
+        for (int key = warp; key < G; key += Warps) {
+            const int absolute = page * G + key;
+            if (absolute > last_position) {
+                for (int r = lane; r < R; r += kWarpSize) {
+                    shared.probability[key * R + r] = -CUDART_INF_F;
+                }
+                continue;
+            }
+            std::int64_t source = 0;
+            if (absolute >= first) {
+                source = kvarn_fresh_index<Spec, Geometry>(0, kv_head,
+                                                           (absolute - first) + width * row);
+            } else {
+                source = kvarn_stage_index<Spec, Geometry>(
+                    0, kv_head, kvarn_stage_slot(absolute, G), table_row);
+            }
+            const __nv_bfloat16* keys = absolute >= first ? k + source : stage_k + source;
+
+            float partial[R];
+#pragma unroll
+            for (int r = 0; r < R; ++r) { partial[r] = 0.0f; }
+            for (int chunk = 0; chunk < D / kWarpSize; ++chunk) {
+                const int d       = chunk * kWarpSize + lane;
+                const float value = __bfloat162float(keys[d]);
+#pragma unroll
+                for (int octet = 0; octet < R / 8; ++octet) {
+                    float tile_q[8];
+                    kvarn_load_row_octet(shared.query + d * R + octet * 8, tile_q);
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) { partial[octet * 8 + i] += tile_q[i] * value; }
+                }
+            }
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                const float total = warp_sum(partial[r]);
+                if (lane == 0) {
+                    shared.probability[key * R + r] =
+                        absolute > shared.position[r / Rows] ? -CUDART_INF_F : total * scale;
+                }
+            }
+        }
+        __syncthreads();
+
+        kvarn_prefill_fold(shared, warp, lane);
+#pragma unroll
+        for (int r = 0; r < R; ++r) { accumulator[r] *= shared.rescale[r]; }
+
+        for (int key = 0; key < G; ++key) {
+            const int absolute = page * G + key;
+            if (absolute > last_position) { break; }
+            std::int64_t source = 0;
+            if (absolute >= first) {
+                source = kvarn_fresh_index<Spec, Geometry>(tid, kv_head,
+                                                           (absolute - first) + width * row);
+            } else {
+                source = kvarn_stage_index<Spec, Geometry>(
+                    tid, kv_head, kvarn_stage_slot(absolute, G), table_row);
+            }
+            const float value = __bfloat162float(absolute >= first ? v[source] : stage_v[source]);
+            const float4* weights =
+                reinterpret_cast<const float4*>(shared.probability + key * R);
+#pragma unroll
+            for (int quartet = 0; quartet < R / 4; ++quartet) {
+                const float4 w = weights[quartet];
+                accumulator[quartet * 4 + 0] += w.x * value;
+                accumulator[quartet * 4 + 1] += w.y * value;
+                accumulator[quartet * 4 + 2] += w.z * value;
+                accumulator[quartet * 4 + 3] += w.w * value;
+            }
+        }
+        __syncthreads();
+    }
+
+    write_out(accumulator);
+}
+
 template <typename Spec, typename Geometry>
 __launch_bounds__(Spec::HeadDim) __global__
     void kvarn_gqa_reduce_kernel(const __nv_bfloat16* __restrict__ partial_acc,
