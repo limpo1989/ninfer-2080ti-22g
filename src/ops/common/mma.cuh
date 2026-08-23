@@ -149,10 +149,10 @@ __device__ __forceinline__ void mma_f16(float& c0, float& c1, float& c2, float& 
                                         unsigned b1) {
 #if defined(NINFER_SM75)
     // Decompose m16n8k16 into two Turing m16n8k8 operations:
-    // (A_k0: a0 [rows 0..7], a2 [rows 8..15]) x B_k0 [b0]
-    // (A_k1: a1 [rows 0..7], a3 [rows 8..15]) x B_k1 [b1]
-    mma_f16_m16n8k8(c0, c1, c2, c3, a0, a2, b0);
-    mma_f16_m16n8k8(c0, c1, c2, c3, a1, a3, b1);
+    // (a0 [rows 0..7], a1 [rows 8..15]) x B_k0 [b0]
+    // (a2 [rows 0..7], a3 [rows 8..15]) x B_k1 [b1]
+    mma_f16_m16n8k8(c0, c1, c2, c3, a0, a1, b0);
+    mma_f16_m16n8k8(c0, c1, c2, c3, a2, a3, b1);
 #else
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
                  "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
@@ -164,11 +164,12 @@ __device__ __forceinline__ void mma_f16(float& c0, float& c1, float& c2, float& 
 __device__ __forceinline__ void mma_s8(int& c0, int& c1, int& c2, int& c3, unsigned a0, unsigned a1,
                                        unsigned a2, unsigned a3, unsigned b0, unsigned b1) {
 #if defined(NINFER_SM75)
-    // Turing decomposition of m16n8k32 into 4x m8n8k16 operations:
-    // (M0, K0), (M0, K1), (M1, K0), (M1, K1)
+    // Turing decomposition of m16n8k32 into 4x m8n8k16 operations.
+    // Standard m16n8k32 A layout: a0 = M0·K0, a1 = M1·K0, a2 = M0·K1,
+    // a3 = M1·K1; pair each (M, K) fragment with its matching B register.
     mma_s8_m8n8k16(c0, c1, a0, b0);
-    mma_s8_m8n8k16(c0, c1, a1, b1);
-    mma_s8_m8n8k16(c2, c3, a2, b0);
+    mma_s8_m8n8k16(c0, c1, a2, b1);
+    mma_s8_m8n8k16(c2, c3, a1, b0);
     mma_s8_m8n8k16(c2, c3, a3, b1);
 #else
     asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "

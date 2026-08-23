@@ -310,12 +310,13 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
     auto issue_kv_tile = [&](int tile_k0) {
         const int physical_page = block_table[tile_k0 >> kPagedKVPageShift];
         for (int key_l = tid; key_l < Bc; key_l += kGqaPrefillI8Threads) {
-            const int key = tile_k0 + key_l;
-            __half* kd    = &k_scale_s[key_l * Groups];
-            __half* vd    = &v_scale_s[key_l * Groups];
+            const int key      = tile_k0 + key_l;
+            const int page_off = key & kPagedKVPageMask;
+            __half* kd         = &k_scale_s[key_l * Groups];
+            __half* vd         = &v_scale_s[key_l * Groups];
             if (key <= max_query_abs) {
                 const std::int64_t off =
-                    gqa_kv_quant_scale_index<Geometry>(physical_page, kv_head, 0, key_l);
+                    gqa_kv_quant_scale_index<Geometry>(physical_page, kv_head, 0, page_off);
                 ninfer::ops::cp_async<8>(kd, &cache_k_scale[off]);
                 ninfer::ops::cp_async<8>(vd, &cache_v_scale[off]);
             } else {
@@ -329,11 +330,12 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
             const int dc    = chunk - key_l * (D / 16);
             const int d     = dc * 16;
             const int key   = tile_k0 + key_l;
+            const int page_off = key & kPagedKVPageMask;
             std::int8_t* kd = &k_i8[(key_l * DB16 + gqa_prefill_swz(key_l, dc * 8)) * 2];
             std::int8_t* vd = &v_i8[key_l * D + d];
             if (key <= max_query_abs) {
                 const std::int64_t off =
-                    gqa_kv_quant_code_index<Geometry>(physical_page, kv_head, d, key_l);
+                    gqa_kv_quant_code_index<Geometry>(physical_page, kv_head, d, page_off);
                 cp_async<16, Cache::cg>(kd, &cache_k[off]);
                 cp_async<16, Cache::cg>(vd, &cache_v[off]);
             } else {
