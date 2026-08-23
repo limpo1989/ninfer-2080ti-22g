@@ -2,11 +2,27 @@
 
 #include "core/tensor.h"
 
+#include <cstdint>
 #include <cuda_runtime.h>
 
 namespace ninfer::ops::detail {
 
 using W8Launch = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+
+// Largest token count any decode GEMV core is instantiated for. Above it the exact-small-T MMA
+// core wins again, because the activation tile it reuses across a 16-row output tile is what a
+// one-row-per-warp GEMV has to re-read. Each geometry declares its own measured cut-off at or
+// below this bound, and refuses a launch past it.
+inline constexpr std::int32_t kW8LastDecodeGemvToken      = 8;
+inline constexpr std::int32_t kW8LastDecodeGemvTokenTallK = 5;
+
+void launch_w8_vocabulary_decode_gemv(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+void launch_w8_mtp_input_decode_gemv(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+void launch_w8_mtp_attention_decode_gemv(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+void launch_w8_mtp_attention_output_decode_gemv(const Tensor&, const Weight&, Tensor&,
+                                                cudaStream_t);
+void launch_w8_mtp_gate_up_decode_gemv(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+void launch_w8_mtp_down_decode_gemv(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 
 void launch_w8_decode_r4(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 void launch_w8_small_t(const Tensor&, const Weight&, Tensor&, cudaStream_t);

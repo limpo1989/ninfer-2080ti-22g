@@ -26,11 +26,13 @@ constexpr int kBytesPerGroup     = 32;
 constexpr int kVecBytes          = 16;
 constexpr int kGroupsPerWarpTile = 16;
 constexpr int kVecsPerWarpTile   = kGroupsPerWarpTile * kBytesPerGroup / kVecBytes;
-constexpr int kWarpsPerBlock     = 4;
+// One warp owns one gate/up row pair. Eight warps per CTA keep two CTAs resident on a Turing SM
+// and halve the per-row activation re-read against the four-warp shape this replaces.
+constexpr int kWarpsPerBlock     = 8;
 constexpr int kBlockThreads      = kWarpsPerBlock * 32;
 constexpr int kPairsPerBlock     = kWarpsPerBlock;
-constexpr int kXVecs             = kK / 8; // x as uint4 (8 bf16 each)
 constexpr int kTiles             = kGroups / kGroupsPerWarpTile;
+constexpr int kTileK             = kGroupsPerWarpTile * kGroupK;
 static_assert(kIntermediate % kPairsPerBlock == 0);
 static_assert(kBytesPerGroup == 2 * kVecBytes);
 static_assert(kGroups % kGroupsPerWarpTile == 0);
@@ -85,48 +87,37 @@ void launch_small_t_active(const Tensor& x, const Weight& w, Tensor& out, cudaSt
 template <std::size_t... Offsets>
 constexpr auto make_small_t_launchers(std::index_sequence<Offsets...>) {
     return std::array<SmallTLauncher, sizeof...(Offsets)>{
-        &launch_small_t_active<2 + static_cast<int>(Offsets)>...};
+        &launch_small_t_active<kQ4SwiGluLastGemvPair + 1 + static_cast<int>(Offsets)>...};
 }
 
-constexpr auto kSmallTLaunchers = make_small_t_launchers(std::make_index_sequence<31>{});
+constexpr auto kSmallTLaunchers = make_small_t_launchers(
+    std::make_index_sequence<32 - kQ4SwiGluLastGemvPair>{});
 
-__device__ __forceinline__ void q4_issue_pair_tile(uint4 (*__restrict__ s_code)[kVecsPerWarpTile],
-                                                   uint4 (*__restrict__ s_scale)[2],
-                                                   const std::uint8_t* __restrict__ gate_code_row,
-                                                   const std::uint8_t* __restrict__ gate_scale_row,
-                                                   const std::uint8_t* __restrict__ up_code_row,
-                                                   const std::uint8_t* __restrict__ up_scale_row,
-                                                   int tile, int lane) {
-    const int g0 = tile * kGroupsPerWarpTile;
-    pipe_copy<16>(&s_code[0][lane],
-                  reinterpret_cast<const uint4*>(gate_code_row + g0 * kBytesPerGroup) + lane);
-    pipe_copy<16>(&s_code[1][lane],
-                  reinterpret_cast<const uint4*>(up_code_row + g0 * kBytesPerGroup) + lane);
-    if (lane < 2) {
-        pipe_copy<16>(&s_scale[0][lane],
-                      reinterpret_cast<const uint4*>(gate_scale_row + g0 * 2) + lane);
-        pipe_copy<16>(&s_scale[1][lane],
-                      reinterpret_cast<const uint4*>(up_scale_row + g0 * 2) + lane);
-    }
-    pipe_commit();
-}
+// Decode-shaped fused gate/up GEMV for T = 1..kQ4SwiGluLastGemvPair.
+//
+// The exact-small-T MMA core it replaces above T=1 stages a 16-row tile through shared memory for
+// output columns that are almost all padding at these token counts, and lands near a third of the
+// device's streaming read rate. Here a warp reads each weight row exactly once and carries all T
+// tokens through it, so the token count costs arithmetic instead of DRAM.
+//
+// Two Turing-specific details carry the bandwidth. Turing has no async copy, so the cp.async
+// pipeline this replaces degenerated to a load/store pair that stalls the warp at the shared
+// store: the next tile's codes and scales are instead prefetched into registers and spilled to
+// shared only after the current tile has been consumed, which keeps a warp's global loads in
+// flight across the whole unpack. And the activations are staged one K tile at a time, which
+// keeps the CTA's shared footprint independent of T and leaves the bf16x2 reads
+// bank-conflict-free (lane L reads word L of its group).
+template <int ActiveTokens>
+__global__ __launch_bounds__(kBlockThreads, 2) void q4_linear_swiglu_gemv_pair_kernel(
+    const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
+    const std::uint8_t* __restrict__ scales, __nv_bfloat16* __restrict__ out) {
+    static_assert(ActiveTokens >= 1);
+    constexpr int kStages    = 2;
+    constexpr int kXTileVecs = ActiveTokens * kTileK / 8;
 
-__global__ void q4_linear_swiglu_gemv_pair_kernel(const __nv_bfloat16* __restrict__ x,
-                                                  const std::uint8_t* __restrict__ codes,
-                                                  const std::uint8_t* __restrict__ scales,
-                                                  __nv_bfloat16* __restrict__ out) {
-    constexpr int kStages   = 3;
-    constexpr int kPrefetch = kStages - 1;
-    __shared__ __align__(16) __nv_bfloat16 x_sh[kK];
+    __shared__ __align__(16) __nv_bfloat16 x_tile[ActiveTokens][kTileK];
     __shared__ uint4 code_tile[kWarpsPerBlock][kStages][2][kVecsPerWarpTile];
     __shared__ uint4 scale_tile[kWarpsPerBlock][kStages][2][2];
-
-    auto* x_sh_v    = reinterpret_cast<uint4*>(x_sh);
-    const auto* x_g = reinterpret_cast<const uint4*>(x);
-    for (int i = static_cast<int>(threadIdx.x); i < kXVecs; i += static_cast<int>(blockDim.x)) {
-        x_sh_v[i] = x_g[i];
-    }
-    __syncthreads();
 
     const int lane    = static_cast<int>(threadIdx.x) & 31;
     const int warp    = static_cast<int>(threadIdx.x) >> 5;
@@ -139,34 +130,68 @@ __global__ void q4_linear_swiglu_gemv_pair_kernel(const __nv_bfloat16* __restric
         codes + static_cast<std::int64_t>(out_row + kIntermediate) * kGroups * kBytesPerGroup;
     const std::uint8_t* up_scale_row =
         scales + static_cast<std::int64_t>(out_row + kIntermediate) * kGroups * 2;
-    const auto* x2 = reinterpret_cast<const __nv_bfloat162*>(x_sh);
 
-    float gate_acc = 0.0f;
-    float up_acc   = 0.0f;
-#pragma unroll
-    for (int p = 0; p < kPrefetch; ++p) {
-        if (p < kTiles) {
-            q4_issue_pair_tile(code_tile[warp][p], scale_tile[warp][p], gate_code_row,
-                               gate_scale_row, up_code_row, up_scale_row, p, lane);
-        } else {
-            pipe_commit();
+    uint4 gate_code_reg;
+    uint4 up_code_reg;
+    uint4 gate_scale_reg;
+    uint4 up_scale_reg;
+
+    const auto load_tile_regs = [&](int tile) {
+        const int g0  = tile * kGroupsPerWarpTile;
+        gate_code_reg = load_ldg<uint4>(
+            reinterpret_cast<const uint4*>(gate_code_row + g0 * kBytesPerGroup) + lane);
+        up_code_reg = load_ldg<uint4>(
+            reinterpret_cast<const uint4*>(up_code_row + g0 * kBytesPerGroup) + lane);
+        if (lane < 2) {
+            gate_scale_reg =
+                load_ldg<uint4>(reinterpret_cast<const uint4*>(gate_scale_row + g0 * 2) + lane);
+            up_scale_reg =
+                load_ldg<uint4>(reinterpret_cast<const uint4*>(up_scale_row + g0 * 2) + lane);
         }
+    };
+
+    const auto spill_tile_regs = [&](int buf) {
+        code_tile[warp][buf][0][lane] = gate_code_reg;
+        code_tile[warp][buf][1][lane] = up_code_reg;
+        if (lane < 2) {
+            scale_tile[warp][buf][0][lane] = gate_scale_reg;
+            scale_tile[warp][buf][1][lane] = up_scale_reg;
+        }
+    };
+
+    // x is 16-byte aligned by construction (activations come from the 256-byte-aligned workspace
+    // arena), so a K tile stages as uint4.
+    const auto stage_x_tile = [&](int tile) {
+        auto* x_tile_v = reinterpret_cast<uint4*>(&x_tile[0][0]);
+        for (int i = static_cast<int>(threadIdx.x); i < kXTileVecs; i += kBlockThreads) {
+            const int token = i / (kTileK / 8);
+            const int slot  = i - token * (kTileK / 8);
+            x_tile_v[i]     = load_ldg<uint4>(
+                reinterpret_cast<const uint4*>(x + static_cast<std::int64_t>(token) * kK +
+                                               tile * kTileK) +
+                slot);
+        }
+    };
+
+    float gate_acc[ActiveTokens];
+    float up_acc[ActiveTokens];
+#pragma unroll
+    for (int token = 0; token < ActiveTokens; ++token) {
+        gate_acc[token] = 0.0f;
+        up_acc[token]   = 0.0f;
     }
+
+    load_tile_regs(0);
+    spill_tile_regs(0);
+    stage_x_tile(0);
+    __syncthreads();
 
 #pragma unroll 1
     for (int tile = 0; tile < kTiles; ++tile) {
-        const int fetch = tile + kPrefetch;
-        if (fetch < kTiles) {
-            const int buf = fetch % kStages;
-            q4_issue_pair_tile(code_tile[warp][buf], scale_tile[warp][buf], gate_code_row,
-                               gate_scale_row, up_code_row, up_scale_row, fetch, lane);
-        } else {
-            pipe_commit();
-        }
-        pipe_wait<kPrefetch>();
-        __syncwarp();
+        const bool has_next = tile + 1 < kTiles;
+        if (has_next) { load_tile_regs(tile + 1); }
 
-        const int buf           = tile % kStages;
+        const int buf           = tile & 1;
         const auto* gate_codes  = reinterpret_cast<const std::uint8_t*>(code_tile[warp][buf][0]);
         const auto* up_codes    = reinterpret_cast<const std::uint8_t*>(code_tile[warp][buf][1]);
         const auto* gate_scales = reinterpret_cast<const std::uint16_t*>(scale_tile[warp][buf][0]);
@@ -180,25 +205,63 @@ __global__ void q4_linear_swiglu_gemv_pair_kernel(const __nv_bfloat16* __restric
 
             const int gate_packed =
                 static_cast<int>(gate_codes[tile_group * kBytesPerGroup + lane]);
-            const int gate_q0   = sign_extend<4>(gate_packed & 0x0f);
-            const int gate_q1   = sign_extend<4>(gate_packed >> 4);
+            const float gate_w0 =
+                static_cast<float>(sign_extend<4>(gate_packed & 0x0f)) * gate_scale;
+            const float gate_w1 = static_cast<float>(sign_extend<4>(gate_packed >> 4)) * gate_scale;
             const int up_packed = static_cast<int>(up_codes[tile_group * kBytesPerGroup + lane]);
-            const int up_q0     = sign_extend<4>(up_packed & 0x0f);
-            const int up_q1     = sign_extend<4>(up_packed >> 4);
-            const int k0        = (tile * kGroupsPerWarpTile + tile_group) * kGroupK + lane * 2;
-            const float2 xv     = __bfloat1622float2(x2[k0 >> 1]);
-            gate_acc            = fmaf(static_cast<float>(gate_q0) * gate_scale, xv.x, gate_acc);
-            gate_acc            = fmaf(static_cast<float>(gate_q1) * gate_scale, xv.y, gate_acc);
-            up_acc              = fmaf(static_cast<float>(up_q0) * up_scale, xv.x, up_acc);
-            up_acc              = fmaf(static_cast<float>(up_q1) * up_scale, xv.y, up_acc);
+            const float up_w0   = static_cast<float>(sign_extend<4>(up_packed & 0x0f)) * up_scale;
+            const float up_w1   = static_cast<float>(sign_extend<4>(up_packed >> 4)) * up_scale;
+
+            const int tile_k = tile_group * kGroupK + lane * 2;
+#pragma unroll
+            for (int token = 0; token < ActiveTokens; ++token) {
+                const float2 xv = __bfloat1622float2(
+                    reinterpret_cast<const __nv_bfloat162*>(&x_tile[token][0])[tile_k >> 1]);
+                gate_acc[token] = fmaf(gate_w0, xv.x, gate_acc[token]);
+                gate_acc[token] = fmaf(gate_w1, xv.y, gate_acc[token]);
+                up_acc[token]   = fmaf(up_w0, xv.x, up_acc[token]);
+                up_acc[token]   = fmaf(up_w1, xv.y, up_acc[token]);
+            }
         }
-        __syncwarp();
+
+        if (has_next) {
+            __syncthreads();
+            spill_tile_regs((tile + 1) & 1);
+            stage_x_tile(tile + 1);
+            __syncthreads();
+        }
     }
 
-    gate_acc = warp_reduce_sum(gate_acc);
-    up_acc   = warp_reduce_sum(up_acc);
-    if (lane == 0) { out[out_row] = __float2bfloat16(silu(gate_acc) * up_acc); }
+#pragma unroll
+    for (int token = 0; token < ActiveTokens; ++token) {
+        const float gate = warp_reduce_sum(gate_acc[token]);
+        const float up   = warp_reduce_sum(up_acc[token]);
+        if (lane == 0) {
+            out[static_cast<std::int64_t>(token) * kIntermediate + out_row] =
+                __float2bfloat16(silu(gate) * up);
+        }
+    }
 }
+
+using GemvPairLauncher = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+
+template <int ActiveTokens>
+void launch_gemv_pair_active(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
+    constexpr int kBlocks = kIntermediate / kPairsPerBlock;
+    q4_linear_swiglu_gemv_pair_kernel<ActiveTokens><<<kBlocks, kBlockThreads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
+        static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(out.data));
+    CUDA_CHECK(cudaGetLastError());
+}
+
+template <std::size_t... Offsets>
+constexpr auto make_gemv_pair_launchers(std::index_sequence<Offsets...>) {
+    return std::array<GemvPairLauncher, sizeof...(Offsets)>{
+        &launch_gemv_pair_active<1 + static_cast<int>(Offsets)>...};
+}
+
+constexpr auto kGemvPairLaunchers =
+    make_gemv_pair_launchers(std::make_index_sequence<kQ4SwiGluLastGemvPair>{});
 
 } // namespace
 
@@ -207,19 +270,19 @@ void q4_linear_swiglu_gemv_pair_launch(const Tensor& x, const Weight& w, Tensor&
     if (w.n != kN || w.k != kK || w.padded_shape[1] != kK) {
         throw std::invalid_argument("q4 linear_swiglu GEMV requires weight [34816,5120]");
     }
-    const int grid = kIntermediate / kPairsPerBlock;
-    q4_linear_swiglu_gemv_pair_kernel<<<grid, kBlockThreads, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
-        static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(out.data));
-    CUDA_CHECK(cudaGetLastError());
+    if (x.ne[1] < 1 || x.ne[1] > kQ4SwiGluLastGemvPair) {
+        throw std::invalid_argument("q4 linear_swiglu GEMV pair requires T=1..6");
+    }
+    kGemvPairLaunchers[static_cast<std::size_t>(x.ne[1] - 1)](x, w, out, stream);
 }
 
 void q4_linear_swiglu_small_t_exact_launch(const Tensor& x, const Weight& w, Tensor& out,
                                            cudaStream_t stream) {
-    if (x.ne[1] < 2 || x.ne[1] > 32) {
-        throw std::invalid_argument("Q4 LinearSwiGLU exact small-T requires T=2..32");
+    if (x.ne[1] <= kQ4SwiGluLastGemvPair || x.ne[1] > 32) {
+        throw std::invalid_argument("Q4 LinearSwiGLU exact small-T requires T=7..32");
     }
-    kSmallTLaunchers[static_cast<std::size_t>(x.ne[1] - 2)](x, w, out, stream);
+    kSmallTLaunchers[static_cast<std::size_t>(x.ne[1] - kQ4SwiGluLastGemvPair - 1)](x, w, out,
+                                                                                    stream);
 }
 
 } // namespace ninfer::ops::detail

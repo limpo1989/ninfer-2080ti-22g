@@ -39,8 +39,8 @@ constexpr Q4LinearSwiGluProblem kShape{34816, 17408, 5120, 5120, 1};
 // (4 vs 8 ops/step) and doubles grid launch/barrier overhead, which outweighs the residency gain.
 // Therefore C128 is retained for long prefill.
 constexpr std::array<RouteSpec, 10> kRoutes{{
-    {{1, 1}, Q4LinearSwiGluScheduleId::GemvPair},
-    {{2, 32}, Q4LinearSwiGluScheduleId::SmallTExact},
+    {{1, kQ4SwiGluLastGemvPair}, Q4LinearSwiGluScheduleId::GemvPair},
+    {{kQ4SwiGluLastGemvPair + 1, 32}, Q4LinearSwiGluScheduleId::SmallTExact},
     {{33, 40}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C40},
     {{41, 48}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C48},
     {{49, 128}, Q4LinearSwiGluScheduleId::Materialized},

@@ -47,21 +47,32 @@ KVarN keeps each sequence's first 128 positions and its still-filling tail page 
 
 ## Performance (RTX 2080 Ti 22GB)
 
-Measured on NVIDIA GeForce RTX 2080 Ti (`TU102` / `sm_75`, 22 GB VRAM mod, CUDA 12.9) with **Qwen3.8-27B Dense** (`groupwise-int`, INT8 group-64 KV cache, greedy generation, $T_{\text{new}} = 256$ tokens):
+Measured on NVIDIA GeForce RTX 2080 Ti (`TU102` / `sm_75`, 22 GB VRAM mod) with **Qwen3.8-27B
+Dense** (`groupwise-int`, greedy generation, $T_{\text{new}} = 256$ tokens, `--max-context 4096`,
+one fixed prompt per row).
 
-### Speculative Decoding (MTP0 vs MTP3)
+### Committed decode throughput
 
-| Benchmark Metric | Baseline (MTP0, Autoregressive) | Speculative MTP3 (Draft Window = 3) | Performance Delta |
-|---|:---:|:---:|:---:|
-| **Committed Decode Throughput** | **24.58 – 24.88 tok/s** | **41.92 – 44.64 tok/s** | **1.71× – 1.79× (+79.4%)** |
-| **Decode Latency (256 tokens)** | 10.25 s (40.68 ms/tok) | **5.71 s (23.85 ms/tok)** | **−44.3% latency** |
-| **MTP Acceptance Rate** | N/A | **60.74% – 65.37%** | 164–168 / 257–270 tokens |
-| **Effective Draft Length** | 1.00 tok/round | **2.82 – 2.95 tok/round** | ~2.9× step efficiency |
-| **Accepted by Position** | N/A | Pos 1: ~73, Pos 2: ~55, Pos 3: ~40 | Monotonic acceptance decay |
-| **VRAM Allocation** | 16.51 GiB | 17.47 GiB | ~2.9 GiB free headroom |
-| **Numerical Parity** | Reference | Exact token-for-token parity | 0 token divergence vs MTP0 |
+| KV cache | Speculation | Decode throughput | Tokens / round |
+|---|---|:---:|:---:|
+| BF16 | none (autoregressive) | **24.62 tok/s** | 1.00 |
+| BF16 | MTP, draft window 2 | **44.18 tok/s** | 2.34 |
+| BF16 | MTP, draft window 3 | **44.81 tok/s** | 2.73 |
+| INT8 group-64 | none (autoregressive) | **25.50 tok/s** | 1.00 |
+| INT8 group-64 | MTP, draft window 2 | **43.90 tok/s** | 2.28 |
+| INT8 group-64 | MTP, draft window 3 | **41.57 tok/s** | 2.54 |
 
-### Prefill Throughput
+A decode step reads 15.9 GiB of weights, and this card sustains ≈ 555 GB/s on a streaming read,
+so ≈ 31 ms (≈ 32 tok/s) is the autoregressive floor; speculation is what carries the committed
+rate past it. See [`docs/maintainer/turing-decode-gemv.md`](docs/maintainer/turing-decode-gemv.md)
+for the decode-path kernel routes and their measured before/after.
+
+### Long context
+
+At 34,342 prompt tokens with `--kv-dtype kvarn` and MTP draft window 2: prefill **168 tok/s**,
+decode **34.40 tok/s**, 3.00 tokens per round, planted needle retrieved verbatim.
+
+### Prefill throughput
 - **Short Prompt ($T = 22$ tokens):** ~71 – 78 tok/s
 - **Medium Prompt ($T = 62$ tokens):** ~134 – 135 tok/s
 - **Long Prefill ($T \ge 1024$ – $2048$ tokens):** Routed via GDN `MmaUnsplit` to operate within Turing SM75 shared-memory and cooperative CTA launch limits (1 CTA / SM, 40 KiB smem).
@@ -71,6 +82,7 @@ Measured on NVIDIA GeForce RTX 2080 Ti (`TU102` / `sm_75`, 22 GB VRAM mod, CUDA 
 ## Fork Features & Customizations
 
 - **Custom W8 GEMM & Split-K Kernels**: Tailored for Turing SM75 thread-block limits and register allocation.
+- **Decode-shaped GEMV routes**: One-warp-per-row W8 cores for the vocabulary head and the MTP projections, and a fused Q4 gate/up core that carries a whole speculative verify step through one pass over the matrix — the exact-small-T MMA cores run at a third of Turing's streaming read rate at these token counts. Details in [`docs/maintainer/turing-decode-gemv.md`](docs/maintainer/turing-decode-gemv.md).
 - **GDN Routing Optimization**: Routes GDN gating projections to `MmaUnsplit` for token counts $T \ge 9$, resolving cooperative launch limits on Turing.
 - **22GB VRAM Memory Tuning**: Startup sizing headroom and paged INT8/BF16 KV allocation profiles calibrated for 22GB capacity.
 - **Reasoning Effort Control**: Configurable thinking depth via `--reasoning-effort none|minimal|low|medium|high|xhigh` (`none` disables thinking; `minimal`/`low` concise reasoning; `medium`/`high`/`xhigh` comprehensive reasoning).
