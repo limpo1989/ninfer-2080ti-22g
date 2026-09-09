@@ -7,8 +7,10 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
+#include <string_view>
 
 namespace ninfer::ops::detail {
 namespace {
@@ -110,6 +112,15 @@ Q4LinearSwiGluPlan q4_linear_swiglu_resolve_plan(const Q4LinearSwiGluProblem& pr
             "q4 linear_swiglu: exact problem or column count is not admitted");
     }
 
+#if defined(NINFER_SM75)
+    static const bool fused_prefill = [] {
+        const char* value = std::getenv("NINFER_SWIGLU_FUSED_PREFILL");
+        return value == nullptr || std::string_view(value) != "0";
+    }();
+    if (fused_prefill && problem.cols >= 17) {
+        return {Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C128, 0};
+    }
+#endif
     for (const RouteSpec& route : kRoutes) {
         if (!route.cols.contains(problem.cols)) { continue; }
         Q4LinearSwiGluPlan plan{

@@ -94,6 +94,11 @@ ninfer::bench::RepTiming run_repetition(ninfer::Engine& engine,
     timing.timings                 = generated.timings;
     timing.speculative             = std::move(generated.speculative);
     timing.generated_output_tokens = expected;
+    timing.generated_token_hash = 14695981039346656037ULL;
+    for (const auto token : generated.generated_token_ids) {
+        timing.generated_token_hash ^= static_cast<std::uint32_t>(token);
+        timing.generated_token_hash *= 1099511628211ULL;
+    }
     return timing;
 }
 

@@ -305,7 +305,8 @@ void parse_tools(const Json& body, GenerationRequest& out) {
             bad_request("tools entries must contain a string type", "tools");
         }
         if (item.at("type").get<std::string>() != "function") {
-            bad_request("only function tools are supported", "tools", "tool_type_not_supported");
+            // Codex sends namespace/web_search/etc. tool types; skip like LMStudio does.
+            continue;
         }
         if (!item.contains("function") || !item.at("function").is_object()) {
             bad_request("function tools must contain a function object", "tools");

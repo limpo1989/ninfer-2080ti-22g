@@ -67,7 +67,7 @@ template <class Cfg, bool Full, W8Epilogue Epilogue = W8Epilogue::Store,
 __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void w8_rowsplit_gemm_mma_kernel(
     const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
     const std::uint8_t* __restrict__ scales, Output output, std::int32_t m, std::int32_t k,
-    std::int32_t n, std::int32_t padded_k) {
+    std::int32_t n, std::int32_t padded_k, int perf_mode = 0) {
     constexpr int BM                = Cfg::BM;
     constexpr int BN                = Cfg::BN;
     constexpr int BK                = Cfg::BK;
@@ -223,6 +223,131 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void w8_rowsplit_gem
     };
 
     const int nkt = padded_k / BK;
+
+#if defined(NINFER_SM75)
+    // [sm75 pipeline] Turing has no cp.async: the fallback synchronous staging serializes
+    // loads with compute. This path overlaps global->register prefetch (LDG) with MMA by
+    // staging through registers one k-tile ahead. Activated via perf_mode == 3.
+    if (perf_mode == 3 && Full) {
+        constexpr int NX = BN * (BK / 8);
+        constexpr int NW = BM * (BK / 16);
+        constexpr int IX = (NX + Cfg::THREADS - 1) / Cfg::THREADS;
+        constexpr int IW = (NW + Cfg::THREADS - 1) / Cfg::THREADS;
+        int4 rx[IX];
+        int4 rw[IW];
+
+        auto prefetch = [&](int kt) {
+            const int k0 = kt * BK;
+#pragma unroll
+            for (int i = 0; i < IX; ++i) {
+                const int item = tid + i * Cfg::THREADS;
+                if (item < NX) {
+                    const int nl = item / (BK / 8);
+                    const int k8 = item - nl * (BK / 8);
+                    rx[i] = *reinterpret_cast<const int4*>(
+                        &x[static_cast<std::int64_t>(n0 + nl) * k + k0 + k8 * 8]);
+                }
+            }
+            constexpr int GROUPS = BK / 32;
+            const int g0         = kt * GROUPS;
+#pragma unroll
+            for (int i = 0; i < IW; ++i) {
+                const int item = tid + i * Cfg::THREADS;
+                if (item < NW) {
+                    const int row   = item / (BK / 16);
+                    const int chunk = item - row * (BK / 16);
+                    const int grow =
+                        kSwiGlu ? m0 + (row % (BM / 2)) + (row >= BM / 2 ? m / 2 : 0) : m0 + row;
+                    const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + g0;
+                    rw[i] = *reinterpret_cast<const int4*>(&codes[gi * 32 + chunk * 16]);
+                }
+            }
+        };
+
+        auto store_staged = [&](int stage, int kt) {
+#pragma unroll
+            for (int i = 0; i < IX; ++i) {
+                const int item = tid + i * Cfg::THREADS;
+                if (item < NX) {
+                    const int nl = item / (BK / 8);
+                    const int k8 = item - nl * (BK / 8);
+                    *reinterpret_cast<int4*>(&Bs[stage][nl * BK + w8g32_swz64(nl, k8 * 8)]) = rx[i];
+                }
+            }
+#pragma unroll
+            for (int i = 0; i < IW; ++i) {
+                const int item = tid + i * Cfg::THREADS;
+                if (item < NW) {
+                    const int row   = item / (BK / 16);
+                    const int chunk = item - row * (BK / 16);
+                    *reinterpret_cast<int4*>(&Cr[row * BK + chunk * 16]) = rw[i];
+                }
+            }
+            // scales stay synchronous (tiny): refresh the 8-group cache when needed
+            constexpr int GROUPS            = BK / 32;
+            constexpr int SCALE_CACHE_TILES = 8 / GROUPS;
+            if ((kt % SCALE_CACHE_TILES) == 0) {
+                const int g0 = kt * GROUPS;
+                for (int row = tid; row < BM; row += Cfg::THREADS) {
+                    const int grow = kSwiGlu ? m0 + (row % (BM / 2)) + (row >= BM / 2 ? m / 2 : 0)
+                                             : m0 + row;
+                    auto* dst      = &Sr[row * Cfg::SCALE_CACHE_BYTES];
+                    const std::int64_t gi =
+                        static_cast<std::int64_t>(grow) * kg + g0;
+                    *reinterpret_cast<int4*>(dst) =
+                        *reinterpret_cast<const int4*>(&scales[gi * 2]);
+                }
+            }
+        };
+
+        prefetch(0);
+#pragma unroll 2
+        for (int kt = 0; kt < nkt; ++kt) {
+            store_staged(kt & 1, kt);
+            __syncthreads();
+            dequant_w(kt);
+            __syncthreads();
+            if (kt + 1 < nkt) { prefetch(kt + 1); }
+
+            unsigned af[2][MT][4];
+            unsigned bf[2][NT][2];
+            auto load_fragments_p = [&](int slot, int ks) {
+#pragma unroll
+                for (int mi = 0; mi < MT; ++mi) {
+                    const int ar = wm * WM + mi * 16 + a_rowoff;
+                    const int ac = ks * 16 + a_coloff;
+                    ldmatrix_x4(af[slot][mi][0], af[slot][mi][1], af[slot][mi][2], af[slot][mi][3],
+                                smem_addr(&As[ar * BK + w8g32_swz64(ar, ac)]));
+                }
+#pragma unroll
+                for (int ni = 0; ni < NT; ++ni) {
+                    const int br = wn * WN + ni * 8 + b_rin;
+                    const int bc = ks * 16 + b_koff;
+                    ldmatrix_x2(bf[slot][ni][0], bf[slot][ni][1],
+                                smem_addr(&Bs[kt & 1][br * BK + w8g32_swz64(br, bc)]));
+                }
+            };
+            load_fragments_p(0, 0);
+#pragma unroll
+            for (int ks = 0; ks < KSUB; ++ks) {
+                const int slot = ks & 1;
+                if (ks + 1 < KSUB) { load_fragments_p(slot ^ 1, ks + 1); }
+#pragma unroll
+                for (int mi = 0; mi < MT; ++mi) {
+#pragma unroll
+                    for (int ni = 0; ni < NT; ++ni) {
+                        mma_bf16(acc[mi][ni][0], acc[mi][ni][1], acc[mi][ni][2], acc[mi][ni][3],
+                                 af[slot][mi][0], af[slot][mi][1], af[slot][mi][2],
+                                 af[slot][mi][3], bf[slot][ni][0], bf[slot][ni][1]);
+                    }
+                }
+            }
+        }
+        store_staged(0, 0); // keep the compiler from thinking rx/rw are dead early
+        goto kernel_epilogue;
+    }
+#endif // NINFER_SM75
+
     stage_x(0, 0);
     stage_w(0);
     ninfer::ops::cp_commit();
@@ -233,11 +358,11 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void w8_rowsplit_gem
         ninfer::ops::cp_wait<0>();
         __syncthreads();
 
-        dequant_w(kt);
+        if ((perf_mode != 1 && perf_mode != 5) || kt == 0) { dequant_w(kt); }
         __syncthreads();
 
         const int next = kt + 1;
-        if (next < nkt) {
+        if (next < nkt && perf_mode != 6) {
             if constexpr (Cfg::ACTIVATION_STAGES == Cfg::STAGES) {
                 stage_x(next % Cfg::STAGES, next);
             }
@@ -265,18 +390,20 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void w8_rowsplit_gem
             }
         };
 
-        load_fragments(0, 0);
+        if (perf_mode != 5) { load_fragments(0, 0); }
 #pragma unroll
         for (int ks = 0; ks < KSUB; ++ks) {
             const int slot = ks & 1;
-            if (ks + 1 < KSUB) { load_fragments(slot ^ 1, ks + 1); }
+            if (ks + 1 < KSUB && perf_mode != 5) { load_fragments(slot ^ 1, ks + 1); }
+            if (perf_mode != 2 && perf_mode != 5) {
 #pragma unroll
-            for (int mi = 0; mi < MT; ++mi) {
+                for (int mi = 0; mi < MT; ++mi) {
 #pragma unroll
-                for (int ni = 0; ni < NT; ++ni) {
-                    mma_bf16(acc[mi][ni][0], acc[mi][ni][1], acc[mi][ni][2], acc[mi][ni][3],
-                             af[slot][mi][0], af[slot][mi][1], af[slot][mi][2], af[slot][mi][3],
-                             bf[slot][ni][0], bf[slot][ni][1]);
+                    for (int ni = 0; ni < NT; ++ni) {
+                        mma_bf16(acc[mi][ni][0], acc[mi][ni][1], acc[mi][ni][2], acc[mi][ni][3],
+                                 af[slot][mi][0], af[slot][mi][1], af[slot][mi][2], af[slot][mi][3],
+                                 bf[slot][ni][0], bf[slot][ni][1]);
+                    }
                 }
             }
         }
@@ -290,6 +417,9 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void w8_rowsplit_gem
         }
     }
 
+#if defined(NINFER_SM75)
+kernel_epilogue:
+#endif
     if constexpr (kSwiGlu) {
         if constexpr (Cfg::WARPS_M == 1) {
             static_assert((MT % 2) == 0);

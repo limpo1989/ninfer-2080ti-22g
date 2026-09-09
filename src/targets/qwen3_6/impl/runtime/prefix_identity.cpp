@@ -1,6 +1,8 @@
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 
@@ -148,10 +150,19 @@ bool ResidentPrefixIdentity::matches(const PreparedPromptData& prompt, std::size
 bool prefix_matches(const PreparedPromptData& prompt, const std::vector<TokenId>& resident_tokens,
                     const ResidentPrefixIdentity& resident_identity, std::size_t count) {
     if (count > prompt.token_ids.size() || count > resident_tokens.size()) { return false; }
-    return std::equal(prompt.token_ids.begin(),
-                      prompt.token_ids.begin() + static_cast<std::ptrdiff_t>(count),
-                      resident_tokens.begin()) &&
-           resident_identity.matches(prompt, count);
+    const auto end = prompt.token_ids.begin() + static_cast<std::ptrdiff_t>(count);
+    const auto mismatch = std::mismatch(prompt.token_ids.begin(), end, resident_tokens.begin());
+    if (mismatch.first != end) {
+        static const bool trace = std::getenv("NINFER_TRACE_PREFIX") != nullptr;
+        if (trace) {
+            std::fprintf(stderr, "[prefix-mismatch] frontier=%zu prompt=%zu common=%zu incoming=%d resident=%d\n",
+                         count, prompt.token_ids.size(),
+                         static_cast<std::size_t>(mismatch.first - prompt.token_ids.begin()),
+                         *mismatch.first, *mismatch.second);
+        }
+        return false;
+    }
+    return resident_identity.matches(prompt, count);
 }
 
 } // namespace ninfer::targets::qwen3_6::detail

@@ -44,9 +44,11 @@ void launch_w8_mma_r48_c128(const Tensor&, const Weight&, Tensor&, cudaStream_t)
 void launch_w8_mma_r64_c96(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 void launch_w8_mma_r64_c112(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 void launch_w8_mma_r64_c128(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+void launch_w8_mma_r64_c128_a1(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 void launch_w8_mma_r96_c96(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 void launch_w8_mma_r128_c64(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 void launch_w8_mma_r128_c80(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+void launch_w8_mma_r128_c128_a1(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 void launch_w8_mma_r64x16_c48_k128_a1(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 
 void launch_w8_exact_mma_r32_c96(const Tensor&, const Weight&, Tensor&, cudaStream_t);

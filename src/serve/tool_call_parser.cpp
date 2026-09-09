@@ -13,7 +13,9 @@
 namespace ninfer::serve {
 namespace {
 
-using Json = nlohmann::json;
+// The frontend replays parameter objects in insertion order. Sorting here
+// would rewrite the generated tool-call prefix even when its values are unchanged.
+using Json = nlohmann::ordered_json;
 
 std::string trim_ascii(std::string_view text) {
     std::size_t begin = 0;

@@ -1,11 +1,40 @@
 #include "ops/linear/w8/w8_dispatch.h"
 
+#include <cstdlib>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
 
+// [experiment] NINFER_W8_FORCE=<mode> overrides large-T (prefill) W8 routing.
+namespace {
+W8Launch forced_w8_launch() {
+    static int mode = -2;
+    if (mode == -2) {
+        const char* env = std::getenv("NINFER_W8_FORCE");
+        mode            = env != nullptr ? std::atoi(env) : -1;
+    }
+    if (mode < 0) { return nullptr; }
+    switch (mode) {
+    case 0: return launch_w8_mma_r64_c128;
+    case 1: return launch_w8_mma_r128_c64;
+    case 2: return launch_w8_mma_r96_c96;
+    case 3: return launch_w8_mma_r64_c96;
+    case 4: return launch_w8_mma_r48_c128;
+    case 5: return launch_w8_mma_r32_c128;
+    case 6: return launch_w8_medium_splitk_c144;
+    case 7: return launch_w8_dflash_medium;
+    case 8: return launch_w8_mma_r64_c128_a1;
+    case 9: return launch_w8_mma_r128_c128_a1;
+    default: return nullptr;
+    }
+}
+} // namespace
+
 W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
     if (t <= 0) { throw std::invalid_argument("w8 linear: unsupported shape or T"); }
+    if (t > 64) {
+        if (W8Launch forced = forced_w8_launch()) { return forced; }
+    }
 
     switch (k) {
     case 10240:

@@ -40,6 +40,7 @@ struct ResponsesRuntimeValues {
     float temperature       = 1.0F;
     float top_p             = 1.0F;
     int cached_input_tokens = 0;
+    bool enable_thinking    = false;
 };
 
 struct BuiltResponse {
@@ -91,6 +92,7 @@ public:
     ResponsesEventStream& operator=(const ResponsesEventStream&) = delete;
 
     std::vector<std::string> start();
+    std::vector<std::string> keepalive();
     std::vector<std::string> reasoning_delta(const std::string& text);
     std::vector<std::string> content_delta(const std::string& text);
     ResponsesStreamFinish finish(const GenerationOutcome& outcome);

@@ -1,0 +1,15 @@
+[Unit]
+Description=Aggressive NVIDIA GPU fan curve
+After=multi-user.target
+ConditionPathExists=/dev/nvidia0
+
+[Service]
+Type=simple
+ExecStartPre=/usr/bin/nvidia-smi -i 0 -gtt 84
+ExecStart=/usr/bin/python3 /usr/local/sbin/nvidia-fan-curve.py
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

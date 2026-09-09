@@ -77,6 +77,7 @@ struct RepTiming {
     GenerationTimings timings;
     SpeculativeStats speculative;
     std::uint32_t generated_output_tokens = 0;
+    std::uint64_t generated_token_hash = 0;
 };
 
 struct TestResult {

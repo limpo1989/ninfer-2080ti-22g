@@ -100,8 +100,8 @@ not exposed by the loaded template returns HTTP 400 with code
 `reasoning_effort_not_supported` before prompt preparation.
 
 For Chat Completions, `reasoning_effort: "none"` disables thinking. `low`, `medium`, and `xhigh`
-select the corresponding template effort when available. The other OpenAI protocol values
-`minimal`, `high`, and `max` are parsed but rejected when the loaded template does not expose them.
+select the corresponding template effort when available. `minimal` aliases `low`; `high` and
+`max` alias `xhigh`. The resolved effort still has to be supported by the loaded template.
 `enable_thinking` controls the same new-turn thinking switch; a contradictory combination with
 `reasoning_effort` returns `conflicting_template_option`.
 
@@ -239,7 +239,7 @@ String `input` is normalized to one user `message` with an `input_text` part. Ar
 | `output_text` | assistant-message replay part containing string `text` |
 | `input_image` | user-message part with HTTP(S) or data-URI `image_url`; detail omitted or `auto`; requires server `--vision` |
 | `input_video` | NInfer extension with HTTP(S) or data-URI `video_url`; requires server `--vision` |
-| `reasoning` | raw replay Item with an empty `summary` and `reasoning_text` content parts |
+| `reasoning` | replay Item with `reasoning_text` content, or `summary_text` summary as a fallback; raw content takes precedence when both are present |
 | `function_call` | completed assistant call with optional `id`, and required `call_id`, `name`, and JSON-object string `arguments` |
 | `function_call_output` | completed tool result with required `call_id` and string `output` |
 
@@ -337,6 +337,20 @@ and content indices remain stable, and concatenated deltas equal the terminal It
 does not emit the Chat Completions `[DONE]` sentinel. With tools enabled, ordinary answer text still
 streams immediately; only an ambiguous `<tool_call>` suffix or the structured tool region is held.
 Malformed tool markup is flushed back as ordinary text without losing bytes.
+
+During streaming, raw reasoning events also have `reasoning_summary_*` counterparts for clients
+that consume the standard summary channel. Do not concatenate these two representations. Inbound
+replay prefers raw `content` and uses `summary` only when raw content is absent or empty.
+An assistant message followed immediately by function-call Items is reconstructed as one assistant
+turn, including its preceding reasoning. Tool parameters retain their generation order through
+parsing and replay; JSON object key sorting must not rewrite an otherwise reusable prefix.
+
+The Responses transport sends a heartbeat after five seconds without output. During thinking it
+opens the reasoning Item if necessary and sends an empty summary delta; during an open text Item
+it sends an empty text delta. These events carry no generated tokens and do not change Engine
+TTFT, throughput, or usage. Clients may show an empty thinking indicator before actual generation.
+The provider thread alone owns the event encoder and socket, including sequence numbers. Closing
+the stream cancels the Engine request at the next decode-round or prefill-chunk boundary.
 
 ### Local response state and resources
 
@@ -613,6 +627,14 @@ that frontier does not split a tiny trailing prologue into a separate prefill un
 response which no longer matches the raw generated tokens replays only that response and its
 suffix. Stable `false` keeps the first assistant opener in the open turn so a newly closed turn can
 be recomputed without its reasoning.
+
+Exact generated-prefix reuse works with `preserve_thinking=false` during tool loops. The builtin
+renderers use the artifact's `<think>` / `</think>` markers, and streamed reasoning replay is not
+doubled. `tools/bench/run_responses_cache.py` exercises stored continuation, terminal-Item replay,
+and streamed-Item replay. For diagnosis, `NINFER_TRACE_PREFIX=1` reports the first mismatching token
+index and IDs without logging prompt text. A cache hit is reused tokens divided by total input:
+large new tool results, edited history, a new user turn that strips reasoning, and cold starts can
+legitimately have lower hit rates.
 
 `preserve_thinking` selects where the next checkpoint should live; it is not a cache-compatibility
 bit. An exact current frontier or matching complete checkpoint remains reusable across a mode

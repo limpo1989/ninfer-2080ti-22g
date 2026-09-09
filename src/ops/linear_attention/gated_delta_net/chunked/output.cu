@@ -1,5 +1,6 @@
 #include "ops/linear_attention/gated_delta_net/chunked/launch.h"
 #include "ops/linear_attention/gated_delta_net/chunked/output.cuh"
+#include <cstdlib>
 
 namespace ninfer::ops::detail::gated_delta_net::chunked {
 namespace {
@@ -10,17 +11,17 @@ constexpr std::int64_t kRtx5090SmCount = 170;
 constexpr std::int64_t kCtasPerSm      = 4;
 constexpr std::int64_t kTargetCtas     = kRtx5090SmCount * kCtasPerSm;
 
-template <bool MULTI_JOB>
+template <bool MULTI_JOB, bool Native = false>
 cudaError_t launch_fixed(const chunk_output_config& cfg, dim3 grid, head_map qk_map, int chunks) {
     constexpr int smem_bytes = kernel::kernel_dims::SMEM_BYTES;
 
-    cudaError_t err = cudaFuncSetAttribute(kernel::output_kernel<MULTI_JOB>,
+    cudaError_t err = cudaFuncSetAttribute(kernel::output_kernel<MULTI_JOB, Native>,
                                            cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
     if (err != cudaSuccess) { return err; }
 
     const dim3 block(kernel::THREADS, 1, 1);
 
-    kernel::output_kernel<MULTI_JOB><<<grid, block, smem_bytes, cfg.stream>>>(
+    kernel::output_kernel<MULTI_JOB, Native><<<grid, block, smem_bytes, cfg.stream>>>(
         cfg.q, cfg.k, cfg.v_new, cfg.g_cumsum, cfg.h_chunk, cfg.attn_out, qk_map, cfg.scale,
         chunks);
     return cudaGetLastError();
@@ -48,6 +49,18 @@ cudaError_t launch_output(const chunk_output_config& cfg) {
     NINFER_GATED_DELTA_NET_PROPAGATE(v.check_grid(grid_chunks, cfg.H_v));
 
     const dim3 grid(static_cast<unsigned>(grid_chunks), static_cast<unsigned>(cfg.H_v), 1);
+#if defined(NINFER_SM75)
+    static const bool native = [] {
+        const char* value = std::getenv("NINFER_GDN_OUTPUT_HMMA");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (native) {
+        if (jobs_per_block == 1) {
+            return launch_fixed<false, true>(cfg, grid, qk_map, static_cast<int>(NT));
+        }
+        return launch_fixed<true, true>(cfg, grid, qk_map, static_cast<int>(NT));
+    }
+#endif
     if (jobs_per_block == 1) {
         return launch_fixed<false>(cfg, grid, qk_map, static_cast<int>(NT));
     }

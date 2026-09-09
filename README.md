@@ -47,9 +47,9 @@ KVarN keeps each sequence's first 128 positions and its still-filling tail page 
 
 ## Performance (RTX 2080 Ti 22GB)
 
-Measured on NVIDIA GeForce RTX 2080 Ti (`TU102` / `sm_75`, 22 GB VRAM mod) with **Qwen3.8-27B
+Earlier reference measurements on NVIDIA GeForce RTX 2080 Ti (`TU102` / `sm_75`, 22 GB VRAM mod) with **Qwen3.8-27B
 Dense** (`groupwise-int`, greedy generation, $T_{\text{new}} = 256$ tokens, `--max-context 4096`,
-one fixed prompt per row).
+one fixed prompt per row). Current Linux measurements and defaults appear under the SM75 fast path below.
 
 ### Committed decode throughput
 
@@ -75,7 +75,94 @@ decode **34.40 tok/s**, 3.00 tokens per round, planted needle retrieved verbatim
 ### Prefill throughput
 - **Short Prompt ($T = 22$ tokens):** ~71 – 78 tok/s
 - **Medium Prompt ($T = 62$ tokens):** ~134 – 135 tok/s
-- **Long Prefill ($T \ge 1024$ – $2048$ tokens):** Routed via GDN `MmaUnsplit` to operate within Turing SM75 shared-memory and cooperative CTA launch limits (1 CTA / SM, 40 KiB smem).
+- Current long and short prefill routes are described below; the earlier prompt measurements above used a different host and route set.
+
+### SM75 groupwise-int prefill fast path
+
+Turing has neither `cp.async` nor native BF16 Tensor Core instructions. The SM75 long-prefill
+path therefore converts the already-loaded BF16 fragments to FP16, executes native FP16 HMMA with
+FP32 accumulation, and overlaps the next quantized-weight and activation loads through registers.
+This is enabled by default for the Qwen3.8 Q4 SwiGLU and Q5 residual-add C128 routes. SM75 grouped
+Q4/Q5 attention/GDN input projections also use FP16 HMMA. Both BF16 panels are scaled by 256
+before conversion, then partial sums are scaled back by 1/65536. A warp-wide check permits only
+zeros and magnitudes in [2^-22, 255], making conversion exact and keeping nonzero FP16 operands
+normal; other panels fall back to FP32. The GDN chunk output uses native HMMA
+only when the BF16 operands are exactly representable in FP16. Accumulation and persistent state
+retain their original dtypes; FP32 accumulation order can differ and bitwise output identity is
+not promised. The registered operators retain their independent FP32/FP64 oracle thresholds.
+
+Measured on RTX 2080 Ti 22GB, driver 595.99.02, CUDA 12.8.93, with the 7,680-token NIAH prompt,
+INT8 KV, MTP3, and the same aggressive fan curve for every run:
+
+| Configuration | Prefill | Decode | Result |
+|---|---:|---:|---|
+| Original Q4/Q5 paths | 77.51 tok/s | 36.01 tok/s | `ORCHID=4938` |
+| Q4 FP16 HMMA only | 98.62 tok/s | 36.73 tok/s | `ORCHID=4938` |
+| Q5 FP16 HMMA only | 112.82 tok/s | 36.60 tok/s | `ORCHID=4938` |
+| Default Q4 + Q5 fast paths | **201.34 tok/s** | **38.94 tok/s** | `ORCHID=4938` |
+
+The focused Q4 and Q5 independent-oracle tests pass with the default fast paths. Override the
+routes only for diagnosis: `NINFER_SWIGLU_KMODE=0` or `NINFER_Q5ADD_KMODE=0` selects the original
+path, `=2` selects FP16 HMMA without register prefetch, and `=3` selects the default full fast path.
+The experimental W8 `KMODE=3` is not enabled by default and is not part of this optimization.
+
+Short prefills use the fused Q4 C128 route from 17 tokens and the Q5 C128 route from 49 tokens.
+Smaller decode/verify shapes retain their existing routes. The measured Q4 64-token latency fell
+from 14.48 ms to 3.49 ms; Q5 down-projection at 80 tokens fell from 6.99 ms to 2.94 ms. Set
+`NINFER_SWIGLU_FUSED_PREFILL=0`, `NINFER_Q5ADD_SMALL_HMMA=0`, `NINFER_GROUPED_HMMA=0`, or
+`NINFER_GDN_OUTPUT_HMMA=0` to disable the corresponding optimization for comparison.
+Detailed per-layer profiling is opt-in with `NINFER_PROFILE_PREFILL=1`; ordinary serving metrics
+remain available without per-layer CUDA timing events.
+
+On the Linux dual E5-2690 v3 host (125 GiB RAM), the public Engine benchmark with the same
+Qwen3.8-27B artifact, KVarN, 8,192 input tokens, 256 decode tokens, MTP3, and two repetitions
+measured:
+
+| Configuration | Prefill | Decode |
+|---|---:|---:|
+| Earlier Q4/Q5 fast paths, 250 W GPU limit | 185.10 tok/s | 40.07 tok/s |
+| Final defaults with exact operand scaling, default 250 W | 196.88 tok/s | 39.93 tok/s |
+
+At the same default power limit, prefill improved by 6.4%. Decode was effectively unchanged
+(-0.3%, within run-to-run variation); this measurement does not establish a decode speedup.
+
+The benchmark context capacity was 32,768; serving retains 245,760 and the 131,072 default
+output allowance. This host retains the card's default 250 W power limit. The restart script
+does not change it unless explicitly requested; the fan-control systemd unit does not set power.
+The new kernels are enabled directly in source on SM75, so their effect does not depend on
+setting environment variables in the restart script. The delivered path avoids conversion
+rounding in the new input-projection kernels. FP32 accumulation order may still differ.
+
+```bash
+LD_LIBRARY_PATH="$HOME/.local/ninfer-deps/lib:/usr/local/cuda-12.8/lib64" \
+  ./build/bench/ninfer_bench --weights /path/to/qwen3_8_27b.ninfer \
+  -pg 8192,256 -r 2 --warmup 0 --max-ctx 32768 --kv-dtype kvarn \
+  --mtp-draft-tokens 3 --lm-head-draft -o json
+```
+
+### Responses cache reuse
+
+The builtin template replays the actual `<think>` / `</think>` tokens. Responses replay prefers
+raw reasoning `content` over its `summary`, so clients that return both do not duplicate it.
+Assistant text and immediately following function calls replay as one assistant turn, and tool
+parameters keep their generation order through JSON parsing.
+These fixes allow exact `append_frontier` reuse during tool loops with `preserve_thinking` off.
+At the default 250 W limit, Codex CLI 0.153.4 with three sequential shell calls produced warm
+continuation hits of 98.65%, 99.09%, and 99.09% with 0.834–0.956 s time to first token;
+a controlled five-request tool loop with an initial 6,583-token prompt reached 99.55–99.56%
+after the cold start.
+Cold starts, large new tool outputs, edited history, and stripping reasoning at a new user turn
+are excluded from this warm-continuation claim.
+
+To reproduce against a running service:
+
+```bash
+python3 tools/bench/run_responses_cache.py --base-url http://127.0.0.1:8321/v1 --mode streamed --min-hit 0.98
+python3 tools/bench/run_responses_cache.py --base-url http://127.0.0.1:8321/v1 --mode stored --min-hit 0.98
+```
+
+`deploy/codex-ninfer.config.toml` is an optional Codex profile. Copy it to
+`~/.codex/ninfer.config.toml` and select it with `codex --profile ninfer`.
 
 ---
 
@@ -176,6 +263,48 @@ Start the HTTP server:
   --kv-capacity auto \
   --max-concurrency 2 \
   --spec mtp --draft-tokens 3 --lm-head-draft
+```
+
+For the RTX 2080 Ti 22GB deployment bundle, `deploy/restart-ninfer.sh` provides an idempotent
+restart command. It resolves the adjacent `ninfer-src/` and `models/` directories, waits for old GPU
+allocations to drain, starts the public HTTP server, and waits for `/v1/models` to become healthy:
+
+```bash
+./deploy/restart-ninfer.sh restart
+./deploy/restart-ninfer.sh restart-daemon
+./deploy/restart-ninfer.sh status
+./deploy/restart-ninfer.sh watch
+./deploy/restart-ninfer.sh logs
+./deploy/restart-ninfer.sh stop
+```
+
+`restart` attaches a fixed-width live table after startup with TTFB, prefill and decode rates,
+generated tokens, prompt-cache hit rate, MTP acceptance, and wall time. `Ctrl+C` exits only the
+view. Use `restart-daemon` (or `--daemon`) when the restart command must return immediately.
+
+Its tested defaults are KVarN, MTP3, concurrency 2, a 245,760-token maximum context and shared KV
+capacity, and `default-max-tokens=131072`. On the 22,528 MiB card this uses about 21,610 MiB after
+startup while retaining about 220 MiB of planner slack. Paths and sizing remain overridable through
+the `NINFER_MODEL`, `NINFER_BIN`, `NINFER_MAX_CONTEXT`, `NINFER_KV_CAPACITY`, and
+`NINFER_DEFAULT_MAX_TOKENS` environment variables.
+`NINFER_PREFILL_CHUNK` and `NINFER_DRAFT_TOKENS` override the prefill chunk and MTP window for
+controlled experiments. The script leaves `preserve_thinking` off by default.
+
+The optional GPU power override is disabled by default. To explicitly request 280 W at startup,
+use `NINFER_GPU_POWER_LIMIT_W=280 ./deploy/restart-ninfer.sh restart-daemon`; applying it requires
+sudo. An unset or empty variable leaves the current driver limit unchanged. To restore this
+host's default after an opt-in run, use `sudo nvidia-smi -i 0 -pl 250`. Current deployment and the
+final performance measurements use 250 W.
+
+Driver 595.99.02 exposes manual fan control through NVML. The tested fan curve keeps the driver's
+84 C target (so temperature control does not lower clocks), runs at 45% through 40 C, and ramps to
+100% at 67 C. Install its system service with:
+
+```bash
+sudo install -m 0755 deploy/nvidia-fan-curve.py /usr/local/sbin/nvidia-fan-curve.py
+sudo install -m 0644 deploy/nvidia-fan-curve.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now nvidia-fan-curve.service
 ```
 
 ### Request Example

@@ -106,7 +106,8 @@ __device__ __forceinline__ int q5_mma_swizzle_k64(int row, int col) {
 }
 
 // clang-format off
-template <class Schedule_, bool Full, Q5MmaEpilogue Epilogue = Q5MmaEpilogue::Store>
+template <class Schedule_, bool Full, Q5MmaEpilogue Epilogue = Q5MmaEpilogue::Store,
+          bool UseFp16Mma = false, bool UseRegisterPrefetch = false>
 __global__ __launch_bounds__(Schedule_::kThreads, Schedule_::kLaunchBoundsMinBlocks)
 void q5_rowsplit_gemm_mma_kernel(
     const __nv_bfloat16* __restrict__ x,
@@ -338,6 +339,104 @@ void q5_rowsplit_gemm_mma_kernel(
         }
     };
 
+#if defined(NINFER_SM75)
+    constexpr int kPrefetchXItems = BN * (BK / 8);
+    constexpr int kPrefetchXRegs  =
+        (kPrefetchXItems + Schedule::kThreads - 1) / Schedule::kThreads;
+    constexpr int kPrefetchCodeItems = BM * GPB * 2;
+    constexpr int kPrefetchCodeRegs  =
+        (kPrefetchCodeItems + Schedule::kThreads - 1) / Schedule::kThreads;
+    constexpr int kPrefetchMetaItems = BM * GPB;
+    constexpr int kPrefetchMetaRegs  =
+        (kPrefetchMetaItems + Schedule::kThreads - 1) / Schedule::kThreads;
+    int4 prefetched_x[kPrefetchXRegs];
+    int4 prefetched_codes[kPrefetchCodeRegs];
+    std::uint64_t prefetched_high[kPrefetchMetaRegs];
+    std::uint32_t prefetched_scales[kPrefetchMetaRegs];
+
+    auto prefetch_inputs = [&](int k_tile) {
+        const int k0 = k_tile * BK;
+#pragma unroll
+        for (int i = 0; i < kPrefetchXRegs; ++i) {
+            const int item = tid + i * Schedule::kThreads;
+            if (item < kPrefetchXItems) {
+                const int local_col = item / (BK / 8);
+                const int k8        = item - local_col * (BK / 8);
+                prefetched_x[i] = load_ldg<int4>(
+                    &x[static_cast<std::int64_t>(col0 + local_col) * k + k0 + k8 * 8]);
+            }
+        }
+
+        const int group0 = (k_tile * BK) / Q5RowSplitStorage::kGroupK;
+#pragma unroll
+        for (int i = 0; i < kPrefetchCodeRegs; ++i) {
+            const int item = tid + i * Schedule::kThreads;
+            if (item < kPrefetchCodeItems) {
+                const int row_group = item >> 1;
+                const int half      = item & 1;
+                const int local_row = row_group / GPB;
+                const int group     = row_group - local_row * GPB;
+                const std::int64_t group_index =
+                    static_cast<std::int64_t>(row0 + local_row) * groups_per_row + group0 + group;
+                prefetched_codes[i] = load_ldg<int4>(
+                    &codes[group_index * Q5RowSplitStorage::kCodeBytesPerGroup + half * 16]);
+            }
+        }
+
+#pragma unroll
+        for (int i = 0; i < kPrefetchMetaRegs; ++i) {
+            const int row_group = tid + i * Schedule::kThreads;
+            if (row_group < kPrefetchMetaItems) {
+                const int local_row = row_group / GPB;
+                const int group     = row_group - local_row * GPB;
+                const int row       = row0 + local_row;
+                const int scale_group = group0 + group;
+                const std::int64_t group_index =
+                    static_cast<std::int64_t>(row) * groups_per_row + scale_group;
+                prefetched_high[i] = load_ldg<std::uint64_t>(
+                    &high[group_index * Q5RowSplitStorage::kHighBytesPerGroup]);
+                const int aligned_group = scale_group & ~1;
+                const std::int64_t aligned_index =
+                    static_cast<std::int64_t>(row) * groups_per_row + aligned_group;
+                prefetched_scales[i] = load_ldg<std::uint32_t>(
+                    &scales[aligned_index * Q5RowSplitStorage::kScaleBytesPerGroup]);
+            }
+        }
+    };
+
+    auto spill_prefetched = [&](int stage) {
+#pragma unroll
+        for (int i = 0; i < kPrefetchXRegs; ++i) {
+            const int item = tid + i * Schedule::kThreads;
+            if (item < kPrefetchXItems) {
+                const int local_col = item / (BK / 8);
+                const int k8        = item - local_col * (BK / 8);
+                store_vec(&Bs[stage][local_col * BK + q5_mma_swizzle_k64(local_col, k8 * 8)],
+                          prefetched_x[i]);
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < kPrefetchCodeRegs; ++i) {
+            const int item = tid + i * Schedule::kThreads;
+            if (item < kPrefetchCodeItems) {
+                const int row_group = item >> 1;
+                const int half      = item & 1;
+                store_vec(&Cr[stage][row_group * Q5RowSplitStorage::kCodeBytesPerGroup + half * 16],
+                          prefetched_codes[i]);
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < kPrefetchMetaRegs; ++i) {
+            const int row_group = tid + i * Schedule::kThreads;
+            if (row_group < kPrefetchMetaItems) {
+                store_vec(&Hr[stage][row_group * Q5RowSplitStorage::kHighBytesPerGroup],
+                          prefetched_high[i]);
+                store_vec(&Sr[stage][row_group * SB], prefetched_scales[i]);
+            }
+        }
+    };
+#endif
+
 #pragma unroll
     for (int stage = 0; stage < S; ++stage) {
         if (stage < k_tiles) { stage_inputs(stage, stage); }
@@ -351,6 +450,16 @@ void q5_rowsplit_gemm_mma_kernel(
 
         decode_weight(stage, k_tile);
         __syncthreads();
+
+        const int prefetch_tile = k_tile + S;
+#if defined(NINFER_SM75)
+        if constexpr (UseRegisterPrefetch) {
+            static_assert(Full);
+            static_assert(GPB == 1);
+            static_assert(SB == 4);
+            if (prefetch_tile < k_tiles) { prefetch_inputs(prefetch_tile); }
+        }
+#endif
 
         auto load_fragments = [&](int k_step, unsigned(&a_frag)[MT][4], unsigned(&b_frag)[NT][2]) {
 #pragma unroll
@@ -395,21 +504,54 @@ void q5_rowsplit_gemm_mma_kernel(
 #pragma unroll
             for (int ki = 0; ki < KSUB; ++ki) {
                 load_fragments(ki * 16, a_frag, b_frag);
+#if defined(NINFER_SM75)
+                if constexpr (UseFp16Mma) {
+#pragma unroll
+                    for (int mi = 0; mi < MT; ++mi) {
+#pragma unroll
+                        for (int reg = 0; reg < 4; ++reg) {
+                            a_frag[mi][reg] = bf162_to_f162(a_frag[mi][reg]);
+                        }
+                    }
+#pragma unroll
+                    for (int ni = 0; ni < NT; ++ni) {
+#pragma unroll
+                        for (int reg = 0; reg < 2; ++reg) {
+                            b_frag[ni][reg] = bf162_to_f162(b_frag[ni][reg]);
+                        }
+                    }
+                }
+#endif
 #pragma unroll
                 for (int mi = 0; mi < MT; ++mi) {
 #pragma unroll
                     for (int ni = 0; ni < NT; ++ni) {
-                        mma_bf16(accum[mi][ni][0], accum[mi][ni][1], accum[mi][ni][2],
-                                 accum[mi][ni][3], a_frag[mi][0], a_frag[mi][1], a_frag[mi][2],
-                                 a_frag[mi][3], b_frag[ni][0], b_frag[ni][1]);
+                        if constexpr (UseFp16Mma) {
+                            mma_f16(accum[mi][ni][0], accum[mi][ni][1], accum[mi][ni][2],
+                                    accum[mi][ni][3], a_frag[mi][0], a_frag[mi][1], a_frag[mi][2],
+                                    a_frag[mi][3], b_frag[ni][0], b_frag[ni][1]);
+                        } else {
+                            mma_bf16(accum[mi][ni][0], accum[mi][ni][1], accum[mi][ni][2],
+                                     accum[mi][ni][3], a_frag[mi][0], a_frag[mi][1], a_frag[mi][2],
+                                     a_frag[mi][3], b_frag[ni][0], b_frag[ni][1]);
+                        }
                     }
                 }
             }
         }
 
         __syncthreads();
-        const int prefetch_tile = k_tile + S;
-        if (prefetch_tile < k_tiles) { stage_inputs(stage, prefetch_tile); }
+        if (prefetch_tile < k_tiles) {
+#if defined(NINFER_SM75)
+            if constexpr (UseRegisterPrefetch) {
+                spill_prefetched(stage);
+            } else {
+                stage_inputs(stage, prefetch_tile);
+            }
+#else
+            stage_inputs(stage, prefetch_tile);
+#endif
+        }
         cp_commit();
     }
 

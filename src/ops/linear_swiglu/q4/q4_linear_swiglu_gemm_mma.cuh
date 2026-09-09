@@ -15,7 +15,8 @@
 
 namespace ninfer::ops::detail {
 
-template <class Cfg, bool FullTiles>
+template <class Cfg, bool FullTiles, bool UseFp16Mma = false,
+          bool UseRegisterPrefetch = false>
 __global__
 __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void q4_linear_swiglu_mma_split_half_pair_kernel(
     const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
@@ -156,6 +157,73 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void q4_linear_swiglu_mma_split
         }
     };
 
+#if defined(NINFER_SM75)
+    constexpr int kPrefetchXItems    = BN * (BK / 8);
+    constexpr int kPrefetchXRegs     = (kPrefetchXItems + Cfg::THREADS - 1) / Cfg::THREADS;
+    constexpr int kPrefetchCodeItems = BM * 2;
+    constexpr int kPrefetchCodeRegs  =
+        (kPrefetchCodeItems + Cfg::THREADS - 1) / Cfg::THREADS;
+    int4 prefetched_x[kPrefetchXRegs];
+    int4 prefetched_codes[kPrefetchCodeRegs];
+    std::uint32_t prefetched_scales = 0;
+
+    auto prefetch_inputs = [&](int kt) {
+        const int k0 = kt * BK;
+#pragma unroll
+        for (int i = 0; i < kPrefetchXRegs; ++i) {
+            const int item = tid + i * Cfg::THREADS;
+            if (item < kPrefetchXItems) {
+                const int tl  = item / (BK / 8);
+                const int kg8 = item - tl * (BK / 8);
+                prefetched_x[i] =
+                    load_ldg<int4>(&x[static_cast<std::int64_t>(t0 + tl) * k + k0 + kg8 * 8]);
+            }
+        }
+
+        const int g = (kt * BK) >> 6;
+#pragma unroll
+        for (int i = 0; i < kPrefetchCodeRegs; ++i) {
+            const int item = tid + i * Cfg::THREADS;
+            if (item < kPrefetchCodeItems) {
+                const int row  = item >> 1;
+                const int half = item & 1;
+                const int grow = global_row(row);
+                const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + g;
+                prefetched_codes[i] = load_ldg<int4>(&codes[gi * 32 + half * 16]);
+            }
+        }
+
+        if (tid < BM) {
+            const int grow             = global_row(tid);
+            const int aligned_g        = g & ~1;
+            const std::int64_t scale_i = static_cast<std::int64_t>(grow) * kg + aligned_g;
+            prefetched_scales          = load_ldg<std::uint32_t>(&scales[scale_i * 2]);
+        }
+    };
+
+    auto spill_prefetched = [&](int stage) {
+#pragma unroll
+        for (int i = 0; i < kPrefetchXRegs; ++i) {
+            const int item = tid + i * Cfg::THREADS;
+            if (item < kPrefetchXItems) {
+                const int tl  = item / (BK / 8);
+                const int kg8 = item - tl * (BK / 8);
+                store_vec(&Bs[stage][tl * BK + gemm_swz64(tl, kg8 * 8)], prefetched_x[i]);
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < kPrefetchCodeRegs; ++i) {
+            const int item = tid + i * Cfg::THREADS;
+            if (item < kPrefetchCodeItems) {
+                const int row  = item >> 1;
+                const int half = item & 1;
+                store_vec(&Cr[stage][row * 32 + half * 16], prefetched_codes[i]);
+            }
+        }
+        if (tid < BM) { store_vec(&Sr[stage][tid * SB], prefetched_scales); }
+    };
+#endif
+
 #pragma unroll
     for (int s = 0; s < S; ++s) {
         if (s < NKT) { stage_load(s, s); }
@@ -168,6 +236,15 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void q4_linear_swiglu_mma_split
         __syncthreads();
         dequant_to_As(stage, it);
         __syncthreads();
+
+        const int next = it + S;
+#if defined(NINFER_SM75)
+        if constexpr (UseRegisterPrefetch) {
+            static_assert(FullTiles);
+            static_assert(SB == 4);
+            if (next < NKT) { prefetch_inputs(next); }
+        }
+#endif
 
         unsigned af[MT][4];
         unsigned bf[NT][2];
@@ -186,19 +263,51 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void q4_linear_swiglu_mma_split
                 ldmatrix_x2(bf[ni][0], bf[ni][1],
                             smem_addr(&Bs[stage][brow * BK + gemm_swz64(brow, ks + b_koff)]));
             }
+#if defined(NINFER_SM75)
+            if constexpr (UseFp16Mma) {
+#pragma unroll
+                for (int mi = 0; mi < MT; ++mi) {
+#pragma unroll
+                    for (int reg = 0; reg < 4; ++reg) {
+                        af[mi][reg] = bf162_to_f162(af[mi][reg]);
+                    }
+                }
+#pragma unroll
+                for (int ni = 0; ni < NT; ++ni) {
+#pragma unroll
+                    for (int reg = 0; reg < 2; ++reg) {
+                        bf[ni][reg] = bf162_to_f162(bf[ni][reg]);
+                    }
+                }
+            }
+#endif
 #pragma unroll
             for (int mi = 0; mi < MT; ++mi) {
 #pragma unroll
                 for (int ni = 0; ni < NT; ++ni) {
-                    mma_bf16(acc[mi][ni][0], acc[mi][ni][1], acc[mi][ni][2], acc[mi][ni][3],
-                             af[mi][0], af[mi][1], af[mi][2], af[mi][3], bf[ni][0], bf[ni][1]);
+                    if constexpr (UseFp16Mma) {
+                        mma_f16(acc[mi][ni][0], acc[mi][ni][1], acc[mi][ni][2], acc[mi][ni][3],
+                                af[mi][0], af[mi][1], af[mi][2], af[mi][3], bf[ni][0], bf[ni][1]);
+                    } else {
+                        mma_bf16(acc[mi][ni][0], acc[mi][ni][1], acc[mi][ni][2], acc[mi][ni][3],
+                                 af[mi][0], af[mi][1], af[mi][2], af[mi][3], bf[ni][0], bf[ni][1]);
+                    }
                 }
             }
         }
 
         __syncthreads();
-        const int next = it + S;
-        if (next < NKT) { stage_load(stage, next); }
+        if (next < NKT) {
+#if defined(NINFER_SM75)
+            if constexpr (UseRegisterPrefetch) {
+                spill_prefetched(stage);
+            } else {
+                stage_load(stage, next);
+            }
+#else
+            stage_load(stage, next);
+#endif
+        }
         ninfer::ops::cp_commit();
     }
 

@@ -218,9 +218,14 @@ int test_reasoning_effort() {
     Json high                            = base;
     high["reasoning_effort"]             = "high";
     const GenerationRequest high_request = parse_chat_completion_request(high, default_limits());
+    failures += check(resolve_prompt_semantics(high_request, default_server(), effort_capabilities())
+                          .reasoning_effort == ninfer::ReasoningEffort::XHigh,
+                      "Chat high alias did not resolve to xhigh");
+    auto unavailable = effort_capabilities();
+    unavailable.reasoning_effort.xhigh = false;
     failures += check(api_code([&] {
                           (void)resolve_prompt_semantics(high_request, default_server(),
-                                                         effort_capabilities());
+                                                         unavailable);
                       }) == "reasoning_effort_not_supported",
                       "protocol-valid high effort was not rejected by template capability");
 
@@ -341,8 +346,8 @@ int test_reject_unsupported() {
     custom_tool["tools"] =
         Json::array({Json{{"type", "custom"}, {"custom", Json{{"name", "search"}}}}});
     failures += check(
-        throws_api([&] { (void)parse_chat_completion_request(custom_tool, default_limits()); }),
-        "custom tools rejected");
+        parse_chat_completion_request(custom_tool, default_limits()).tools.empty(),
+        "custom tools were not ignored by compatibility policy");
 
     Json functions         = base;
     functions["functions"] = Json::array({Json::object()});

@@ -5,11 +5,18 @@
 #include <array>
 #include <limits>
 #include <stdexcept>
+#include <string_view>
 
 namespace ninfer::ops::detail {
 namespace {
 
 constexpr std::int32_t kAnyCols = std::numeric_limits<std::int32_t>::max();
+
+#if defined(NINFER_SM75)
+constexpr int kDefaultQ5AddPerfMode = 3;
+#else
+constexpr int kDefaultQ5AddPerfMode = 0;
+#endif
 
 struct ColsSet {
     std::int32_t first;
@@ -162,8 +169,31 @@ void q5_linear_add_execute_plan(const Q5LinearAddPlan& plan, const Tensor& x, co
 
 void q5_linear_add_dispatch(const Tensor& x, const Weight& w, Tensor& residual_out,
                             WorkspaceArena& ws, cudaStream_t stream) {
+    // mode1 skips the projection; mode2 uses FP16 HMMA; mode3 also pipelines global loads.
+    static int mode = -2;
+    if (mode == -2) {
+        const char* env = std::getenv("NINFER_Q5ADD_KMODE");
+        mode            = env != nullptr ? std::atoi(env) : kDefaultQ5AddPerfMode;
+    }
+    if (mode == 1) { return; }
     const Q5LinearAddProblem problem{residual_out.ne[0], x.ne[0], w.padded_shape[1], x.ne[1]};
     const Q5LinearAddPlan plan = q5_linear_add_resolve_plan(problem);
+#if defined(NINFER_SM75)
+    static const bool small_hmma = [] {
+        const char* value = std::getenv("NINFER_Q5ADD_SMALL_HMMA");
+        return value == nullptr || std::string_view(value) != "0";
+    }();
+    if ((mode == 2 || mode == 3) &&
+        (plan.schedule == Q5LinearAddScheduleId::MmaResidualR64C128 ||
+         (small_hmma && problem.cols >= 49))) {
+        if (mode == 3) {
+            q5_linear_add_mma_r64_c128_sm75_f16_prefetch_launch(x, w, residual_out, stream);
+        } else {
+            q5_linear_add_mma_r64_c128_sm75_f16_launch(x, w, residual_out, stream);
+        }
+        return;
+    }
+#endif
     q5_linear_add_execute_plan(plan, x, w, residual_out, ws, stream);
 }
 

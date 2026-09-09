@@ -14,6 +14,8 @@
 #include "targets/qwen3_6/impl/frontend/jinja.h"
 
 #include <iostream>
+#include <fstream>
+#include <iterator>
 #include <string>
 #include <vector>
 
@@ -290,6 +292,40 @@ void test_builtin_templates_keep_their_transcription() {
               custom.render(messages, options).text, "plain text");
 }
 
+void test_builtin_tool_replay_matches_jinja() {
+    for (const char* filename : {"thinking_toggle_chat_template.jinja",
+                                 "reasoning_effort_chat_template.jinja"}) {
+        const std::string path = std::string(NINFER_SOURCE_DIR) + "/tests/fixtures/frontend/" + filename;
+        std::ifstream input(path);
+        if (!input) { throw std::runtime_error("missing template fixture: " + path); }
+        std::string source{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+        if (source.ends_with('\n')) { source.pop_back(); }
+        const auto builtin = CompiledChatTemplate::resolve(source);
+        const auto interpreted = CompiledChatTemplate::resolve(source + "{# force interpreter #}");
+        auto assistant = user_message("");
+        assistant.role = ChatRole::Assistant;
+        assistant.reasoning_content = "Need the next record.";
+        assistant.tool_calls.push_back(fi::ToolCall{"call_a", "lookup", R"({"key":"alpha"})"});
+        auto tool = user_message(R"({"value":17})");
+        tool.role = ChatRole::Tool;
+        tool.tool_call_id = "call_a";
+        std::vector<ChatMessage> messages{user_message("Look up alpha."), assistant, tool};
+        for (bool preserve : {false, true}) {
+            for (bool thinking : {false, true}) {
+                ChatRenderOptions options;
+                options.enable_thinking = thinking;
+                options.preserve_thinking = preserve;
+                expect_eq(std::string(filename) + " tool replay", builtin.render(messages, options).text,
+                          interpreted.render(messages, options).text);
+                auto next_turn = messages;
+                next_turn.push_back(user_message("What did you find?"));
+                expect_eq(std::string(filename) + " closed-turn replay", builtin.render(next_turn, options).text,
+                          interpreted.render(next_turn, options).text);
+            }
+        }
+    }
+}
+
 } // namespace
 
 int main() {
@@ -305,6 +341,7 @@ int main() {
     test_capabilities_follow_the_template();
     test_malformed_template_is_rejected();
     test_builtin_templates_keep_their_transcription();
+    test_builtin_tool_replay_matches_jinja();
 
     if (g_failures != 0) {
         std::cerr << g_failures << " jinja chat-template checks failed\n";

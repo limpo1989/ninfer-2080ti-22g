@@ -1,0 +1,16 @@
+# Install as ~/.codex/ninfer.config.toml and select with: codex --profile ninfer
+model = "qwen3.8-27b"
+model_provider = "ninfer"
+model_context_window = 245760
+model_auto_compact_token_limit = 220000
+model_reasoning_effort = "xhigh"
+model_reasoning_summary = "none"
+web_search = "disabled"
+
+[model_providers.ninfer]
+name = "NInfer local"
+base_url = "http://127.0.0.1:8321/v1"
+wire_api = "responses"
+requires_openai_auth = false
+stream_idle_timeout_ms = 300000
+stream_max_retries = 0

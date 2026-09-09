@@ -187,9 +187,14 @@ int test_reasoning_effort() {
     Json high                            = base;
     high["reasoning"]                    = Json{{"effort", "high"}};
     const GenerationRequest high_request = parse_responses_request(high, limits()).generation;
+    failures += check(resolve_prompt_semantics(high_request, ServeOptions{}, effort_capabilities())
+                          .reasoning_effort == ninfer::ReasoningEffort::XHigh,
+                      "Responses high alias did not resolve to xhigh");
+    auto unavailable = effort_capabilities();
+    unavailable.reasoning_effort.xhigh = false;
     failures += check(api_code([&] {
                           (void)resolve_prompt_semantics(high_request, ServeOptions{},
-                                                         effort_capabilities());
+                                                         unavailable);
                       }) == "reasoning_effort_not_supported",
                       "Responses high effort bypassed template capability validation");
 
@@ -458,6 +463,104 @@ int test_sse_sequence() {
     return failures;
 }
 
+int test_sse_keepalive_activity() {
+    ResponsesRequest request = parse_responses_request(Json{{"model", "qwen3.6-27b"},
+                                                            {"input", "hello"},
+                                                            {"max_output_tokens", 32},
+                                                            {"stream", true}},
+                                                       limits());
+    ResponsesRuntimeValues runtime;
+    runtime.enable_thinking = true;
+    ResponsesEventStream encoder("resp_keepalive", 123, request, runtime);
+    std::vector<std::string> wire = encoder.start();
+    for (int i = 0; i < 2; ++i) {
+        std::vector<std::string> more = encoder.keepalive();
+        wire.insert(wire.end(), more.begin(), more.end());
+    }
+    std::vector<std::string> more = encoder.reasoning_delta("thought");
+    wire.insert(wire.end(), more.begin(), more.end());
+    more = encoder.content_delta("answer");
+    wire.insert(wire.end(), more.begin(), more.end());
+    GenerationOutcome outcome    = sample_outcome();
+    ResponsesStreamFinish finish = encoder.finish(outcome);
+    wire.insert(wire.end(), finish.events_before_terminal.begin(),
+                finish.events_before_terminal.end());
+    wire.push_back(encoder.terminal(finish.response));
+
+    int failures                    = 0;
+    std::uint64_t expected_sequence = 0;
+    int reasoning_items             = 0;
+    int empty_activity_deltas       = 0;
+    for (const std::string& event : wire) {
+        const Json payload = parse_event(event);
+        failures += check(payload.at("sequence_number") == expected_sequence++,
+                          "keepalive sequence_number is contiguous");
+        if (payload.at("type") == "response.output_item.added" &&
+            payload.at("item").at("type") == "reasoning") {
+            ++reasoning_items;
+        }
+        if (payload.at("type") == "response.reasoning_summary_text.delta" &&
+            payload.at("delta").get<std::string>().empty()) {
+            ++empty_activity_deltas;
+        }
+    }
+    failures += check(reasoning_items == 1,
+                      "keepalive must open at most one reasoning item");
+    failures += check(empty_activity_deltas == 2,
+                      "each keepalive must emit one pi-ai-visible empty reasoning delta");
+    failures += check(finish.response.body.at("output").at(0).at("content").at(0).at("text") ==
+                          "thought",
+                      "keepalive changed terminal reasoning text");
+
+    ResponsesRuntimeValues no_thinking;
+    no_thinking.enable_thinking = false;
+    ResponsesEventStream plain("resp_plain_keepalive", 123, request, no_thinking);
+    (void)plain.start();
+    const std::vector<std::string> plain_keepalive = plain.keepalive();
+    failures += check(plain_keepalive.size() == 1 &&
+                          parse_event(plain_keepalive.front()).at("type") ==
+                              "response.in_progress",
+                      "non-thinking keepalive created synthetic output");
+    return failures;
+}
+
+int test_reasoning_replay_is_not_duplicated() {
+    Json reasoning = {{"type", "reasoning"}, {"id", "rs_replay"},
+                      {"summary", Json::array({Json{{"type", "summary_text"}, {"text", "summary"}}})},
+                      {"content", Json::array({Json{{"type", "reasoning_text"}, {"text", "raw thought"}}})}};
+    auto parse = [&](const Json& item) {
+        return parse_responses_request(Json{{"model", "qwen3.6-27b"},
+            {"input", Json::array({item, Json{{"role", "assistant"}, {"content", "answer"}}})}}, limits());
+    };
+    int failures = check(parse(reasoning).input_turns[0].reasoning_content == "raw thought",
+                         "raw reasoning and summary were concatenated during replay");
+    reasoning.erase("content");
+    failures += check(parse(reasoning).input_turns[0].reasoning_content == "summary",
+                      "summary-only reasoning replay was lost");
+    reasoning["content"] = Json::array();
+    failures += check(parse(reasoning).input_turns[0].reasoning_content == "summary",
+                      "empty raw content did not fall back to summary");
+    return failures;
+}
+
+int test_text_and_tool_call_replay_stays_one_turn() {
+    const auto request = parse_responses_request(Json{{"model", "qwen3.6-27b"},
+        {"input", Json::array({Json{{"role", "user"}, {"content", "Look it up"}},
+            Json{{"type", "reasoning"}, {"content", Json::array({Json{{"type", "reasoning_text"},
+                  {"text", "Need the data"}}})}},
+            Json{{"role", "assistant"}, {"content", "I will check the record."}},
+            Json{{"type", "function_call"}, {"call_id", "call_a"}, {"name", "lookup"},
+                 {"arguments", R"({"key":"a"})"}},
+            Json{{"type", "function_call"}, {"call_id", "call_b"}, {"name", "lookup"},
+                 {"arguments", R"({"key":"b"})"}},
+            Json{{"type", "function_call_output"}, {"call_id", "call_a"}, {"output", "17"}}})}}, limits());
+    return check(request.input_turns.size() == 3 &&
+                 request.input_turns[1].reasoning_content == "Need the data" &&
+                 request.input_turns[1].content[0].text == "I will check the record." &&
+                 request.input_turns[1].tool_calls.size() == 2,
+                 "assistant text and following tool calls were split into separate turns");
+}
+
 int test_sse_function_call() {
     ResponsesRequest request = parse_responses_request(Json{{"model", "qwen3.6-27b"},
                                                             {"input", "weather"},
@@ -525,6 +628,9 @@ int main() {
     failures += test_explicit_rejections();
     failures += test_response_object();
     failures += test_sse_sequence();
+    failures += test_sse_keepalive_activity();
+    failures += test_reasoning_replay_is_not_duplicated();
+    failures += test_text_and_tool_call_replay_stays_one_turn();
     failures += test_sse_function_call();
     failures += test_input_tokens_schema();
     if (failures == 0) { std::cout << "ok\n"; }

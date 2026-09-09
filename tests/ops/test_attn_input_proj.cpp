@@ -48,11 +48,14 @@ int verify_output(std::string_view label, const GuardedBf16Tensor& output,
 }
 
 int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& gate_value,
-                   std::int32_t tokens) {
+                   std::int32_t tokens, float amplitude = 1.0F, bool wide_range = false) {
     constexpr std::int32_t kHidden      = 5120;
     constexpr std::int32_t kQRows       = 6144;
     constexpr std::int32_t kKvRows      = 1024;
-    const std::vector<float> activation = make_bf16_activation(kHidden, tokens, 101U + tokens);
+    std::vector<float> activation = make_bf16_activation(kHidden, tokens, 101U + tokens);
+    for (std::size_t i = 0; i < activation.size(); ++i) {
+        activation[i] *= wide_range ? (i % 2 ? 0x1p30F : 0x1p-30F) : amplitude;
+    }
     const std::vector<std::uint16_t> activation_bits = bf16_bits(activation);
     DeviceBuffer device_activation                   = to_device(activation_bits);
 
@@ -93,9 +96,13 @@ int run_q4_q5() {
         quantized_weight::make_patterned_weight(QType::Q5G64_F16S, kParent, kHidden, 107U));
 
     int failures = 0;
-    for (const std::int32_t tokens : {1, 2, 16, 17, 21, 48}) {
+    for (const std::int32_t tokens : {1, 2, 16, 17, 21, 48, 128, 129, 1024}) {
         failures += run_q4_q5_case(query_key, gate_value, tokens);
     }
+    failures += run_q4_q5_case(query_key, gate_value, 128, 0x1p30F);
+    failures += run_q4_q5_case(query_key, gate_value, 128, 0x1p-30F);
+    failures += run_q4_q5_case(query_key, gate_value, 128, 0x1p-16F);
+    failures += run_q4_q5_case(query_key, gate_value, 129, 1.0F, true);
     return failures;
 }
 
@@ -488,7 +495,7 @@ int run_w8_companion() {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
@@ -496,6 +503,10 @@ int main() {
 
     int failures = 0;
     failures += run_q4_q5();
+    if (argc == 2 && std::string(argv[1]) == "--q4-q5-only") {
+        std::cout << (failures == 0 ? "OK" : "FAIL") << " attn_input_proj Q4/Q5\n";
+        return failures == 0 ? 0 : 1;
+    }
     failures += run_bf16_target();
     failures += run_nvfp4_target();
     failures += run_fp8_target();

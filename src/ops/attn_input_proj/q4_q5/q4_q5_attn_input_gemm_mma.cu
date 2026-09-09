@@ -45,12 +45,12 @@ void launch_pair(bool full, const Tensor& x, RowSplitGroupedMmaJob first,
         rowsplit_grouped_mma_kernel<Schedule, true, Codec, 2>
             <<<grid, Schedule::THREADS, 0, stream>>>(static_cast<const __nv_bfloat16*>(x.data),
                                                      first, second, empty, empty, x.ne[0], cols,
-                                                     x.ne[0]);
+                                                     x.ne[0], sm75_grouped_hmma_enabled());
     } else {
         rowsplit_grouped_mma_kernel<Schedule, false, Codec, 2>
             <<<grid, Schedule::THREADS, 0, stream>>>(static_cast<const __nv_bfloat16*>(x.data),
                                                      first, second, empty, empty, x.ne[0], cols,
-                                                     x.ne[0]);
+                                                     x.ne[0], sm75_grouped_hmma_enabled());
     }
     CUDA_CHECK(cudaGetLastError());
 }

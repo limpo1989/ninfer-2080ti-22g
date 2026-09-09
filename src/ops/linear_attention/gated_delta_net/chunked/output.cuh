@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ops/common/mma.cuh"
+#include "ops/common/sm75_bf16_mma.cuh"
 #include "ops/linear_attention/gated_delta_net/chunked/common.cuh"
 
 #include <cmath>
@@ -97,7 +98,7 @@ issue_cp_bf16(Bf16SmemTile<COLS> dst, const __nv_bfloat16* __restrict__ src_row0
     }
 }
 
-template <int N_TILES, int K_TILES, int A_STRIDE, int B_STRIDE>
+template <bool Native, int N_TILES, int K_TILES, int A_STRIDE, int B_STRIDE>
 __device__ __forceinline__ void
 mma_bf16_panel(float (&D)[N_TILES][4], Bf16SmemTile<A_STRIDE> A,
                Bf16SmemTile<B_STRIDE> B, int a_row_base, int a_col_base, int b_col_base,
@@ -119,8 +120,13 @@ mma_bf16_panel(float (&D)[N_TILES][4], Bf16SmemTile<A_STRIDE> A,
             unsigned bf[2];
             ldmatrix_x2(bf[0], bf[1],
                         smem_addr(B.ptr(nt * MMA_N + lane_in_8, b_col + k_off)));
-            mma_bf16(D[nt][0], D[nt][1], D[nt][2], D[nt][3], af[0], af[1], af[2], af[3],
-                     bf[0], bf[1]);
+            if constexpr (Native) {
+                ninfer::ops::mma_bf16_exact_fp16(D[nt][0], D[nt][1], D[nt][2], D[nt][3],
+                                                af[0], af[1], af[2], af[3], bf[0], bf[1]);
+            } else {
+                mma_bf16(D[nt][0], D[nt][1], D[nt][2], D[nt][3], af[0], af[1], af[2], af[3],
+                         bf[0], bf[1]);
+            }
         }
     }
 }
@@ -147,6 +153,7 @@ __device__ __forceinline__ void mma_av_panel(float (&D)[N_TILES][4],
     }
 }
 
+template <bool Native>
 __device__ __forceinline__ void
 output_job(const __nv_bfloat16* __restrict__ q_in,
            const __nv_bfloat16* __restrict__ k_in,
@@ -213,7 +220,7 @@ output_job(const __nv_bfloat16* __restrict__ q_in,
                 g_cumsum_in[(cs + static_cast<std::int64_t>(tid)) * H_v + h_v];
         }
 
-        mma_bf16_panel<N_TILES_BT, K_PANEL / BF16_MMA_K>(
+        mma_bf16_panel<Native, N_TILES_BT, K_PANEL / BF16_MMA_K>(
             A_strip, q_view, current, warp * MMA_M, panel * K_PANEL, 0, lane);
 
         if (panel + 1 < N_K_PANELS) {
@@ -296,7 +303,7 @@ output_job(const __nv_bfloat16* __restrict__ q_in,
         cp_commit();
 
         float D_frag[D_PANEL / MMA_N][4] = {};
-        mma_bf16_panel<D_PANEL / MMA_N, kStateDim / BF16_MMA_K>(
+        mma_bf16_panel<Native, D_PANEL / MMA_N, kStateDim / BF16_MMA_K>(
             D_frag, q_view, h_view, warp * MMA_M, 0, 0, lane);
 
 #pragma unroll
@@ -342,7 +349,7 @@ output_job(const __nv_bfloat16* __restrict__ q_in,
     }
 }
 
-template <bool MULTI_JOB>
+template <bool MULTI_JOB, bool Native = false>
 __launch_bounds__(THREADS, 4) __global__
     void output_kernel(const __nv_bfloat16* __restrict__ q_in,
                        const __nv_bfloat16* __restrict__ k_in,
@@ -357,12 +364,12 @@ __launch_bounds__(THREADS, 4) __global__
     if constexpr (MULTI_JOB) {
         const int chunk_stride = static_cast<int>(gridDim.x);
         for (int chunk = static_cast<int>(blockIdx.x); chunk < chunks; chunk += chunk_stride) {
-            output_job(q_in, k_in, v_new_in, g_cumsum_in, h_chunk_in, attn_out, qk_map, scale,
+            output_job<Native>(q_in, k_in, v_new_in, g_cumsum_in, h_chunk_in, attn_out, qk_map, scale,
                        chunk, h_v, smem);
             if (chunk + chunk_stride < chunks) { __syncthreads(); }
         }
     } else {
-        output_job(q_in, k_in, v_new_in, g_cumsum_in, h_chunk_in, attn_out, qk_map, scale,
+        output_job<Native>(q_in, k_in, v_new_in, g_cumsum_in, h_chunk_in, attn_out, qk_map, scale,
                    static_cast<int>(blockIdx.x), h_v, smem);
     }
 }

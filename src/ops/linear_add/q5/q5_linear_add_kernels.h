@@ -18,5 +18,12 @@ void q5_linear_add_mma_r64_c64_launch(const Tensor& x, const Weight& w, Tensor& 
                                       cudaStream_t stream);
 void q5_linear_add_mma_r64_c128_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
                                        cudaStream_t stream);
+#if defined(NINFER_SM75)
+void q5_linear_add_mma_r64_c128_sm75_f16_launch(const Tensor& x, const Weight& w,
+                                                Tensor& residual_out, cudaStream_t stream);
+void q5_linear_add_mma_r64_c128_sm75_f16_prefetch_launch(const Tensor& x, const Weight& w,
+                                                         Tensor& residual_out,
+                                                         cudaStream_t stream);
+#endif
 
 } // namespace ninfer::ops::detail

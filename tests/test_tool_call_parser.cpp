@@ -66,6 +66,15 @@ int test_multiple_calls_and_json_values() {
     return failures;
 }
 
+int test_parameter_order_survives_replay() {
+    const auto result = ninfer::serve::parse_qwen_tool_call_output(
+        "<tool_call>\n<function=run>\n<parameter=z>\n1\n</parameter>\n"
+        "<parameter=a>\n2\n</parameter>\n</function>\n</tool_call>", 64);
+    return check(result.is_tool_call_response &&
+                 result.tool_calls[0].arguments_json == R"({"z":1,"a":2})",
+                 "tool parameter order changed between generation and replay");
+}
+
 int test_malformed_falls_back_to_text() {
     const std::string text = "<tool_call>\n<function=get_weather>\n";
     const ninfer::serve::ParsedToolCallOutput parsed =
@@ -157,6 +166,7 @@ int main() {
     int failures = 0;
     failures += test_single_call();
     failures += test_multiple_calls_and_json_values();
+    failures += test_parameter_order_survives_replay();
     failures += test_malformed_falls_back_to_text();
     failures += test_suffix_after_tool_falls_back_to_text();
     failures += test_configured_name_limit();

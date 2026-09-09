@@ -52,12 +52,12 @@ void launch_slice(bool full, const Tensor& x, const Weight& qk_weight, const Wei
         rowsplit_grouped_mma_kernel<Schedule, true, RowSplitGroupedMmaCodec::Mixed, 4>
             <<<grid, Schedule::THREADS, 0, stream>>>(static_cast<const __nv_bfloat16*>(x.data), qk,
                                                      value, output_gate, empty, x.ne[0], cols,
-                                                     x.ne[0]);
+                                                     x.ne[0], sm75_grouped_hmma_enabled());
     } else {
         rowsplit_grouped_mma_kernel<Schedule, false, RowSplitGroupedMmaCodec::Mixed, 4>
             <<<grid, Schedule::THREADS, 0, stream>>>(static_cast<const __nv_bfloat16*>(x.data), qk,
                                                      value, output_gate, empty, x.ne[0], cols,
-                                                     x.ne[0]);
+                                                     x.ne[0], sm75_grouped_hmma_enabled());
     }
     CUDA_CHECK(cudaGetLastError());
 }

@@ -65,6 +65,16 @@ using Q4MmaR64C120Schedule =
 using Q4MmaR64C128Schedule =
     Q4RowSplitMmaGemmSchedule<64, 128, 64, 64, 32, 2, 1, Q4FragmentPipeline::Serial, Cache::cg,
                               Cache::cg, Q4ScaleLoad::Pair32>;
+// [experiment] 8-warp 变体(更多延迟隐藏) / PingPong 片段流水(加载与MMA重叠)
+using Q4MmaR64C128W8Schedule =
+    Q4RowSplitMmaGemmSchedule<64, 128, 64, 64, 16, 2, 1, Q4FragmentPipeline::Serial, Cache::cg,
+                              Cache::cg, Q4ScaleLoad::Pair32>;
+using Q4MmaR64C128PPSchedule =
+    Q4RowSplitMmaGemmSchedule<64, 128, 64, 64, 32, 2, 1, Q4FragmentPipeline::PingPong, Cache::cg,
+                              Cache::cg, Q4ScaleLoad::Pair32>;
+using Q4MmaR64C128W8PPSchedule =
+    Q4RowSplitMmaGemmSchedule<64, 128, 64, 64, 16, 2, 1, Q4FragmentPipeline::PingPong, Cache::cg,
+                              Cache::cg, Q4ScaleLoad::Pair32>;
 
 template <class Schedule, bool Full>
 void launch_schedule(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
@@ -159,6 +169,18 @@ void launch_q4_mma_r64_c120(const Tensor& x, const Weight& w, Tensor& out, cudaS
 
 void launch_q4_mma_r64_c128(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     launch_route<Q4MmaR64C128Schedule>(x, w, out, stream);
+}
+void launch_q4_mma_r64_c128_w8(const Tensor& x, const Weight& w, Tensor& out,
+                               cudaStream_t stream) {
+    launch_route<Q4MmaR64C128W8Schedule>(x, w, out, stream);
+}
+void launch_q4_mma_r64_c128_pp(const Tensor& x, const Weight& w, Tensor& out,
+                               cudaStream_t stream) {
+    launch_route<Q4MmaR64C128PPSchedule>(x, w, out, stream);
+}
+void launch_q4_mma_r64_c128_w8pp(const Tensor& x, const Weight& w, Tensor& out,
+                                 cudaStream_t stream) {
+    launch_route<Q4MmaR64C128W8PPSchedule>(x, w, out, stream);
 }
 
 } // namespace ninfer::ops::detail

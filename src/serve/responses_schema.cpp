@@ -265,28 +265,47 @@ std::string parse_reasoning_item(const Json& item, Json& canonical) {
         bad_request("encrypted reasoning content is not supported", "input",
                     "encrypted_reasoning_not_supported");
     }
+    // A summary is an alternative representation, not an additional reasoning
+    // segment. Prefer raw content when present so replaying our streamed Item
+    // (which contains both) never duplicates the model's reasoning.
+    Json summary_content = Json::array();
     if (item.contains("summary") && !item.at("summary").is_null()) {
         if (!item.at("summary").is_array()) {
             bad_request("reasoning summary must be an array", "input");
         }
-        if (!item.at("summary").empty()) {
-            bad_request("reasoning summaries are not supported; replay raw reasoning_text", "input",
-                        "reasoning_summary_not_supported");
+        for (const Json& part : item.at("summary")) {
+            if (part.is_object() && part.contains("type") &&
+                part.at("type").get<std::string>() == "summary_text" && part.contains("text") &&
+                part.at("text").is_string()) {
+                summary_content.push_back(Json{{"type", "reasoning_text"},
+                                               {"text", part.at("text").get<std::string>()}});
+            }
         }
     }
     if (!item.contains("content") || !item.at("content").is_array()) {
-        bad_request("reasoning Item must contain a content array", "input");
+        if (summary_content.empty()) {
+            bad_request("reasoning Item must contain a content array", "input");
+        }
     }
     std::string text;
     Json content = Json::array();
-    for (const Json& part : item.at("content")) {
-        if (!part.is_object() || !part.contains("type") || !part.at("type").is_string() ||
-            part.at("type").get<std::string>() != "reasoning_text" || !part.contains("text") ||
-            !part.at("text").is_string()) {
-            bad_request("reasoning content only supports reasoning_text parts", "input");
+    if (item.contains("content") && item.at("content").is_array()) {
+        for (const Json& part : item.at("content")) {
+            if (!part.is_object() || !part.contains("type") || !part.at("type").is_string() ||
+                part.at("type").get<std::string>() != "reasoning_text" || !part.contains("text") ||
+                !part.at("text").is_string()) {
+                bad_request("reasoning content only supports reasoning_text parts", "input");
+            }
+            text += part.at("text").get<std::string>();
+            content.push_back(Json{{"type", "reasoning_text"}, {"text", part.at("text")}});
         }
-        text += part.at("text").get<std::string>();
-        content.push_back(Json{{"type", "reasoning_text"}, {"text", part.at("text")}});
+    }
+    if (content.empty()) {
+        for (const Json& part : summary_content) {
+            const std::string& part_text = part.at("text").get<std::string>();
+            text += part_text;
+            content.push_back(Json{{"type", "reasoning_text"}, {"text", part_text}});
+        }
     }
     canonical = {{"id", item_id(item, "rs", "input")},
                  {"type", "reasoning"},
@@ -396,9 +415,9 @@ void parse_input(const Json& input, ResponsesRequest& out) {
                 pending_reasoning.clear();
                 pending_reasoning_present = false;
             }
+            can_group_function_calls = message.turn.role == ChatRole::Assistant;
             out.input_turns.push_back(std::move(message.turn));
             canonical                = std::move(message.canonical);
-            can_group_function_calls = false;
         } else if (type == "reasoning") {
             if (pending_reasoning_present) {
                 bad_request("adjacent reasoning Items are not supported", "input");
@@ -409,9 +428,7 @@ void parse_input(const Json& input, ResponsesRequest& out) {
         } else if (type == "function_call") {
             ToolCall call = parse_function_call_item(item, canonical);
             if (can_group_function_calls && !pending_reasoning_present &&
-                !out.input_turns.empty() && out.input_turns.back().role == ChatRole::Assistant &&
-                out.input_turns.back().content.empty() &&
-                !out.input_turns.back().tool_calls.empty()) {
+                !out.input_turns.empty() && out.input_turns.back().role == ChatRole::Assistant) {
                 out.input_turns.back().tool_calls.push_back(std::move(call));
             } else {
                 ChatTurn turn;
@@ -454,7 +471,8 @@ void parse_tools(const Json& body, ResponsesRequest& out) {
             bad_request("tools entries must be objects with a string type", "tools");
         }
         if (item.at("type").get<std::string>() != "function") {
-            bad_request("only function tools are supported", "tools", "tool_type_not_supported");
+            // Codex sends namespace/web_search/etc. tool types; skip like LMStudio does.
+            continue;
         }
         ToolDefinition tool;
         tool.name = require_function_name(item, "tools");
@@ -573,6 +591,7 @@ void reject_unknown_top_level(const Json& body) {
     static const std::unordered_set<std::string> allowed = {
         "background",
         "chat_template_kwargs",
+        "client_metadata",
         "context_management",
         "conversation",
         "include",
@@ -614,7 +633,7 @@ void reject_unknown_top_level(const Json& body) {
 
 void reject_server_managed_features(const Json& body) {
     for (const char* key : {"context_management", "conversation", "max_tool_calls", "moderation",
-                            "prompt", "prompt_cache_key", "prompt_cache_options",
+                            "prompt", "prompt_cache_options",
                             "prompt_cache_retention", "safety_identifier", "user"}) {
         if (body.contains(key) && !body.at(key).is_null()) {
             bad_request(std::string(key) + " is not supported", key, "parameter_not_supported");
@@ -631,10 +650,7 @@ void reject_server_managed_features(const Json& body) {
     }
     if (body.contains("include") && !body.at("include").is_null()) {
         if (!body.at("include").is_array()) { bad_request("include must be an array", "include"); }
-        if (!body.at("include").empty()) {
-            bad_request("additional response fields are not supported", "include",
-                        "include_not_supported");
-        }
+        // Codex sends include: ["reasoning.encrypted_content"]; tolerate and ignore.
     }
     if (body.contains("parallel_tool_calls") && !body.at("parallel_tool_calls").is_null()) {
         if (!body.at("parallel_tool_calls").is_boolean()) {
@@ -845,7 +861,7 @@ BuiltResponse build_response(const std::string& id, std::int64_t created_at,
     const std::string status      = response_status(outcome.finish_reason);
     const std::string item_status = status == "completed" ? "completed" : "incomplete";
 
-    if (!outcome.reasoning.empty()) {
+    if (!outcome.reasoning.empty() || !ids.reasoning.empty()) {
         if (ids.reasoning.empty()) { ids.reasoning = new_response_item_id("rs"); }
         const char* reasoning_status = (!outcome.text.empty() || !outcome.tool_calls.empty())
                                            ? "completed"
@@ -1015,10 +1031,11 @@ public:
         reasoning_started = true;
         ids.reasoning     = new_response_item_id("rs");
         reasoning_index   = next_output_index++;
+        const Json spart  = {{"type", "summary_text"}, {"text", ""}};
         const Json item   = {{"id", ids.reasoning},
                              {"type", "reasoning"},
                              {"status", "in_progress"},
-                             {"summary", Json::array()},
+                             {"summary", Json::array({spart})},
                              {"content", Json::array()}};
         const Json part   = {{"type", "reasoning_text"}, {"text", ""}};
         return {sse(event("response.output_item.added",
@@ -1026,7 +1043,12 @@ public:
                 sse(event("response.content_part.added", Json{{"item_id", ids.reasoning},
                                                               {"output_index", reasoning_index},
                                                               {"content_index", 0},
-                                                              {"part", part}}))};
+                                                              {"part", part}})),
+                sse(event("response.reasoning_summary_part.added",
+                          Json{{"item_id", ids.reasoning},
+                               {"output_index", reasoning_index},
+                               {"summary_index", 0},
+                               {"part", spart}}))};
     }
 
     std::vector<std::string> close_reasoning(const std::string& final_text,
@@ -1035,12 +1057,23 @@ public:
         reasoning_done  = true;
         reasoning_text  = final_text;
         const Json part = {{"type", "reasoning_text"}, {"text", reasoning_text}};
+        const Json spart = {{"type", "summary_text"}, {"text", reasoning_text}};
         const Json item = {{"id", ids.reasoning},
                            {"type", "reasoning"},
                            {"status", item_status},
-                           {"summary", Json::array()},
+                           {"summary", Json::array({spart})},
                            {"content", Json::array({part})}};
-        return {sse(event("response.reasoning_text.done", Json{{"item_id", ids.reasoning},
+        return {sse(event("response.reasoning_summary_text.done",
+                          Json{{"item_id", ids.reasoning},
+                               {"output_index", reasoning_index},
+                               {"summary_index", 0},
+                               {"text", reasoning_text}})),
+                sse(event("response.reasoning_summary_part.done",
+                          Json{{"item_id", ids.reasoning},
+                               {"output_index", reasoning_index},
+                               {"summary_index", 0},
+                               {"part", spart}})),
+                sse(event("response.reasoning_text.done", Json{{"item_id", ids.reasoning},
                                                                {"output_index", reasoning_index},
                                                                {"content_index", 0},
                                                                {"text", reasoning_text}})),
@@ -1134,6 +1167,37 @@ std::vector<std::string> ResponsesEventStream::start() {
             sse(impl_->event("response.in_progress", Json{{"response", response}}))};
 }
 
+std::vector<std::string> ResponsesEventStream::keepalive() {
+    if (!impl_->started || impl_->finish_built) {
+        throw std::logic_error("invalid Responses stream keepalive state");
+    }
+    const Json response =
+        in_progress_response(impl_->id, impl_->created_at, impl_->request, impl_->runtime);
+    std::vector<std::string> events{
+        sse(impl_->event("response.in_progress", Json{{"response", response}}))};
+
+    if (impl_->message_started && !impl_->message_done) {
+        events.push_back(sse(impl_->event("response.output_text.delta",
+            Json{{"item_id", impl_->ids.message}, {"output_index", impl_->message_index},
+                 {"content_index", 0}, {"delta", ""}, {"logprobs", Json::array()}})));
+        return events;
+    }
+    if (!impl_->runtime.enable_thinking || impl_->reasoning_done) { return events; }
+
+    std::vector<std::string> added = impl_->ensure_reasoning();
+    events.insert(events.end(), std::make_move_iterator(added.begin()),
+                  std::make_move_iterator(added.end()));
+    if (!impl_->reasoning_done) {
+        events.push_back(sse(impl_->event(
+            "response.reasoning_summary_text.delta",
+            Json{{"item_id", impl_->ids.reasoning},
+                 {"output_index", impl_->reasoning_index},
+                 {"summary_index", 0},
+                 {"delta", ""}})));
+    }
+    return events;
+}
+
 std::vector<std::string> ResponsesEventStream::reasoning_delta(const std::string& text) {
     if (!impl_->started || impl_->finish_built) {
         throw std::logic_error("invalid reasoning delta event state");
@@ -1146,6 +1210,12 @@ std::vector<std::string> ResponsesEventStream::reasoning_delta(const std::string
                                                            {"output_index", impl_->reasoning_index},
                                                            {"content_index", 0},
                                                            {"delta", text}})));
+    events.push_back(sse(
+        impl_->event("response.reasoning_summary_text.delta",
+                     Json{{"item_id", impl_->ids.reasoning},
+                          {"output_index", impl_->reasoning_index},
+                          {"summary_index", 0},
+                          {"delta", text}})));
     return events;
 }
 

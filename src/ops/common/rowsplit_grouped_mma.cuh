@@ -5,6 +5,7 @@
 
 #include "ops/common/math.h"
 #include "ops/common/rowsplit_mma.cuh"
+#include "ops/common/sm75_bf16_mma.cuh"
 #include "ops/linear/q4/q4_rowsplit_storage.cuh"
 #include "ops/linear/q5/q5_rowsplit_storage.cuh"
 #include "core/tensor.h"
@@ -12,8 +13,21 @@
 #include <cuda_bf16.h>
 
 #include <cstdint>
+#include <cstdlib>
 
 namespace ninfer::ops::detail {
+
+inline bool sm75_grouped_hmma_enabled() {
+#if defined(NINFER_SM75)
+    static const bool enabled = [] {
+        const char* value = std::getenv("NINFER_GROUPED_HMMA");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+#else
+    return false;
+#endif
+}
 
 struct RowSplitGroupedMmaJob {
     const std::uint8_t* codes   = nullptr;
@@ -37,7 +51,7 @@ template <class Cfg, bool FullTiles, RowSplitGroupedMmaCodec Codec = RowSplitGro
 __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void rowsplit_grouped_mma_kernel(
     const __nv_bfloat16* __restrict__ x, RowSplitGroupedMmaJob job0, RowSplitGroupedMmaJob job1,
     RowSplitGroupedMmaJob job2, RowSplitGroupedMmaJob job3, std::int32_t k, std::int32_t t,
-    std::int32_t padded_k) {
+    std::int32_t padded_k, bool native_hmma = false) {
     constexpr int BM   = Cfg::BM;
     constexpr int BN   = Cfg::BN;
     constexpr int BK   = Cfg::BK;
@@ -306,12 +320,29 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void rowsplit_groupe
                 ldmatrix_x2(bf[ni][0], bf[ni][1],
                             smem_addr(&Bs[stage][brow * BK + gemm_swz64(brow, ks + b_koff)]));
             }
+            bool use_f16 = false;
+            float inverse_scale = 1.0F;
+#if defined(NINFER_SM75)
+            if (native_hmma) {
+                use_f16 = scale_bf16_mma_fragments(af, bf, inverse_scale);
+            }
+#endif
 #pragma unroll
             for (int mi = 0; mi < MT; ++mi) {
 #pragma unroll
                 for (int ni = 0; ni < NT; ++ni) {
-                    mma_bf16(acc[mi][ni][0], acc[mi][ni][1], acc[mi][ni][2], acc[mi][ni][3],
-                             af[mi][0], af[mi][1], af[mi][2], af[mi][3], bf[ni][0], bf[ni][1]);
+                    if (use_f16) {
+                        float sum0 = 0, sum1 = 0, sum2 = 0, sum3 = 0;
+                        mma_f16(sum0, sum1, sum2, sum3,
+                                af[mi][0], af[mi][1], af[mi][2], af[mi][3], bf[ni][0], bf[ni][1]);
+                        acc[mi][ni][0] += sum0 * inverse_scale;
+                        acc[mi][ni][1] += sum1 * inverse_scale;
+                        acc[mi][ni][2] += sum2 * inverse_scale;
+                        acc[mi][ni][3] += sum3 * inverse_scale;
+                    } else {
+                        mma_bf16(acc[mi][ni][0], acc[mi][ni][1], acc[mi][ni][2], acc[mi][ni][3],
+                                 af[mi][0], af[mi][1], af[mi][2], af[mi][3], bf[ni][0], bf[ni][1]);
+                    }
                 }
             }
         }

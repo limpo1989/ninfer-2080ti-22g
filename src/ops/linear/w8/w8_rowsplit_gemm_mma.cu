@@ -6,10 +6,20 @@
 #include "ops/linear/w8/w8_launch.h"
 
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
 namespace {
+
+int w8_perf_mode() {
+    static int mode = -2;
+    if (mode == -2) {
+        const char* env = std::getenv("NINFER_W8_KMODE");
+        mode            = env != nullptr ? std::atoi(env) : 0;
+    }
+    return mode;
+}
 
 template <class Schedule, bool Full>
 void launch_slice(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
@@ -22,7 +32,8 @@ void launch_slice(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t st
     const W8ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data), rows};
     w8_rowsplit_gemm_mma_kernel<Schedule, Full><<<grid, Schedule::THREADS, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
-        static_cast<const std::uint8_t*>(w.scales), output, rows, k, cols, padded_k);
+        static_cast<const std::uint8_t*>(w.scales), output, rows, k, cols, padded_k,
+        w8_perf_mode());
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -82,6 +93,8 @@ using MmaR96C96          = W8RowSplitMmaGemmSchedule<96, 96, 48, 16, 2>;
 using MmaR128C64         = W8RowSplitMmaGemmSchedule<128, 64, 64, 16, 2>;
 using MmaR128C80         = W8RowSplitMmaGemmSchedule<128, 80, 64, 16, 2>;
 using MmaR64x16C48K128A1 = W8RowSplitMmaGemmSchedule<64, 48, 16, 24, 2, 2, 128, 1>;
+using MmaR64C128A1       = W8RowSplitMmaGemmSchedule<64, 128, 64, 16, 2, 2, 64, 1>;
+using MmaR128C128A1      = W8RowSplitMmaGemmSchedule<128, 128, 64, 32, 1, 2, 64, 1>;
 
 } // namespace
 
@@ -104,6 +117,8 @@ NINFER_W8_MMA_LAUNCHER(launch_w8_mma_r96_c96, MmaR96C96)
 NINFER_W8_MMA_LAUNCHER(launch_w8_mma_r128_c64, MmaR128C64)
 NINFER_W8_MMA_LAUNCHER(launch_w8_mma_r128_c80, MmaR128C80)
 NINFER_W8_MMA_LAUNCHER(launch_w8_mma_r64x16_c48_k128_a1, MmaR64x16C48K128A1)
+NINFER_W8_MMA_LAUNCHER(launch_w8_mma_r64_c128_a1, MmaR64C128A1)
+NINFER_W8_MMA_LAUNCHER(launch_w8_mma_r128_c128_a1, MmaR128C128A1)
 
 #undef NINFER_W8_MMA_LAUNCHER
 

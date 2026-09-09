@@ -36,13 +36,16 @@ int verify_output_range(std::string_view label, const GuardedBf16Tensor& output,
 }
 
 int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_weight,
-                   std::int32_t tokens) {
+                   std::int32_t tokens, float amplitude = 1.0F, bool wide_range = false) {
     constexpr std::int32_t kHidden      = 5120;
     constexpr std::int32_t kQkRows      = 4096;
     constexpr std::int32_t kValueRows   = 6144;
     constexpr std::int32_t kZRows       = 6144;
     constexpr std::int32_t kRows        = kQkRows + kValueRows;
-    const std::vector<float> activation = make_bf16_activation(kHidden, tokens, 401U + tokens);
+    std::vector<float> activation = make_bf16_activation(kHidden, tokens, 401U + tokens);
+    for (std::size_t i = 0; i < activation.size(); ++i) {
+        activation[i] *= wide_range ? (i % 2 ? 0x1p30F : 0x1p-30F) : amplitude;
+    }
     const std::vector<std::uint16_t> activation_bits = bf16_bits(activation);
     DeviceBuffer device_activation                   = to_device(activation_bits);
     GuardedBf16Tensor qkv(kRows, tokens);
@@ -77,9 +80,13 @@ int run_q4_q5() {
     DevicePackedWeight value_z_weight(
         quantized_weight::make_patterned_weight(QType::Q5G64_F16S, 12288, kHidden, 419U));
     int failures = 0;
-    for (const std::int32_t tokens : {1, 2, 16, 17}) {
+    for (const std::int32_t tokens : {1, 2, 16, 17, 128, 129, 1024}) {
         failures += run_q4_q5_case(query_key, value_z_weight, tokens);
     }
+    failures += run_q4_q5_case(query_key, value_z_weight, 128, 0x1p30F);
+    failures += run_q4_q5_case(query_key, value_z_weight, 128, 0x1p-30F);
+    failures += run_q4_q5_case(query_key, value_z_weight, 128, 0x1p-16F);
+    failures += run_q4_q5_case(query_key, value_z_weight, 129, 1.0F, true);
     return failures;
 }
 
@@ -314,7 +321,7 @@ int run_fp8() {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
@@ -322,6 +329,10 @@ int main() {
 
     int failures = 0;
     failures += run_q4_q5();
+    if (argc == 2 && std::string(argv[1]) == "--q4-q5-only") {
+        std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_input_proj Q4/Q5\n";
+        return failures == 0 ? 0 : 1;
+    }
     failures += run_w8();
     failures += run_nvfp4();
     failures += run_fp8();

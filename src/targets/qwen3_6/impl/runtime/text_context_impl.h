@@ -1,3 +1,7 @@
+#include <chrono>
+#include <iostream>
+#include <cstdio>
+#include <cstdlib>
 #include "targets/qwen3_6/impl/runtime/instance.h"
 #include "targets/qwen3_6/impl/runtime/text_context.h"
 #include "targets/qwen3_6/impl/runtime/workspace_recipe.h"
@@ -39,11 +43,20 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
 namespace {
+
+bool profile_prefill_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NINFER_PROFILE_PREFILL");
+        return value != nullptr && std::string_view(value) == "1";
+    }();
+    return enabled;
+}
 
 void copy_i32(const std::int32_t* source, Tensor& destination, cudaStream_t stream) {
     if (source == nullptr || destination.dtype != DType::I32 || !destination.is_contiguous() ||
@@ -1038,6 +1051,15 @@ void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Ph
 template <class Tap>
 void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
     const bool prefill = ph == Phase::Prefill;
+    // [perf-instrumentation] per-layer GPU stream segmentation (prefill only)
+    std::vector<cudaEvent_t> inst_ev;
+    const bool instrument = prefill && profile_prefill_enabled();
+    if (instrument) {
+        inst_ev.resize(static_cast<std::size_t>(kCfg.n_layers) * 2 + 1);
+        for (auto& e : inst_ev) { (void)cudaEventCreate(&e); }
+        (void)cudaEventRecord(inst_ev[0], ctx_.stream);
+    }
+    int inst_idx = 0;
     for (int layer = 0; layer < kCfg.n_layers; ++layer) {
         if (ModelConfig::is_full(layer)) {
             const int fidx         = ModelConfig::full_idx(layer);
@@ -1052,6 +1074,7 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                 auto mixer_scope = work_.scope();
                 attn_mix(full, x, fidx, ph);
             }
+            if (instrument) { (void)cudaEventRecord(inst_ev[++inst_idx], ctx_.stream); }
             {
                 nvtx::ScopedRange post_mixer_range(
                     prefill ? nvtx::Name::PrefillPostMixer : nvtx::Name::VerifyPostMixer,
@@ -1060,6 +1083,7 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                 mlp_tail(full.post_attn_norm, full.mlp, x, ph);
                 if constexpr (Tap::enabled) { tap.capture_layer(layer, x, ctx_.stream); }
             }
+            if (instrument) { (void)cudaEventRecord(inst_ev[++inst_idx], ctx_.stream); }
         } else {
             const int gidx       = ModelConfig::gdn_idx(layer);
             const GdnLayerW& gdn = gdn_.at(static_cast<std::size_t>(gidx));
@@ -1073,6 +1097,7 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                 auto mixer_scope = work_.scope();
                 gdn_mix(gdn, x, gidx, ph);
             }
+            if (instrument) { (void)cudaEventRecord(inst_ev[++inst_idx], ctx_.stream); }
             {
                 nvtx::ScopedRange post_mixer_range(
                     prefill ? nvtx::Name::PrefillPostMixer : nvtx::Name::VerifyPostMixer,
@@ -1081,7 +1106,25 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                 mlp_tail(gdn.post_attn_norm, gdn.mlp, x, ph);
                 if constexpr (Tap::enabled) { tap.capture_layer(layer, x, ctx_.stream); }
             }
+            if (instrument) { (void)cudaEventRecord(inst_ev[++inst_idx], ctx_.stream); }
         }
+    }
+    if (instrument) {
+        (void)cudaEventSynchronize(inst_ev.back());
+        double full_ms = 0.0, gdn_ms = 0.0, mlp_ms = 0.0;
+        double worst = 0.0; int worst_layer = -1;
+        for (int layer = 0; layer < kCfg.n_layers; ++layer) {
+            float a = 0.0f, m = 0.0f;
+            (void)cudaEventElapsedTime(&a, inst_ev[2 * layer], inst_ev[2 * layer + 1]);
+            (void)cudaEventElapsedTime(&m, inst_ev[2 * layer + 1], inst_ev[2 * layer + 2]);
+            if (ModelConfig::is_full(layer)) { full_ms += a; } else { gdn_ms += a; }
+            mlp_ms += m;
+            if (a > worst) { worst = a; worst_layer = layer; }
+        }
+        std::cerr << "[layer-perf] full_attn=" << full_ms << "ms gdn=" << gdn_ms
+                  << "ms mlp=" << mlp_ms << "ms worst_layer=" << worst_layer
+                  << " worst_attn=" << worst << "ms" << std::endl;
+        for (auto& e : inst_ev) { (void)cudaEventDestroy(e); }
     }
 }
 
@@ -1095,10 +1138,20 @@ PrefillChunkResult
 TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_prefill,
                           const MultimodalPrefill* multimodal, Tap& tap, bool finalize_at_end) {
     if (ids.empty()) { throw std::invalid_argument("TextContext::prefill requires tokens"); }
+    // [perf-instrumentation] host wall vs GPU stream time for this chunk
+    const auto inst_host_t0 = std::chrono::steady_clock::now();
+    cudaEvent_t inst_ev0    = nullptr;
+    cudaEvent_t inst_ev1    = nullptr;
+    const bool instrument = profile_prefill_enabled();
+    if (instrument) {
+        (void)cudaEventCreate(&inst_ev0);
+        (void)cudaEventCreate(&inst_ev1);
+    }
     if (ids.size() > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::overflow_error("TextContext::prefill token count exceeds int32");
     }
     cudaStream_t s           = ctx_.stream;
+    if (instrument) { (void)cudaEventRecord(inst_ev0, s); }
     const int T              = static_cast<int>(ids.size());
     const int chunk          = static_cast<int>(prefill_chunk_);
     const std::uint32_t base = text_kv_base_;
@@ -1363,6 +1416,20 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
     prefill_rewrite_checkpoint_frontier_ = -1;
 
     ctx_.synchronize();
+    if (instrument) {
+        (void)cudaEventRecord(inst_ev1, s);
+        (void)cudaEventSynchronize(inst_ev1);
+        float inst_gpu_ms = 0.0f;
+        (void)cudaEventElapsedTime(&inst_gpu_ms, inst_ev0, inst_ev1);
+        const double inst_host_ms = std::chrono::duration<double, std::milli>(
+                                        std::chrono::steady_clock::now() - inst_host_t0)
+                                        .count();
+        std::fprintf(stderr, "[chunk-perf] tokens=%d host=%.1fms gpu_stream=%.1fms gap=%.1fms\n",
+                     t0, inst_host_ms, static_cast<double>(inst_gpu_ms),
+                     inst_host_ms - static_cast<double>(inst_gpu_ms));
+        (void)cudaEventDestroy(inst_ev0);
+        (void)cudaEventDestroy(inst_ev1);
+    }
     work_.reset();
     return PrefillChunkResult{.processed_tokens = static_cast<std::uint32_t>(t0),
                               .finalized        = finalize_at_end && t0 == T};

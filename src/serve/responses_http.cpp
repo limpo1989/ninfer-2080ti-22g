@@ -8,8 +8,13 @@
 #include <algorithm>
 #include <atomic>
 #include <charconv>
+#include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
+#include <mutex>
+#include <thread>
 #include <exception>
 #include <iterator>
 #include <memory>
@@ -123,8 +128,9 @@ ResponseContext terminal_context(const ResponseContext& previous, const Response
 ResponsesRuntimeValues runtime_values(const PreparedRequest& prepared,
                                       const GenerationOutcome* outcome = nullptr) {
     ResponsesRuntimeValues runtime;
-    runtime.temperature = prepared.sampling.temperature;
-    runtime.top_p       = prepared.sampling.top_p;
+    runtime.temperature     = prepared.sampling.temperature;
+    runtime.top_p           = prepared.sampling.top_p;
+    runtime.enable_thinking = prepared.enable_thinking;
     if (outcome != nullptr) {
         runtime.cached_input_tokens = static_cast<int>(outcome->metrics.prefix_cache_hit_tokens);
     }
@@ -301,19 +307,116 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
             stream->started = true;
             try {
                 write_stream_items(sink, *stream, stream->encoder->start());
+                // The provider owns both the encoder and socket. Queue raw deltas so
+                // heartbeat sequence numbers cannot overtake already encoded output.
+                std::mutex q_mutex;
+                std::condition_variable q_cv;
+                std::deque<std::pair<bool, std::string>> event_queue;
+                bool producer_done = false;
+                std::atomic<bool> sink_failed{false};
                 StreamSink output;
+                auto push_delta = [&](bool reasoning, const std::string& text) {
+                    {
+                        std::lock_guard lock(q_mutex);
+                        if (producer_done || text.empty()) { return; }
+                        event_queue.emplace_back(reasoning, text);
+                    }
+                    q_cv.notify_one();
+                };
                 output.on_reasoning = [&](const std::string& text) {
-                    write_stream_items(sink, *stream, stream->encoder->reasoning_delta(text));
+                    push_delta(true, text);
                 };
                 output.on_content = [&](const std::string& text) {
-                    write_stream_items(sink, *stream, stream->encoder->content_delta(text));
+                    push_delta(false, text);
                 };
                 output.is_cancelled = [&] {
                     return stream->cancelled.load(std::memory_order_acquire) ||
-                           (sink.is_writable && !sink.is_writable());
+                           sink_failed.load(std::memory_order_acquire);
                 };
 
-                const GenerationOutcome outcome = service_->run(stream->prepared, &output);
+                GenerationOutcome outcome;
+                std::exception_ptr worker_error = nullptr;
+                std::jthread worker([&] {
+                    try {
+                        outcome = service_->run(stream->prepared, &output);
+                    } catch (...) {
+                        worker_error = std::current_exception();
+                    }
+                    {
+                        std::lock_guard lock(q_mutex);
+                        producer_done = true;
+                    }
+                    q_cv.notify_all();
+                });
+                // Drain the queue; when idle for 5s emit an SSE comment so long
+                // prefills keep the connection alive at intermediaries.
+                auto last_activity = std::chrono::steady_clock::now();
+                try {
+                    for (;;) {
+                        if (sink.is_writable && !sink.is_writable()) {
+                            sink_failed.store(true, std::memory_order_release);
+                            break;
+                        }
+                        std::optional<std::pair<bool, std::string>> delta;
+                        {
+                            std::unique_lock lock(q_mutex);
+                            q_cv.wait_for(lock, std::chrono::milliseconds(200),
+                                          [&] { return !event_queue.empty() || producer_done; });
+                            if (!event_queue.empty()) {
+                                delta = std::move(event_queue.front());
+                                event_queue.pop_front();
+                            }
+                        }
+                        if (delta) {
+                            const auto batch = delta->first
+                                ? stream->encoder->reasoning_delta(delta->second)
+                                : stream->encoder->content_delta(delta->second);
+                            for (const std::string& item : batch) {
+                                if (!sink.write(item.data(), item.size())) {
+                                    sink_failed.store(true, std::memory_order_release);
+                                    break;
+                                }
+                            }
+                            last_activity = std::chrono::steady_clock::now();
+                            if (sink_failed.load(std::memory_order_acquire)) { break; }
+                            continue;
+                        }
+                        bool drained = false;
+                        {
+                            std::lock_guard lock(q_mutex);
+                            drained = producer_done && event_queue.empty();
+                        }
+                        if (drained) { break; }
+                        const auto now = std::chrono::steady_clock::now();
+                        if (now - last_activity >= std::chrono::seconds(5)) {
+                            // SSE comments are stripped by client parsers before the app layer,
+                            // so thinking streams also emit an empty semantic delta that pi-ai
+                            // observes without changing the accumulated reasoning text.
+                            bool wrote = sink.write(": ping\n\n", 8);
+                            if (wrote) {
+                                const auto items = stream->encoder->keepalive();
+                                for (const std::string& item : items) {
+                                    if (!sink.write(item.data(), item.size())) {
+                                        wrote = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            if (!wrote) {
+                                sink_failed.store(true, std::memory_order_release);
+                                break;
+                            }
+                            last_activity = now;
+                        }
+                    }
+                } catch (...) {
+                    stream->cancelled.store(true, std::memory_order_release);
+                    worker.join();
+                    throw;
+                }
+                worker.join();
+                if (worker_error) { std::rethrow_exception(worker_error); }
+                if (sink_failed.load(std::memory_order_acquire)) { throw ClientDisconnected(); }
                 ResponsesStreamFinish finished  = stream->encoder->finish(outcome);
                 if (stream->request.store) {
                     StoredResponse stored;

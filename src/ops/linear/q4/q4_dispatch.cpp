@@ -1,5 +1,7 @@
 #include "ops/linear/q4/q4_dispatch.h"
 
+#include <cstdlib>
+
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
@@ -103,7 +105,22 @@ Q4Launch select_q4_launch(std::int32_t n, std::int32_t k, std::int32_t t, Linear
 
 void q4_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
                  cudaStream_t stream) {
-    const Q4Launch launch = select_q4_launch(w.n, w.k, x.ne[1], policy);
+    Q4Launch launch = select_q4_launch(w.n, w.k, x.ne[1], policy);
+    // [experiment] NINFER_Q4_FORCE 强制大 T 路由
+    static int forced = -2;
+    if (forced == -2) {
+        const char* env = std::getenv("NINFER_Q4_FORCE");
+        forced          = env != nullptr ? std::atoi(env) : -1;
+    }
+    if (forced >= 0 && x.ne[1] > 16) {
+        switch (forced) {
+        case 0: launch = launch_q4_mma_r64_c128; break;
+        case 1: launch = launch_q4_mma_r64_c128_w8; break;
+        case 2: launch = launch_q4_mma_r64_c128_pp; break;
+        case 3: launch = launch_q4_mma_r64_c128_w8pp; break;
+        default: break;
+        }
+    }
     launch(x, w, out, stream);
 }
 
