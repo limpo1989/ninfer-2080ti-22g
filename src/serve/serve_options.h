@@ -41,6 +41,9 @@ struct ServeOptions {
     std::size_t response_store_max_records = kDefaultResponseStoreRecords;
     std::size_t response_store_max_bytes   = kDefaultResponseStoreBytes;
     std::size_t tool_replay_cache_bytes    = kDefaultToolReplayCacheBytes;
+    std::filesystem::path state_cache_dir;
+    std::size_t state_cache_max_bytes = 0;
+    std::size_t state_cache_ram_bytes = 4ULL << 30;
     int device                             = 0;
     KvCacheStorage kv_cache                = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;

@@ -4,6 +4,74 @@
 
 This repository is a specialized port of [NInfer](https://github.com/Neroued/ninfer) (originally developed by [@Neroued](https://github.com/Neroued)) optimized for NVIDIA Turing architecture (`sm_75`, tuned specifically for the **RTX 2080 Ti 22GB** modded card), while retaining compatibility with Ampere (`sm_86`) and Blackwell (`sm_120a`). It executes text and multimodal (image/video) prompts through a fast local CLI or OpenAI/Anthropic-compatible HTTP servers.
 
+**Resume cached conversations after a restart: 42.29s → 1.91s to the first token** in a controlled
+Qwen3.8-27B continuation test. The [persistent state cache](#persistent-state-cache) retains model
+state in RAM and on disk, preserving expensive prefill work when a conversation leaves VRAM.
+
+---
+
+## Persistent State Cache
+
+Long agent histories can take tens of seconds to process again after eviction or a server restart.
+NInfer saves completed conversation state in **VRAM → RAM → DISK** tiers. When the same token
+prefix returns, it restores the saved state and computes the new suffix. Completed disk snapshots
+survive process restarts with compatible model files, executable, and configuration.
+
+### Measured continuation latency
+
+An **8,201-token** continuation built from a recorded DeepSeek Harness request produced:
+
+| State available | Time to first token | Tokens requiring prefill | Reused input |
+|---|---:|---:|---:|
+| No reusable state; full recomputation | 42.289s | 8,201 | 0% |
+| **Disk snapshot after process restart** | **1.907s** | **28** | **99.66%** |
+| **RAM snapshot after the GPU slot was overwritten** | **0.892s** | **28** | **99.66%** |
+| GPU-resident reference | 0.811s | 28 | 99.66% |
+
+**Disk recovery cut first-token waiting by 95.5% (22.2×), saving 40.38 seconds per tested
+continuation.** RAM recovery reduced the same wait by 47.4×. Both restored 8,173 input tokens.
+The approximately 426 MiB restored state was verified byte for byte, and all 64 generated tokens
+matched the GPU-resident reference. State retains its existing numeric formats without additional
+quantization or recompression.
+
+Measured on RTX 2080 Ti 22GB, dual E5-2690 v3, NVMe storage, CUDA 12.8, and driver 595.99.02;
+Qwen3.8-27B groupwise-int, KVarN, MTP3, 32,768-token context capacity, concurrency 1,
+prefill chunk 1,024, temperature 0.6, presence penalty 1.0, seed 1234, and a 64-token output limit.
+Each row is one controlled run through Responses translation and the public Engine. Timing begins
+after model initialization and includes request preparation and restoration; model loading and
+startup warmup still take place after restart. Before the disk performance run, the test requested
+file-specific OS page-cache eviction with `POSIX_FADV_DONTNEED`; this is an advisory operation.
+
+### Enable and inspect
+
+The deployment launcher enables **4 GiB RAM + 8 GiB disk** by default, allocating memory on demand:
+
+```bash
+# Configure larger budgets; values are in MiB. Choose a disk with sufficient free space.
+./deploy/restart-ninfer.sh restart \
+  --state-cache-dir /path/to/ssd/ninfer-state \
+  --state-cache-ram-mib 8192 --state-cache-max-mib 32768
+
+# Inspect RAM/disk restore source, GPU upload time, and snapshot capture time.
+./deploy/restart-ninfer.sh watch --details
+```
+
+The same cache flags are available on `ninfer-serve`; direct launches require an explicit directory
+and positive disk budget. Set `--state-cache-max-mib 0` to disable state caching. For an existing
+service, pass the same overrides when opening watch so its configuration header reflects them.
+
+Disk reads, checksums, and durable writes run on a dedicated I/O worker. Capturing the tested state
+to RAM took 0.46–0.51s after generation, and GPU upload took about 0.08–0.09s; these transfers briefly
+occupy the inference worker. The measured benefit is reduced prefill waiting. Concurrent tail
+latency has not yet been measured.
+
+This first version supports **text with ordinary decode or MTP**. Clients resend conversation
+history after restart; public `previous_response_id` records and tool-format replay metadata remain
+process-local. Rebuilding the executable or replacing model files creates a new cache namespace.
+Budgets apply to the current namespace, while old namespaces remain available for manual cleanup.
+See the [serving options](docs/serving.md#server-options) and the deployment details below for the
+complete storage behavior and benchmark modes.
+
 ---
 
 ## Supported Models & Artifacts
@@ -229,6 +297,7 @@ python3 tools/bench/run_responses_cache.py --base-url http://127.0.0.1:8321/v1 -
 - **Build Tools**: CMake >= 3.28, Ninja, C++20 compiler (GCC >= 11 or Clang >= 14), `pkg-config`.
 - **System Libraries**:
   - FFmpeg development libraries (`libavformat >= 60`, `libavcodec >= 60`, `libavutil >= 58`, `libswscale >= 7`)
+  - zlib development headers/library (`zlib1g-dev` on Debian/Ubuntu), used for state-cache checksums
   - `libcurl >= 7.85`
 
 ---
@@ -375,7 +444,41 @@ The launcher also accepts `--tool-replay-cache-mib N`, for example
 `./deploy/restart-ninfer.sh restart --tool-replay-cache-mib 2048`, or the
 `NINFER_TOOL_REPLAY_CACHE_MIB` environment variable (default `1024`). The command-line value takes
 precedence, and the selected budget appears in the watch header. The Responses object/context store
-has its own separate limits.
+has its own separate limits. The launcher enables text retained-state caching with 4 GiB RAM
+and 8 GiB disk under `$BUNDLE_ROOT/state-cache`. Override with `NINFER_STATE_CACHE_DIR`,
+`NINFER_STATE_CACHE_RAM_MIB`, and `NINFER_STATE_CACHE_MAX_MIB`, or the corresponding
+`--state-cache-dir`, `--state-cache-ram-mib`, and `--state-cache-max-mib` flags. A zero disk budget
+disables this feature. Direct `ninfer-serve` launches leave it disabled unless a directory and
+positive disk budget are supplied.
+
+Completed text requests with at least 256 retained tokens can capture immutable continuation
+images (Main/MTP KV, KVarN stages, current/checkpoint GDN state, hidden state and prefix identity).
+Capture and upload synchronize on the compute stream and briefly occupy the GPU worker. Payload
+reads, checksums, writes, fsync and atomic publication run on a separate I/O worker. RAM includes
+pending writes; pressure evicts clean images or skips new captures instead of blocking for disk.
+Images are persisted in the background after completion, even if their GPU state remains resident,
+so a later restart can reuse them. An interrupted write is never a valid cache hit. Saved state
+uses existing numeric formats without recompression. The first version supports text ordinary/MTP
+execution; Vision and DFlash configurations reject enabling state caching.
+
+Cache directories are separated by artifact and executable file identity, storage configuration
+and template. Rebuilding the executable or replacing weights invalidates old namespaces; budgets
+apply to the current namespace. Old incompatible namespaces are retained for manual removal.
+Startup reads descriptors only. Requests search exact token-prefix aliases, retain the existing
+GPU match when it is at least as long, and otherwise request an asynchronous RAM/disk restore.
+Recoverable cache corruption falls back to normal prefill. New physical pages and mappings are
+allocated on restore, leaving CUDA Graph addresses stable. The disk cache does not persist public
+Responses IDs: after restart clients must resend their history. Tool-format replay metadata is
+also process-local, so normalized tool history may still reduce the reusable suffix.
+
+`watch --details` shows `State`, GPU upload time (`Restore`), and capture time (`Snapshot`).
+Disk-read waiting is included in Queue; upload occurs after admission and is included in TTFB;
+capture is included in Wall. These are not decode-throughput improvements. The opt-in
+`ninfer_state_cache_bench MODEL REQUEST_JSON CACHE_DIR FIXTURE_JSON MODE` exercises the actual
+Responses translation and public Engine with `seed`, `resident`, `ram`, `disk`, and `cold` modes.
+`disk` checks the generated tokens against the `resident` reference. Set
+`NINFER_VERIFY_STATE_RESTORE=1` for byte-for-byte upload verification during correctness testing;
+leave it unset for performance measurement.
 `NINFER_SEED` optionally fixes the server's sampling seed for repeatable measurements; leaving it
 unset retains fresh request seeds. The script identifies processes by their executable path so
 wrapper command lines are not mistaken for the inference service.

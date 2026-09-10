@@ -30,10 +30,12 @@ add_library(ninfer_core STATIC
   runtime/engine/admission_policy.cpp
   runtime/engine/kv_capacity.cpp
   runtime/engine/public_types.cpp
-  runtime/engine/request_memory.cpp)
+  runtime/engine/request_memory.cpp
+  runtime/engine/state_snapshot_cache.cpp)
 ninfer_internal_includes(ninfer_core)
 ninfer_cuda_archive(ninfer_core)
-target_link_libraries(ninfer_core PUBLIC CUDA::cudart CUDA::nvtx3 Threads::Threads)
+find_package(ZLIB REQUIRED)
+target_link_libraries(ninfer_core PUBLIC CUDA::cudart CUDA::nvtx3 Threads::Threads PRIVATE ZLIB::ZLIB)
 
 # Generic .ninfer framing, binding, and direct final materialization.
 add_library(ninfer_artifact STATIC

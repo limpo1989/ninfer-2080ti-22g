@@ -1,4 +1,5 @@
 #include <ninfer/targets/qwen3_6/decoder_state.h>
+#include "core/device.h"
 
 #include <limits>
 #include <stdexcept>
@@ -109,10 +110,51 @@ std::size_t PagedKVCacheLayout::payload_bytes() const noexcept {
 
 PagedKVCache::PagedKVCache(DeviceSpan backing, const PagedKVCacheLayout& layout)
     : pool_(backing, layout.pool), layers_(layout.layers), max_context_(layout.max_context),
-      kv_heads_(layout.kv_heads), head_dim_(layout.head_dim), dtype_(layout.dtype),
-      quant_group_(layout.quant_group), kvarn_(layout.kvarn) {
+    kv_heads_(layout.kv_heads), head_dim_(layout.head_dim), dtype_(layout.dtype),
+    quant_group_(layout.quant_group), kvarn_(layout.kvarn), plane_order_(layout.pool.spec.plane_order) {
     stage_.reserve(layout.stage.size());
     for (const TensorRegion& region : layout.stage) { stage_.push_back(region.bind(backing)); }
+}
+
+std::size_t PagedKVCache::snapshot_bytes(const PagedKVAllocation& allocation) const {
+    if (!allocation.belongs_to(pool_)) throw std::invalid_argument("snapshot allocation belongs to another pool");
+    std::size_t total = 0;
+    for (std::size_t i = 0; i < pool_.plane_count(); ++i)
+        total += pool_.plane(i).bytes() / pool_.page_group_count() * allocation.mapped_page_count();
+    return total;
+}
+
+void PagedKVCache::transfer_snapshot(const PagedKVAllocation& allocation, std::uint8_t* host,
+                                     std::size_t bytes, bool restore, cudaStream_t stream) const {
+    if (bytes != snapshot_bytes(allocation)) throw std::invalid_argument("invalid KV snapshot extent");
+    std::size_t offset = 0;
+    const auto pages = allocation.page_ids();
+    for (std::size_t i = 0; i < pool_.plane_count(); ++i) {
+        const Tensor& plane = pool_.plane(i);
+        const auto heads = plane_order_ == PagedKVPlaneOrder::HeadMajor ? plane.ne[3] : 1;
+        for (int head = 0; head < heads; ++head) {
+            const Tensor slab = plane_order_ == PagedKVPlaneOrder::HeadMajor ? plane.slice(3, head, 1) : plane;
+            const int page_axis = plane_order_ == PagedKVPlaneOrder::HeadMajor ? 2 : 3;
+            for (std::size_t p = 0; p < pages.size();) {
+                std::size_t end = p + 1;
+                while (end < pages.size() && pages[end] == pages[end - 1] + 1) ++end;
+                const Tensor run = slab.slice(page_axis, pages[p], static_cast<std::int32_t>(end - p));
+                if (!run.is_contiguous()) throw std::logic_error("noncontiguous snapshot page run");
+                CUDA_CHECK(cudaMemcpyAsync(restore ? run.data : host + offset,
+                                           restore ? host + offset : run.data, run.bytes(),
+                                           restore ? cudaMemcpyHostToDevice : cudaMemcpyDeviceToHost, stream));
+                offset += run.bytes(); p = end;
+            }
+        }
+    }
+}
+void PagedKVCache::snapshot_to_host(const PagedKVAllocation& allocation,
+                                    std::span<std::uint8_t> destination, cudaStream_t stream) const {
+    transfer_snapshot(allocation, destination.data(), destination.size(), false, stream);
+}
+void PagedKVCache::restore_from_host(PagedKVAllocation& allocation,
+                                    std::span<const std::uint8_t> source, cudaStream_t stream) const {
+    transfer_snapshot(allocation, const_cast<std::uint8_t*>(source.data()), source.size(), true, stream);
 }
 
 ops::KvarnBatchLayerView PagedKVCache::kvarn_batch_layer_view(std::uint32_t layer) const {

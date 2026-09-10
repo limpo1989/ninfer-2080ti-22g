@@ -6,8 +6,10 @@
 #include "runtime/contract/types.h"
 #include "runtime/engine/admission_policy.h"
 #include "runtime/engine/request_memory.h"
+#include "runtime/engine/state_snapshot_cache.h"
 #include "runtime/generation/generation_budget.h"
 #include "targets/qwen3_6/export/ninfer/targets/qwen3_6/frontend.h"
+#include "targets/qwen3_6/export/ninfer/targets/qwen3_6/prepared_prompt.h"
 
 #include <algorithm>
 #include <array>
@@ -55,6 +57,7 @@ public:
             admission_capacity_.main_kv_pages == 0) {
             throw std::logic_error("target admission capacity does not match the Engine");
         }
+        instance_.program->configure_state_cache(options);
         worker_ = std::thread([this] { worker_loop(); });
     }
 
@@ -149,6 +152,9 @@ public:
             request = std::make_shared<Request>(request_id, std::move(prompt), std::move(output),
                                                 prompt_summary, prepare_seconds, std::move(options),
                                                 pending_deadline, submitted);
+            if (request->options.execution.allow_prefix_reuse) {
+                request->snapshot = instance_.program->lookup_state(request->prompt);
+            }
         } catch (...) {
             release_reserved_capacity();
             throw;
@@ -287,6 +293,9 @@ private:
         Clock::time_point submitted;
         std::optional<Clock::time_point> admitted;
         std::optional<Clock::time_point> first_token;
+        StateSnapshotLoad snapshot;
+        double state_restore_seconds = 0;
+        std::uint8_t state_cache_source = 0;
         std::optional<GenerationBudget> budget;
         std::optional<BeginSummary> begin;
         std::vector<TokenId> generated;
@@ -420,6 +429,8 @@ private:
     }
 
     void complete_success(const std::shared_ptr<Request>& request, FinishReason reason) {
+        if (request->lane && reason != FinishReason::Cancelled && request->options.execution.allow_prefix_reuse)
+            instance_.program->save_state(*request->lane);
         release_planning_state(request);
         request->prompt = {};
         GenerationResult result;
@@ -440,6 +451,8 @@ private:
             result.speculative = instance_.program->speculative_stats_lane(*request->lane);
         }
         const auto completed = Clock::now();
+        result.timings.state_restore_seconds = request->state_restore_seconds;
+        result.timings.state_cache_source = request->state_cache_source;
         result.timings.queue_seconds =
             std::chrono::duration<double>(request->admitted.value_or(completed) -
                                            request->submitted).count();
@@ -766,6 +779,9 @@ private:
         if (!request->lane_plans[lane]) {
             throw std::logic_error("selected admission lane has no request plan");
         }
+        const auto resident_reuse = request->lane_plans[lane]->summary().reusable_prompt_tokens;
+        const bool use_snapshot = request->snapshot.result.valid() && resident_reuse < request->snapshot.frontier;
+        if (use_snapshot && !request->snapshot.ready()) return AdmissionProgress::None;
         if (choice.evict_retained) {
             for (std::uint32_t retained_lane = 0;
                  retained_lane < max_concurrency_ &&
@@ -782,10 +798,28 @@ private:
             }
         }
 
+        // Disk payload is ready before admission; only the GPU upload happens here.
+        request->admitted = Clock::now();
+        if (use_snapshot) {
+            const auto started = Clock::now();
+            const auto image = request->snapshot.result.get();
+            if (image && instance_.program->restore_state(lane, request->prompt, *image)) {
+                request->state_restore_seconds = std::chrono::duration<double>(Clock::now() - started).count();
+                request->state_cache_source = request->snapshot.source == "ram" ? 1 : 2;
+            }
+            invalidate_lane_plans(lane);
+            ensure_lane_plan(request, lane);
+            if (!instance_.program->can_admit_lane(lane, *request->lane_plans[lane])) {
+                instance_.program->evict_retained_lane(lane);
+                invalidate_lane_plans(lane);
+                ensure_lane_plan(request, lane);
+                request->state_cache_source = 0;
+            }
+        }
+        request->snapshot = {};
         Plan selected_plan = std::move(*request->lane_plans[lane]);
         request->lane_plans[lane].reset();
         if (!erase_pending(request)) { return AdmissionProgress::None; }
-        request->admitted = Clock::now();
         release_planning_state(request);
 
         const RequestPlanSummary summary = selected_plan.summary();
@@ -1149,6 +1183,10 @@ private:
                     previous_unit_was_decode = true;
                     continue;
                 }
+                // An asynchronous cache read may be the only outstanding work. Yield without
+                // adding any polling sleep to active GPU rounds; cancellation/deadlines still run.
+                std::unique_lock queue_lock(queue_mutex_);
+                queue_cv_.wait_for(queue_lock, std::chrono::milliseconds(2));
             } catch (...) {
                 fail_all(std::current_exception());
                 return;

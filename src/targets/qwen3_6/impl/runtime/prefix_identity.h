@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <vector>
+#include <span>
 
 namespace ninfer::targets::qwen3_6::detail {
 
@@ -22,6 +23,8 @@ public:
     [[nodiscard]] std::size_t size() const noexcept { return token_types_.size(); }
 
     [[nodiscard]] bool matches(const PreparedPromptData& prompt, std::size_t count) const;
+    [[nodiscard]] std::vector<std::uint8_t> serialize() const;
+    void deserialize(std::span<const std::uint8_t> bytes);
 
 private:
     std::vector<std::uint8_t> token_types_;

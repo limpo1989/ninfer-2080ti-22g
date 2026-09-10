@@ -23,6 +23,9 @@ DEFAULT_MAX_TOKENS=${NINFER_DEFAULT_MAX_TOKENS:-131072}
 PREFILL_CHUNK=${NINFER_PREFILL_CHUNK:-1024}
 DRAFT_TOKENS=${NINFER_DRAFT_TOKENS:-3}
 TOOL_REPLAY_CACHE_MIB=${NINFER_TOOL_REPLAY_CACHE_MIB:-1024}
+STATE_CACHE_DIR=${NINFER_STATE_CACHE_DIR:-$BUNDLE_ROOT/state-cache}
+STATE_CACHE_MAX_MIB=${NINFER_STATE_CACHE_MAX_MIB:-8192}
+STATE_CACHE_RAM_MIB=${NINFER_STATE_CACHE_RAM_MIB:-4096}
 # Optional power override, disabled by default. Example: NINFER_GPU_POWER_LIMIT_W=280
 # An empty value leaves the driver's current limit unchanged (250 W by default on this host).
 GPU_POWER_LIMIT_W=${NINFER_GPU_POWER_LIMIT_W:-}
@@ -109,6 +112,8 @@ start_server() {
         --pending-timeout-ms 600000 \
         --default-max-tokens "$DEFAULT_MAX_TOKENS" \
         --tool-replay-cache-mib "$TOOL_REPLAY_CACHE_MIB" \
+        --state-cache-dir "$STATE_CACHE_DIR" --state-cache-max-mib "$STATE_CACHE_MAX_MIB" \
+        --state-cache-ram-mib "$STATE_CACHE_RAM_MIB" \
         --temperature 0.6 --presence-penalty 1.0 \
         "${sampling_args[@]}" \
         >"$LOG" 2>&1 </dev/null &
@@ -156,6 +161,8 @@ watch_metrics() {
         --max-output "$DEFAULT_MAX_TOKENS" --draft-tokens "$DRAFT_TOKENS" \
         --prefill-chunk "$PREFILL_CHUNK" \
         --tool-replay-cache-mib "$TOOL_REPLAY_CACHE_MIB" \
+        --state-cache-dir "$STATE_CACHE_DIR" --state-cache-max-mib "$STATE_CACHE_MAX_MIB" \
+        --state-cache-ram-mib "$STATE_CACHE_RAM_MIB" \
         "${watch_args[@]}" "$@"
 }
 
@@ -184,11 +191,34 @@ while [[ $# -gt 0 ]]; do
             TOOL_REPLAY_CACHE_MIB=$2
             shift 2
             ;;
+        --state-cache-dir)
+            [[ $# -ge 2 ]] || { echo "--state-cache-dir needs a value" >&2; exit 2; }
+            STATE_CACHE_DIR=$2
+            shift 2
+            ;;
+        --state-cache-max-mib)
+            [[ $# -ge 2 ]] || { echo "--state-cache-max-mib needs a value" >&2; exit 2; }
+            STATE_CACHE_MAX_MIB=$2
+            shift 2
+            ;;
+        --state-cache-ram-mib)
+            [[ $# -ge 2 ]] || { echo "--state-cache-ram-mib needs a value" >&2; exit 2; }
+            STATE_CACHE_RAM_MIB=$2
+            shift 2
+            ;;
         *) WATCH_ARGS+=("$1"); shift ;;
     esac
 done
 [[ "$TOOL_REPLAY_CACHE_MIB" =~ ^[0-9]+$ ]] || {
     echo "--tool-replay-cache-mib must be a nonnegative integer in MiB" >&2
+    exit 2
+}
+[[ "$STATE_CACHE_MAX_MIB" =~ ^[0-9]+$ ]] || {
+    echo "--state-cache-max-mib must be a nonnegative integer in MiB" >&2
+    exit 2
+}
+[[ "$STATE_CACHE_RAM_MIB" =~ ^[0-9]+$ && "$STATE_CACHE_RAM_MIB" -gt 0 ]] || {
+    echo "--state-cache-ram-mib must be positive in MiB" >&2
     exit 2
 }
 
@@ -220,7 +250,7 @@ case $NINFER_ACTION in
         tail -n 100 -F "$LOG"
         ;;
     *)
-        echo "Usage: $0 [restart|restart-daemon|start|stop|status|watch|logs] [--tool-replay-cache-mib N] [--details] [--once] [--color auto|always|never]" >&2
+        echo "Usage: $0 [restart|restart-daemon|start|stop|status|watch|logs] [--state-cache-dir DIR] [--state-cache-max-mib N] [--tool-replay-cache-mib N] [--details] [--once] [--color auto|always|never]" >&2
         exit 2
         ;;
 esac

@@ -100,6 +100,10 @@ struct EngineOptions {
     bool use_cuda_graph                    = true;
     LoadProgress load_progress;
     ChatStyle chat_style                   = ChatStyle::Default;
+    // Optional retained-state persistence. Empty/zero disables disk snapshots.
+    std::filesystem::path state_cache_dir;
+    std::size_t state_cache_max_bytes = 0;
+    std::size_t state_cache_ram_bytes = 4ULL << 30;
     // Optional Jinja chat template replacing the one inside the artifact.
     // Empty means use the artifact's own frontend/chat_template.jinja.
     std::string chat_template_override;
@@ -383,6 +387,10 @@ struct PreparationControl {
 };
 
 struct GenerationTimings {
+    // External retained-state restore, separately reported within total/TTFT.
+    double state_restore_seconds = 0.0;
+    double state_save_seconds = 0.0;
+    std::uint8_t state_cache_source = 0; // 0: none/resident, 1: RAM, 2: disk
     double prepare_seconds     = 0.0;
     // Submission to scheduler admission, or completion if cancelled while still pending.
     double queue_seconds       = 0.0;

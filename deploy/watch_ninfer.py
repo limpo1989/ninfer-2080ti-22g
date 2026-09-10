@@ -169,7 +169,9 @@ def parse_request(line: str) -> Row | None:
         FINISH_NAMES.get(finish, finish),
     ]
     detail = (f"#{request_id} Think={fields.get('think', '-')} tokens | "
-              f"Reuse={fields.get('reuse', '-')} | Tool calls={fields.get('tool_calls', '0')}")
+              f"Reuse={fields.get('reuse', '-')} | Tool calls={fields.get('tool_calls', '0')} | "
+              f"State={fields.get('state_source', '-')} Restore={fields.get('restore', '-')} "
+              f"Snapshot={fields.get('snapshot', '-')}")
     return Row(request_id, values, detail)
 
 
@@ -352,6 +354,8 @@ def launch_lines(args: argparse.Namespace) -> list[str]:
                      f"Prefill chunk {args.prefill_chunk}")
     if args.tool_replay_cache_mib is not None:
         lines.append(f"Replay cache {args.tool_replay_cache_mib:,} MiB")
+    if getattr(args, "state_cache_max_mib", 0):
+        lines.append(f"State cache RAM {args.state_cache_ram_mib:,} MiB / disk {args.state_cache_max_mib:,} MiB")
     return lines
 
 
@@ -412,6 +416,9 @@ def main() -> int:
     parser.add_argument("--draft-tokens", type=int)
     parser.add_argument("--prefill-chunk", type=int)
     parser.add_argument("--tool-replay-cache-mib", type=int)
+    parser.add_argument("--state-cache-dir")
+    parser.add_argument("--state-cache-max-mib", type=int, default=0)
+    parser.add_argument("--state-cache-ram-mib", type=int, default=4096)
     parser.add_argument("--details", action="store_true", help="show thinking tokens and reuse details")
     parser.add_argument("--once", action="store_true", help="print a snapshot and exit")
     parser.add_argument("--color", choices=("auto", "always", "never"), default="auto",

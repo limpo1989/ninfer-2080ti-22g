@@ -13,6 +13,7 @@ RUN apt-get update \
         libswscale-dev \
         ninja-build \
         pkg-config \
+        zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
@@ -36,6 +37,7 @@ RUN apt-get update \
         libavutil58 \
         libcurl4t64 \
         libswscale7 \
+        zlib1g \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /build/apps/ninfer /usr/local/bin/ninfer

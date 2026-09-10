@@ -282,6 +282,23 @@ void test_prefix_identity() {
            "truncated multimodal continuation identity");
 }
 
+void test_persisted_text_identity() {
+    q36::PreparedPromptData prompt;
+    prompt.token_ids = {10, 20, 30}; prompt.token_types = {0, 0, 0};
+    prompt.positions = {0,1,2, 0,1,2, 0,1,2};
+    q36::detail::ResidentPrefixIdentity original, restored;
+    original.assign(prompt);
+    auto bytes = original.serialize();
+    restored.deserialize(bytes);
+    expect(q36::detail::prefix_matches(prompt, prompt.token_ids, restored, 3), "persisted text identity round trip");
+    auto changed = prompt; changed.positions[1] = 9;
+    expect(!q36::detail::prefix_matches(changed, prompt.token_ids, restored, 3), "restored identity rejects changed positions");
+    bytes.pop_back();
+    bool rejected = false;
+    try { restored.deserialize(bytes); } catch (const std::invalid_argument&) { rejected = true; }
+    expect(rejected, "truncated text identity rejected");
+}
+
 } // namespace
 
 int main() {
@@ -291,6 +308,7 @@ int main() {
     test_mtp_alignment();
     test_vision_control();
     test_prefix_identity();
+    test_persisted_text_identity();
     if (failures != 0) {
         std::cerr << failures << " Qwen3.6 runtime mechanism checks failed\n";
         return 1;

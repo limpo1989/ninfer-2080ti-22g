@@ -6,6 +6,7 @@
 #include "core/gdn_replay_records.h"
 #include "ninfer/ops/sampling.h"
 #include "core/decode_graph.h"
+#include "runtime/engine/state_snapshot_cache.h"
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
 
 #include "targets/qwen3_6/impl/runtime/layouts.h"
@@ -232,6 +233,11 @@ public:
     void abort_lane(std::uint32_t lane) noexcept;
     [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
     void evict_retained_lane(std::uint32_t lane) noexcept;
+    void configure_state_cache(const EngineOptions& options);
+    [[nodiscard]] runtime::StateSnapshotLoad lookup_state(const PreparedPromptData& prompt);
+    [[nodiscard]] bool restore_state(std::uint32_t lane, const PreparedPromptData& prompt,
+                                    const runtime::StateSnapshotImage& image) noexcept;
+    void save_state(std::uint32_t lane) noexcept;
     [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept;
 
@@ -291,6 +297,7 @@ public:
     qwen3_6::DFlashDecodeEgress* dflash_host_egress   = nullptr;
 
     std::size_t workspace_logical_peak_bytes = 0;
+    std::unique_ptr<runtime::StateSnapshotCache> state_cache;
 
 private:
     void clear_lane(SequenceState& sequence, RequestControl& request) noexcept;

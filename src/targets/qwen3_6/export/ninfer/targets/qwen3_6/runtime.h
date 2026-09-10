@@ -3,6 +3,7 @@
 #include "ninfer/types.h"
 #include "runtime/contract/transient_region.h"
 #include "runtime/contract/types.h"
+#include "runtime/engine/state_snapshot_cache.h"
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
 
 #include <cstddef>
@@ -171,6 +172,11 @@ public:
     void abort_lane(std::uint32_t lane) noexcept;
     [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
     void evict_retained_lane(std::uint32_t lane) noexcept;
+    void configure_state_cache(const EngineOptions& options);
+    [[nodiscard]] runtime::StateSnapshotLoad lookup_state(const PreparedPrompt& prompt);
+    [[nodiscard]] bool restore_state(std::uint32_t lane, const PreparedPrompt& prompt,
+                                    const runtime::StateSnapshotImage& image) noexcept;
+    void save_state(std::uint32_t lane) noexcept;
     [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept;
 

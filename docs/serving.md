@@ -489,6 +489,9 @@ curl http://127.0.0.1:8080/v1/models \
 | `--response-store-max-records N` | maximum locally retained Responses objects | `1024` |
 | `--response-store-max-mib N` | total local Response envelope/Item/context budget | `256` |
 | `--tool-replay-cache-mib N` | tool-format replay memory budget; `0` disables it | `1024` |
+| `--state-cache-dir DIR` | retained GPU-state snapshot directory; empty disables it | unset |
+| `--state-cache-max-mib N` | retained-state disk budget; `0` disables it | `0` |
+| `--state-cache-ram-mib N` | RAM budget for state images, including pending I/O | `4096` |
 | `--kv-dtype bf16\|int8\|kvarn\|kvarn-k4v4` | KV-cache storage | `bf16` |
 | `--spec mtp\|dflash` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; DFlash `1..15` | unset |

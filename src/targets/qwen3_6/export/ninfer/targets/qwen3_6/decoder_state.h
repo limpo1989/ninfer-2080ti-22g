@@ -85,6 +85,12 @@ public:
 
     [[nodiscard]] const PagedKVPool& pool() const noexcept { return pool_; }
 
+    [[nodiscard]] std::size_t snapshot_bytes(const PagedKVAllocation& allocation) const;
+    void snapshot_to_host(const PagedKVAllocation& allocation, std::span<std::uint8_t> destination,
+                          cudaStream_t stream = nullptr) const;
+    void restore_from_host(PagedKVAllocation& allocation, std::span<const std::uint8_t> source,
+                           cudaStream_t stream = nullptr) const;
+
     [[nodiscard]] PagedKVCacheView execution_view(const PagedKVAllocation& allocation) const;
 
     [[nodiscard]] PagedKVBatchLayerView batch_layer_view(std::uint32_t layer) const;
@@ -97,6 +103,8 @@ public:
 
 private:
     friend class PagedKVCacheView;
+    void transfer_snapshot(const PagedKVAllocation& allocation, std::uint8_t* host,
+                           std::size_t bytes, bool restore, cudaStream_t stream) const;
     [[nodiscard]] PagedKVLayerView layer_view(std::uint32_t layer, Tensor block_table) const;
 
     PagedKVPool pool_;
@@ -107,6 +115,7 @@ private:
     DType dtype_               = DType::BF16;
     std::int32_t quant_group_  = 0;
     std::optional<KvarnFormat> kvarn_;
+    PagedKVPlaneOrder plane_order_ = PagedKVPlaneOrder::PageMajor;
     std::vector<Tensor> stage_;
 };
 

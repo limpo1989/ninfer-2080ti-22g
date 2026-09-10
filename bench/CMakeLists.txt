@@ -86,6 +86,10 @@ target_include_directories(ninfer_token_decode PRIVATE
   ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party)
 target_link_libraries(ninfer_token_decode PRIVATE ninfer_engine)
 
+add_executable(ninfer_state_cache_bench targets/qwen3_6_27b/state_cache_bench.cpp)
+target_include_directories(ninfer_state_cache_bench PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party)
+target_link_libraries(ninfer_state_cache_bench PRIVATE ninfer_serve ninfer_engine)
+
 
 # Native target-private MTP proposal/verification microbenchmark. It enters through the target
 # Program facade and executes the production round schedule over a real .ninfer artifact.

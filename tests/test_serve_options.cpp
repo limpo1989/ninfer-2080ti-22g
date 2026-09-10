@@ -52,6 +52,8 @@ int main() {
                       "Responses store defaults mismatch");
     failures += check(defaults.tool_replay_cache_bytes == (1024ULL << 20),
                       "tool replay cache must default to 1 GiB");
+    failures += check(defaults.state_cache_dir.empty() && defaults.state_cache_max_bytes == 0,
+                      "state cache must be disabled by default");
     failures += check(!defaults.model_id_override.has_value(),
                       "model id override is unexpectedly configured by default");
     failures += check(
@@ -154,6 +156,11 @@ int main() {
     failures += check(parse({"ninfer-serve", "model.ninfer", "--tool-replay-cache-mib", "0"})
                           .tool_replay_cache_bytes == 0,
                       "zero must disable the tool replay cache");
+    const ServeOptions state_cache = parse({"ninfer-serve", "model.ninfer", "--state-cache-dir",
+                                            "/tmp/ninfer-state", "--state-cache-max-mib", "32768"});
+    failures += check(state_cache.state_cache_dir == "/tmp/ninfer-state" &&
+                          state_cache.state_cache_max_bytes == (32768ULL << 20),
+                      "state cache options did not reach serving options");
     for (const char* invalid : {"-1", "bad", "18446744073709551615"}) {
         bool rejected = false;
         try {

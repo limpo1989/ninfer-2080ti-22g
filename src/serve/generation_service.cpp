@@ -268,6 +268,9 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.media_preprocess_threads = options_.media_preprocess_threads;
     engine_options.load_progress            = std::move(load_progress);
     engine_options.chat_style               = options_.chat_style;
+    engine_options.state_cache_dir          = options_.state_cache_dir;
+    engine_options.state_cache_max_bytes    = options_.state_cache_max_bytes;
+    engine_options.state_cache_ram_bytes    = options_.state_cache_ram_bytes;
     engine_options.chat_template_override   = load_chat_template(options_.chat_template_path);
     engine_              = std::make_unique<ninfer::Engine>(std::move(engine_options));
     prompt_capabilities_ = engine_->prompt_capabilities();
@@ -409,6 +412,9 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
 
     outcome.metrics.prepare_seconds = prepared.prepare_seconds;
     outcome.metrics.queue_seconds   = result.timings.queue_seconds;
+    outcome.metrics.state_restore_seconds = result.timings.state_restore_seconds;
+    outcome.metrics.state_save_seconds = result.timings.state_save_seconds;
+    outcome.metrics.state_cache_source = result.timings.state_cache_source;
     outcome.metrics.ttft_seconds =
         prepared.prepare_seconds +
         std::max(0.0, result.timings.first_token_seconds - result.timings.prepare_seconds);

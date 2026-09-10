@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
+#include <cstring>
 #include <stdexcept>
 
 namespace ninfer::targets::qwen3_6::detail {
@@ -176,6 +177,43 @@ bool prefix_matches(const PreparedPromptData& prompt, const std::vector<TokenId>
         return false;
     }
     return resident_identity.matches(prompt, count);
+}
+
+std::vector<std::uint8_t> ResidentPrefixIdentity::serialize() const {
+    if (!vision_items_.empty()) throw std::invalid_argument("state snapshots currently support text only");
+    std::vector<std::uint8_t> out;
+    auto append = [&](const void* data, std::size_t bytes) {
+        if (!bytes) return;
+        const auto* begin = static_cast<const std::uint8_t*>(data);
+        out.insert(out.end(), begin, begin + bytes);
+    };
+    const std::uint32_t count = static_cast<std::uint32_t>(token_types_.size());
+    append(&count, sizeof(count));
+    append(token_types_.data(), token_types_.size());
+    for (const auto& axis : positions_) { append(axis.data(), axis.size() * sizeof(std::int32_t)); }
+    const std::uint32_t item_count = static_cast<std::uint32_t>(vision_items_.size());
+    append(&item_count, sizeof(item_count));
+    return out;
+}
+
+void ResidentPrefixIdentity::deserialize(std::span<const std::uint8_t> bytes) {
+    std::size_t offset = 0;
+    auto read = [&](void* destination, std::size_t size) {
+        if (size > bytes.size() - offset) { throw std::invalid_argument("truncated prefix identity"); }
+        if (size) std::memcpy(destination, bytes.data() + offset, size);
+        offset += size;
+    };
+    std::uint32_t count = 0;
+    read(&count, sizeof(count));
+    if (count > (bytes.size() - offset) / 13) throw std::invalid_argument("invalid prefix token count");
+    token_types_.resize(count);
+    read(token_types_.data(), token_types_.size());
+    for (auto& axis : positions_) { axis.resize(count); read(axis.data(), axis.size() * sizeof(std::int32_t)); }
+    std::uint32_t item_count = 0;
+    read(&item_count, sizeof(item_count));
+    if (item_count != 0) throw std::invalid_argument("state snapshots currently support text only");
+    vision_items_.resize(item_count);
+    if (offset != bytes.size()) { throw std::invalid_argument("prefix identity has trailing bytes"); }
 }
 
 } // namespace ninfer::targets::qwen3_6::detail

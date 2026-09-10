@@ -202,6 +202,20 @@ void Program<Variant>::evict_retained_lane(std::uint32_t lane) noexcept {
 }
 
 template <>
+void Program<Variant>::configure_state_cache(const EngineOptions& options) { impl_->configure_state_cache(options); }
+template <>
+runtime::StateSnapshotLoad Program<Variant>::lookup_state(const PreparedPrompt& prompt) {
+    return impl_->lookup_state(PreparedPromptAccess::view(prompt));
+}
+template <>
+bool Program<Variant>::restore_state(std::uint32_t lane, const PreparedPrompt& prompt,
+                                    const runtime::StateSnapshotImage& image) noexcept {
+    return impl_->restore_state(lane, PreparedPromptAccess::view(prompt), image);
+}
+template <>
+void Program<Variant>::save_state(std::uint32_t lane) noexcept { impl_->save_state(lane); }
+
+template <>
 GenerationTimings Program<Variant>::generation_timings_lane(std::uint32_t lane) const noexcept {
     return impl_->generation_timings_lane(lane);
 }
