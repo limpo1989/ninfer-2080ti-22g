@@ -550,10 +550,22 @@ void parse_reasoning(const Json& body, ResponsesRequest& out) {
     const Json& reasoning = body.at("reasoning");
     if (!reasoning.is_object()) { bad_request("reasoning must be an object", "reasoning"); }
     for (auto it = reasoning.begin(); it != reasoning.end(); ++it) {
-        if (it.key() != "effort" && !it.value().is_null()) {
+        if (it.key() != "effort" && it.key() != "summary" && !it.value().is_null()) {
             bad_request("reasoning." + it.key() + " is not supported", "reasoning",
                         "reasoning_option_not_supported");
         }
+    }
+    if (reasoning.contains("summary") && !reasoning.at("summary").is_null()) {
+        if (!reasoning.at("summary").is_string()) {
+            bad_request("reasoning.summary must be a string", "reasoning");
+        }
+        const std::string summary = reasoning.at("summary").get<std::string>();
+        if (summary != "auto" && summary != "concise" && summary != "detailed") {
+            bad_request("reasoning.summary must be one of auto, concise, or detailed",
+                        "reasoning");
+        }
+        // Compatibility hint only. NInfer already publishes its visible reasoning through both
+        // reasoning_text and reasoning_summary SSE channels; it does not run a second summarizer.
     }
     if (!reasoning.contains("effort") || reasoning.at("effort").is_null()) { return; }
     if (!reasoning.at("effort").is_string()) {

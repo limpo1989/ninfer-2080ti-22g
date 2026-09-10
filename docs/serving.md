@@ -216,6 +216,7 @@ wire response contains typed `output` Items.
 | `top_p` | finite number in `[0,1]` |
 | `metadata` | at most 16 string pairs; keys at most 64 characters and values at most 512 |
 | `reasoning.effort` | `none` disables thinking; `low`, `medium`, or `xhigh` selects an effort exposed by the loaded chat template; `minimal`, `high`, and `max` return `reasoning_effort_not_supported` for the registered templates |
+| `reasoning.summary` | `null`, `auto`, `concise`, or `detailed` are accepted as compatibility hints; NInfer keeps its existing raw-reasoning and paired summary event output and does not run a separate summarizer |
 | `chat_template_kwargs.preserve_thinking` | optional boolean controlling whether closed-turn reasoning remains in reconstructed prompts |
 | `preserve_thinking` | top-level alias for the same option; conflicting values are rejected |
 | `text.format` | omitted or `{"type":"text"}` only |
@@ -255,8 +256,8 @@ System and developer message Items retain their positions in the input array. To
 `instructions` is represented as a leading developer turn for the current request; target-specific
 role lowering occurs only in the Qwen family frontend.
 
-`input_file`, `input_audio`, image `file_id`, non-`auto` image detail, reasoning summaries or
-encrypted reasoning, message `phase`, and other Item/content types are not supported. HTTP media
+`input_file`, `input_audio`, image `file_id`, non-`auto` image detail, encrypted reasoning, message
+`phase`, and other Item/content types are not supported. HTTP media
 URLs stored in a response chain are fetched again when that chain is continued; use data URIs when
 the historical media bytes must be immutable.
 

@@ -198,6 +198,19 @@ int test_reasoning_effort() {
                       }) == "reasoning_effort_not_supported",
                       "Responses high effort bypassed template capability validation");
 
+    for (const char* summary : {"auto", "concise", "detailed"}) {
+        Json compatible         = base;
+        compatible["reasoning"] = Json{{"effort", "xhigh"}, {"summary", summary}};
+        failures += check(parse_responses_request(compatible, limits()).generation.reasoning_effort ==
+                              RequestedReasoningEffort::XHigh,
+                          std::string("Responses rejected compatible reasoning summary ") + summary);
+    }
+    Json null_summary         = base;
+    null_summary["reasoning"] = Json{{"effort", "medium"}, {"summary", nullptr}};
+    failures += check(parse_responses_request(null_summary, limits()).generation.reasoning_effort ==
+                          RequestedReasoningEffort::Medium,
+                      "null reasoning summary changed effort parsing");
+
     Json invalid         = base;
     invalid["reasoning"] = Json{{"effort", "ultra"}};
     failures += check(throws_api([&] { (void)parse_responses_request(invalid, limits()); }),
@@ -205,6 +218,16 @@ int test_reasoning_effort() {
     invalid["reasoning"] = Json{{"effort", 1}};
     failures += check(throws_api([&] { (void)parse_responses_request(invalid, limits()); }),
                       "non-string Responses reasoning effort was accepted");
+    invalid["reasoning"] = Json{{"effort", "xhigh"}, {"summary", "verbose"}};
+    failures += check(throws_api([&] { (void)parse_responses_request(invalid, limits()); }),
+                      "unknown Responses reasoning summary was accepted");
+    invalid["reasoning"] = Json{{"effort", "xhigh"}, {"summary", 1}};
+    failures += check(throws_api([&] { (void)parse_responses_request(invalid, limits()); }),
+                      "non-string Responses reasoning summary was accepted");
+    invalid["reasoning"] = Json{{"effort", "xhigh"}, {"unknown", true}};
+    failures += check(api_code([&] { (void)parse_responses_request(invalid, limits()); }) ==
+                          "reasoning_option_not_supported",
+                      "unknown Responses reasoning option bypassed strict rejection");
     return failures;
 }
 
