@@ -152,9 +152,6 @@ public:
             request = std::make_shared<Request>(request_id, std::move(prompt), std::move(output),
                                                 prompt_summary, prepare_seconds, std::move(options),
                                                 pending_deadline, submitted);
-            if (request->options.execution.allow_prefix_reuse) {
-                request->snapshot = instance_.program->lookup_state(request->prompt);
-            }
         } catch (...) {
             release_reserved_capacity();
             throw;
@@ -294,6 +291,7 @@ private:
         std::optional<Clock::time_point> admitted;
         std::optional<Clock::time_point> first_token;
         StateSnapshotLoad snapshot;
+        std::optional<std::uint32_t> snapshot_checked_frontier;
         double state_restore_seconds = 0;
         std::uint8_t state_cache_source = 0;
         std::optional<GenerationBudget> budget;
@@ -429,8 +427,6 @@ private:
     }
 
     void complete_success(const std::shared_ptr<Request>& request, FinishReason reason) {
-        if (request->lane && reason != FinishReason::Cancelled && request->options.execution.allow_prefix_reuse)
-            instance_.program->save_state(*request->lane);
         release_planning_state(request);
         request->prompt = {};
         GenerationResult result;
@@ -472,6 +468,10 @@ private:
         }
         if (mark_completed(request)) { release_reserved_capacity(); }
         request->cv.notify_one();
+        if (request->lane && reason != FinishReason::Cancelled &&
+            request->options.execution.allow_prefix_reuse) {
+            instance_.program->save_state(*request->lane);
+        }
     }
 
     void complete_cancelled(const std::shared_ptr<Request>& request) {
@@ -714,6 +714,19 @@ private:
         request->lane_plan_versions[lane] = lane_plan_versions_[lane];
     }
 
+    void ensure_snapshot_lookup(const std::shared_ptr<Request>& request,
+                                std::uint32_t resident_reuse) {
+        if (!request->options.execution.allow_prefix_reuse || request->snapshot.result.valid()) {
+            return;
+        }
+        if (request->snapshot_checked_frontier &&
+            resident_reuse >= *request->snapshot_checked_frontier) {
+            return;
+        }
+        request->snapshot = instance_.program->lookup_state(request->prompt, resident_reuse);
+        request->snapshot_checked_frontier = resident_reuse;
+    }
+
     [[nodiscard]] std::optional<LaneChoice>
     find_admission_lane(const std::shared_ptr<Request>& request) {
         std::optional<LaneChoice> selected;
@@ -729,7 +742,10 @@ private:
                 selected_reuse = reuse;
             }
         }
-        if (selected) { return selected; }
+        if (selected) {
+            ensure_snapshot_lookup(request, selected_reuse);
+            return selected;
+        }
 
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] != nullptr) { continue; }
@@ -745,6 +761,7 @@ private:
                 selected_reuse = reuse;
             }
         }
+        if (selected) { ensure_snapshot_lookup(request, selected_reuse); }
         return selected;
     }
 

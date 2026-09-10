@@ -16,7 +16,7 @@ Json metrics(const ninfer::GenerationResult& r, double wall) {
         {"output", r.generated_token_ids.size()}, {"tokens", r.generated_token_ids},
         {"ttft", r.timings.first_token_seconds}, {"prefill", r.timings.prefill_seconds},
         {"decode", r.timings.decode_seconds}, {"restore", r.timings.state_restore_seconds},
-        {"save", r.timings.state_save_seconds}, {"source", r.timings.state_cache_source}, {"wall", wall}};
+        {"source", r.timings.state_cache_source}, {"wall", wall}};
 }
 int main(int argc, char** argv) {
     if (argc != 6) { std::cerr << "Usage: state_cache_bench MODEL REQUEST CACHE_DIR FIXTURE seed|resident|disk|cold|ram\n"; return 2; }

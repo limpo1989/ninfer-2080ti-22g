@@ -204,8 +204,9 @@ void Program<Variant>::evict_retained_lane(std::uint32_t lane) noexcept {
 template <>
 void Program<Variant>::configure_state_cache(const EngineOptions& options) { impl_->configure_state_cache(options); }
 template <>
-runtime::StateSnapshotLoad Program<Variant>::lookup_state(const PreparedPrompt& prompt) {
-    return impl_->lookup_state(PreparedPromptAccess::view(prompt));
+runtime::StateSnapshotLoad Program<Variant>::lookup_state(const PreparedPrompt& prompt,
+                                                          std::uint32_t minimum_frontier) {
+    return impl_->lookup_state(PreparedPromptAccess::view(prompt), minimum_frontier);
 }
 template <>
 bool Program<Variant>::restore_state(std::uint32_t lane, const PreparedPrompt& prompt,

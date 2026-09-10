@@ -541,6 +541,12 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             trim_sequence_kv(sequence, base, backend_kv_valid(sequence));
             resize_sequence_kv_entitlement(sequence, request_plan.text_kv_page_entitlement,
                                            request_plan.backend_kv_page_entitlement);
+            decoder->text_kv.restore_kvarn_rewrite_checkpoint(
+                static_cast<std::int32_t>(sequence.lane), device.stream);
+            if (decoder->mtp_cache()) {
+                decoder->mtp_cache()->restore_kvarn_rewrite_checkpoint(
+                    static_cast<std::int32_t>(sequence.lane), device.stream);
+            }
             decoder->linear_attention.copy_slot(
                 LinearStateSlots::rewrite_checkpoint_state_slot(sequence.lane, max_concurrency),
                 LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
@@ -1601,7 +1607,17 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             }
             processed_prompt_tokens = result.processed_tokens;
             if (staged.vision) { staged.vision->release_encoded_media_payloads(); }
-            staged.cursor += result.processed_tokens;
+            const std::uint32_t next_cursor = staged.cursor + result.processed_tokens;
+            if (staged.rewrite_checkpoint_capture &&
+                next_cursor == staged.rewrite_checkpoint_capture->frontier) {
+                decoder->text_kv.capture_kvarn_rewrite_checkpoint(
+                    static_cast<std::int32_t>(sequence.lane), device.stream);
+                if (decoder->mtp_cache()) {
+                    decoder->mtp_cache()->capture_kvarn_rewrite_checkpoint(
+                        static_cast<std::int32_t>(sequence.lane), device.stream);
+                }
+            }
+            staged.cursor = next_cursor;
             sequence.text_kv_valid = staged.cursor;
             if (staged.prepare_mtp) { sequence.mtp_kv_valid = staged.cursor; }
             if (speculative_backend == SpeculativeBackend::DFlash) {
@@ -1891,18 +1907,29 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             const std::uint32_t extent =
                 std::min({sequence.mtp_draft_count, draft_window, max_by_budget,
                           capacity - sequence.execution_frontier - 1});
+            const std::uint32_t page_safe_extent = [&] {
+                if (!decoder->text_kv.kvarn() || frontier < kKvarnSinkTokens) {
+                    return draft_window;
+                }
+                const std::uint32_t remaining =
+                    kPagedKVPageSize - frontier % kPagedKVPageSize;
+                return remaining > 1 ? remaining - 2 : 0U;
+            }();
+            const std::uint32_t transactional_extent = std::min(extent, page_safe_extent);
             mtp_host_ingress->anchors[row]        = sequence.ledger.back();
             mtp_host_ingress->base_frontiers[row] = checked_i32(frontier, "MTP batch frontier");
             mtp_host_ingress->remaining_budgets[row] =
                 checked_i32(budgets[row].generated_tokens_remaining, "MTP batch remaining budget");
-            mtp_host_ingress->current_extents[row]      = static_cast<std::int32_t>(extent);
-            mtp_host_ingress->target_valid_columns[row] = static_cast<std::int32_t>(extent + 1);
+            mtp_host_ingress->current_extents[row] =
+                static_cast<std::int32_t>(transactional_extent);
+            mtp_host_ingress->target_valid_columns[row] =
+                static_cast<std::int32_t>(transactional_extent + 1);
             for (std::uint32_t j = 0; j < draft_window; ++j) {
                 mtp_host_ingress->current_drafts[row * draft_window + j] =
-                    j < extent ? sequence.mtp_drafts[j] : sequence.ledger.back();
+                    j < transactional_extent ? sequence.mtp_drafts[j] : sequence.ledger.back();
             }
             for (std::uint32_t j = 0; j < width; ++j) {
-                const std::uint32_t position = frontier + std::min(j, extent);
+                const std::uint32_t position = frontier + std::min(j, transactional_extent);
                 mtp_host_ingress->target_rope_positions[row * width + j] =
                     checked_i32(position, "MTP batch RoPE position") + sequence.rope_delta;
             }
@@ -1911,8 +1938,9 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             mtp_host_ingress->lanes[row]              = static_cast<std::int32_t>(sequence.lane);
             mtp_host_ingress->rope_deltas[row]        = sequence.rope_delta;
             mtp_host_ingress->sampling[row]           = request.sampling_host;
-            materialize_sequence_kv(sequence, frontier + extent + 1,
-                                    std::min(capacity, frontier + extent + draft_window));
+            materialize_sequence_kv(
+                sequence, frontier + transactional_extent + 1,
+                std::min(capacity, frontier + transactional_extent + draft_window));
         }
 
         schedule::MtpBatchContext schedule_state{{device, model, work, decoder->linear_attention,

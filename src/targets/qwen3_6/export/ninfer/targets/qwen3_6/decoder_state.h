@@ -44,6 +44,9 @@ struct PagedKVCacheLayout {
     // Two BF16 stage regions per layer (K and V), each holding every table row's sink pages and
     // its still-filling tail page. Empty unless `kvarn` is engaged.
     std::vector<TensorRegion> stage;
+    // Two BF16 regions per layer retaining the tail page at the rewrite checkpoint. The sink
+    // pages remain immutable in `stage`, so only one page per row is duplicated.
+    std::vector<TensorRegion> rewrite_checkpoint_stage;
     std::int32_t table_rows = 0;
 
     [[nodiscard]] std::size_t payload_bytes() const noexcept;
@@ -70,6 +73,11 @@ private:
 
 class PagedKVCache {
 public:
+    struct KvarnCheckpointTailView {
+        Tensor k;
+        Tensor v;
+    };
+
     PagedKVCache(DeviceSpan backing, const PagedKVCacheLayout& layout);
 
     PagedKVCache(const PagedKVCache&)            = delete;
@@ -100,11 +108,19 @@ public:
     // Valid only when kvarn() holds. Sink and tail live in this layer's stage regions; every
     // committed page lives in the record plane addressed through the shared block tables.
     [[nodiscard]] ops::KvarnBatchLayerView kvarn_batch_layer_view(std::uint32_t layer) const;
+    [[nodiscard]] KvarnCheckpointTailView
+    kvarn_rewrite_checkpoint_tail_view(std::uint32_t layer, std::int32_t row) const;
+    void capture_kvarn_rewrite_checkpoint(std::int32_t row,
+                                          cudaStream_t stream = nullptr) const;
+    void restore_kvarn_rewrite_checkpoint(std::int32_t row,
+                                          cudaStream_t stream = nullptr) const;
 
 private:
     friend class PagedKVCacheView;
     void transfer_snapshot(const PagedKVAllocation& allocation, std::uint8_t* host,
                            std::size_t bytes, bool restore, cudaStream_t stream) const;
+    void transfer_kvarn_rewrite_checkpoint(std::int32_t row, bool restore,
+                                           cudaStream_t stream) const;
     [[nodiscard]] PagedKVLayerView layer_view(std::uint32_t layer, Tensor block_table) const;
 
     PagedKVPool pool_;
@@ -116,7 +132,9 @@ private:
     std::int32_t quant_group_  = 0;
     std::optional<KvarnFormat> kvarn_;
     PagedKVPlaneOrder plane_order_ = PagedKVPlaneOrder::PageMajor;
+    std::int32_t table_rows_       = 0;
     std::vector<Tensor> stage_;
+    std::vector<Tensor> rewrite_checkpoint_stage_;
 };
 
 struct DecoderStateLayout {

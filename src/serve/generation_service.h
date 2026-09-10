@@ -31,7 +31,6 @@ struct GenerationMetrics {
     double decode_seconds  = 0.0;
     double total_seconds   = 0.0;
     double state_restore_seconds = 0.0;
-    double state_save_seconds = 0.0;
     std::uint8_t state_cache_source = 0;
 
     SpeculativeBackend speculative_backend    = SpeculativeBackend::None;

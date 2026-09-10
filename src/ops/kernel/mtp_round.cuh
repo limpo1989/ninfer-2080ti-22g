@@ -13,7 +13,8 @@ __global__ void mtp_prepare_next_round_kernel(
     const std::int32_t* licensed_counts, const std::int32_t* rope_deltas,
     std::int32_t* alignment_ids, std::int32_t* next_extents, std::int32_t* ar_positions,
     std::int32_t* ar_rope_positions, std::int32_t* ar_valid_columns, std::int32_t k,
-    std::int32_t ar_step_stride, std::int32_t max_context) {
+    std::int32_t ar_step_stride, std::int32_t max_context, std::int32_t speculative_page_size,
+    std::int32_t speculative_sink_tokens) {
     const int row = static_cast<int>(blockIdx.y);
     const int T   = k + 1;
     int a         = accepted[row];
@@ -29,6 +30,13 @@ __global__ void mtp_prepare_next_round_kernel(
         const int context_extent = max_context - updated_frontiers[row] - 1;
         int next                 = budget_extent < context_extent ? budget_extent : context_extent;
         next                     = next < 0 ? 0 : (next > k ? k : next);
+        if (speculative_page_size > 0 &&
+            updated_frontiers[row] >= speculative_sink_tokens) {
+            const int page_remaining =
+                speculative_page_size - updated_frontiers[row] % speculative_page_size;
+            const int page_extent = page_remaining > 1 ? page_remaining - 2 : 0;
+            next                  = next < page_extent ? next : page_extent;
+        }
         next_extents[row]        = next;
         const int steps          = k > 1 ? k - 1 : 1;
         for (int s = 0; s < steps; ++s) {

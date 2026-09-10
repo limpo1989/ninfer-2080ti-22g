@@ -389,7 +389,6 @@ struct PreparationControl {
 struct GenerationTimings {
     // External retained-state restore, separately reported within total/TTFT.
     double state_restore_seconds = 0.0;
-    double state_save_seconds = 0.0;
     std::uint8_t state_cache_source = 0; // 0: none/resident, 1: RAM, 2: disk
     double prepare_seconds     = 0.0;
     // Submission to scheduler admission, or completion if cancelled while still pending.

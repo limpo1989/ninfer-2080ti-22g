@@ -11,14 +11,25 @@ using SnapshotJson = nlohmann::json;
 std::string snapshot_alias(std::uint32_t n, std::uint64_t hash) {
     std::ostringstream out; out << n << '-' << std::hex << hash; return out.str();
 }
-std::vector<std::string> snapshot_aliases(const std::vector<TokenId>& tokens) {
-    std::vector<std::string> aliases; aliases.reserve(tokens.size());
+std::vector<std::string> snapshot_aliases(const std::vector<TokenId>& tokens,
+                                          std::uint32_t minimum_frontier = 0) {
+    std::vector<std::string> aliases;
+    if (tokens.size() > minimum_frontier) { aliases.reserve(tokens.size() - minimum_frontier); }
     std::uint64_t hash = 14695981039346656037ULL;
     for (std::size_t i = 0; i < tokens.size(); ++i) {
         hash ^= static_cast<std::uint32_t>(tokens[i]); hash *= 1099511628211ULL;
-        aliases.push_back(snapshot_alias(static_cast<std::uint32_t>(i + 1), hash));
+        if (i + 1 > minimum_frontier) {
+            aliases.push_back(snapshot_alias(static_cast<std::uint32_t>(i + 1), hash));
+        }
     }
     return aliases;
+}
+std::string snapshot_image_key(const std::vector<TokenId>& tokens) {
+    std::uint64_t hash = 14695981039346656037ULL;
+    for (const TokenId token : tokens) {
+        hash ^= static_cast<std::uint32_t>(token); hash *= 1099511628211ULL;
+    }
+    return runtime::state_hash_key(snapshot_alias(static_cast<std::uint32_t>(tokens.size()), hash));
 }
 std::vector<Tensor> snapshot_tensors(ProgramImplCore& p, std::uint32_t lane, bool checkpoint) {
     std::vector<Tensor> result;
@@ -38,6 +49,12 @@ std::vector<Tensor> snapshot_tensors(ProgramImplCore& p, std::uint32_t lane, boo
             const auto view = cache->kvarn_batch_layer_view(layer);
             result.push_back(view.stage_k.slice(3, lane, 1));
             result.push_back(view.stage_v.slice(3, lane, 1));
+            if (checkpoint) {
+                const auto checkpoint_tail =
+                    cache->kvarn_rewrite_checkpoint_tail_view(layer, lane);
+                result.push_back(checkpoint_tail.k);
+                result.push_back(checkpoint_tail.v);
+            }
         }
     }
     return result;
@@ -48,16 +65,17 @@ std::size_t cache_page_bytes(const qwen3_6::PagedKVCache& cache, std::uint32_t p
         size += cache.pool().plane(i).bytes() / cache.pool().page_group_count() * pages;
     return size;
 }
-std::shared_ptr<runtime::StateSnapshotImage> capture_image(ProgramImplCore& p, std::uint32_t lane) {
+std::shared_ptr<runtime::StateSnapshotImage> capture_image(ProgramImplCore& p, std::uint32_t lane,
+                                                           std::string key) {
     const auto& s = p.sequences[lane];
     auto image = std::make_shared<runtime::StateSnapshotImage>();
     auto keys = snapshot_aliases(s.ledger);
-    image->key = runtime::state_hash_key(keys.back());
+    image->key = std::move(key);
     if (s.execution_frontier) image->aliases.push_back(keys.at(s.execution_frontier - 1));
     if (s.rewrite_checkpoint.valid) image->aliases.push_back(keys.at(s.rewrite_checkpoint.frontier - 1));
     const auto main_pages = s.kv->text.mapped_page_count();
     const auto mtp_pages = s.kv->backend ? s.kv->backend->mapped_page_count() : 0U;
-    SnapshotJson j{{"version", 2}, {"execution", s.execution_frontier}, {"ledger_frontier", s.ledger_frontier},
+    SnapshotJson j{{"version", 3}, {"execution", s.execution_frontier}, {"ledger_frontier", s.ledger_frontier},
         {"text_valid", s.text_kv_valid}, {"mtp_valid", s.mtp_kv_valid}, {"rope_delta", s.rope_delta},
         {"checkpoint", s.rewrite_checkpoint.valid}, {"checkpoint_kind", static_cast<int>(s.rewrite_checkpoint.kind)},
         {"checkpoint_frontier", s.rewrite_checkpoint.frontier}, {"tail_valid", s.tail_hidden_valid},
@@ -67,8 +85,8 @@ std::shared_ptr<runtime::StateSnapshotImage> capture_image(ProgramImplCore& p, s
     auto bytes = cache_page_bytes(p.decoder->text_kv, main_pages);
     if (s.kv->backend) bytes += cache_page_bytes(*p.decoder->mtp_cache(), mtp_pages);
     for (const auto& tensor : tensors) bytes += tensor.bytes();
-    if (bytes > p.state_cache->ram_limit()) return nullptr;
     image->metadata = SnapshotJson::to_cbor(j);
+    if (!p.state_cache->can_store(bytes, image->metadata.size())) return nullptr;
     image->payload.resize(bytes);
     std::size_t offset = 0;
     for (const auto& tensor : tensors) {
@@ -95,7 +113,7 @@ void ProgramImplCore::configure_state_cache(const EngineOptions& options) {
     static_assert(std::endian::native == std::endian::little);
     // Conservative cache namespace: an executable rebuild or artifact replacement invalidates
     // existing images. No raw pointer, physical page ID, or CUDA Graph is persisted.
-    SnapshotJson identity{{"state_format", 2}, {"artifact", runtime::state_file_identity(options.artifact_path)},
+    SnapshotJson identity{{"state_format", 3}, {"artifact", runtime::state_file_identity(options.artifact_path)},
         {"executable", runtime::state_file_identity("/proc/self/exe")},
         {"sm", device.sm()}, {"capacity", capacity}, {"kv_storage", static_cast<int>(kv_storage)},
         {"spec", static_cast<int>(speculative_backend)}, {"draft", draft_window},
@@ -104,18 +122,21 @@ void ProgramImplCore::configure_state_cache(const EngineOptions& options) {
     state_cache = std::make_unique<runtime::StateSnapshotCache>(options.state_cache_dir,
         options.state_cache_max_bytes, options.state_cache_ram_bytes, identity.dump());
 }
-runtime::StateSnapshotLoad ProgramImplCore::lookup_state(const PreparedPromptData& prompt) {
+runtime::StateSnapshotLoad ProgramImplCore::lookup_state(const PreparedPromptData& prompt,
+                                                         std::uint32_t minimum_frontier) {
     if (!state_cache || !prompt.identity.reusable || prompt.has_media()) return {};
-    auto aliases = snapshot_aliases(prompt.token_ids);
+    auto aliases = snapshot_aliases(prompt.token_ids, minimum_frontier);
     std::reverse(aliases.begin(), aliases.end());
     return state_cache->lookup(aliases);
 }
 void ProgramImplCore::save_state(std::uint32_t lane) noexcept {
     if (!state_cache || !has_retained_lane(lane) || !sequences[lane].kv ||
         sequences[lane].ledger.size() < 256) return; // avoid fixed GDN snapshot cost for tiny/warmup requests
-    const auto started = Clock::now();
     try {
-        auto image = capture_image(*this, lane);
+        const std::string key = snapshot_image_key(sequences[lane].ledger);
+        if (state_cache->contains(key)) return;
+        const auto started = Clock::now();
+        auto image = capture_image(*this, lane, key);
         if (image) {
             const auto size = image->payload.size();
             const bool kept = state_cache->put(std::move(image));
@@ -125,7 +146,6 @@ void ProgramImplCore::save_state(std::uint32_t lane) noexcept {
     } catch (const std::exception& error) {
         std::fprintf(stderr, "[state-cache] capture skipped: %s\n", error.what());
     }
-    requests[lane].timings.state_save_seconds = std::chrono::duration<double>(Clock::now() - started).count();
 }
 
 bool ProgramImplCore::restore_state(std::uint32_t lane, const PreparedPromptData& prompt,
@@ -135,7 +155,7 @@ bool ProgramImplCore::restore_state(std::uint32_t lane, const PreparedPromptData
     bool mutated = false;
     try {
         const auto j = SnapshotJson::from_cbor(image.metadata);
-        if (j.at("version") != 2) return false;
+        if (j.at("version") != 3) return false;
         auto ledger = j.at("ledger").get<std::vector<TokenId>>();
         const auto execution = j.at("execution").get<std::uint32_t>();
         const auto text_valid = j.at("text_valid").get<std::uint32_t>();
@@ -189,7 +209,7 @@ bool ProgramImplCore::restore_state(std::uint32_t lane, const PreparedPromptData
         s.tail_hidden_valid = j.at("tail_valid").get<bool>(); s.mtp_draft_count = 0; s.retained = true;
         requests[lane].lifecycle = Lifecycle::Complete;
         if (std::getenv("NINFER_VERIFY_STATE_RESTORE")) {
-            const auto actual = capture_image(*this, lane);
+            const auto actual = capture_image(*this, lane, snapshot_image_key(sequences[lane].ledger));
             if (!actual || actual->payload != image.payload || actual->metadata != image.metadata)
                 throw std::runtime_error("restored state differs from saved bytes");
             std::fprintf(stderr, "[state-cache] verified bytes=%zu\n", image.payload.size());

@@ -55,11 +55,17 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
                 {DType::U8, static_cast<std::int32_t>(record.slot_bytes), kv_heads, 256});
         }
         layout.stage.reserve(static_cast<std::size_t>(layers) * 2);
+        layout.rewrite_checkpoint_stage.reserve(static_cast<std::size_t>(layers) * 2);
         for (std::uint32_t layer = 0; layer < layers; ++layer) {
             for (const char* label : {"KVarN stage K", "KVarN stage V"}) {
                 layout.stage.push_back(builder.add_tensor(
                     DType::BF16, {head_dim, kv_heads, ops::kKvarnStageTokens, table_rows}, 256,
                     label));
+            }
+            for (const char* label : {"KVarN rewrite checkpoint tail K",
+                                      "KVarN rewrite checkpoint tail V"}) {
+                layout.rewrite_checkpoint_stage.push_back(builder.add_tensor(
+                    DType::BF16, {head_dim, kv_heads, kPagedKVPageSize, table_rows}, 256, label));
             }
         }
     } else {
@@ -105,15 +111,27 @@ DecoderStateLayout plan_decoder_state(LayoutBuilder& builder, const DecoderState
 std::size_t PagedKVCacheLayout::payload_bytes() const noexcept {
     std::size_t total = pool.payload_bytes();
     for (const TensorRegion& region : stage) { total += region.region.bytes; }
+    for (const TensorRegion& region : rewrite_checkpoint_stage) {
+        total += region.region.bytes;
+    }
     return total;
 }
 
 PagedKVCache::PagedKVCache(DeviceSpan backing, const PagedKVCacheLayout& layout)
     : pool_(backing, layout.pool), layers_(layout.layers), max_context_(layout.max_context),
     kv_heads_(layout.kv_heads), head_dim_(layout.head_dim), dtype_(layout.dtype),
-    quant_group_(layout.quant_group), kvarn_(layout.kvarn), plane_order_(layout.pool.spec.plane_order) {
+    quant_group_(layout.quant_group), kvarn_(layout.kvarn),
+    plane_order_(layout.pool.spec.plane_order), table_rows_(layout.table_rows) {
     stage_.reserve(layout.stage.size());
     for (const TensorRegion& region : layout.stage) { stage_.push_back(region.bind(backing)); }
+    rewrite_checkpoint_stage_.reserve(layout.rewrite_checkpoint_stage.size());
+    for (const TensorRegion& region : layout.rewrite_checkpoint_stage) {
+        rewrite_checkpoint_stage_.push_back(region.bind(backing));
+    }
+    const std::size_t expected_stages = kvarn_ ? static_cast<std::size_t>(layers_) * 2 : 0;
+    if (stage_.size() != expected_stages || rewrite_checkpoint_stage_.size() != expected_stages) {
+        throw std::logic_error("KVarN stage layout does not match the cache geometry");
+    }
 }
 
 std::size_t PagedKVCache::snapshot_bytes(const PagedKVAllocation& allocation) const {
@@ -170,6 +188,54 @@ ops::KvarnBatchLayerView PagedKVCache::kvarn_batch_layer_view(std::uint32_t laye
         .head_dim     = head_dim_,
         .kv_heads     = kv_heads_,
     };
+}
+
+PagedKVCache::KvarnCheckpointTailView
+PagedKVCache::kvarn_rewrite_checkpoint_tail_view(std::uint32_t layer, std::int32_t row) const {
+    if (!kvarn_ || layer >= layers_ || row < 0 || row >= table_rows_ ||
+        2 * layer + 1 >= rewrite_checkpoint_stage_.size()) {
+        throw std::out_of_range("KVarN rewrite checkpoint tail is out of range");
+    }
+    return KvarnCheckpointTailView{
+        .k = rewrite_checkpoint_stage_[2 * layer].slice(3, row, 1),
+        .v = rewrite_checkpoint_stage_[2 * layer + 1].slice(3, row, 1),
+    };
+}
+
+void PagedKVCache::transfer_kvarn_rewrite_checkpoint(std::int32_t row, bool restore,
+                                                     cudaStream_t stream) const {
+    if (!kvarn_) { return; }
+    if (row < 0 || row >= table_rows_) {
+        throw std::out_of_range("KVarN rewrite checkpoint row is out of range");
+    }
+    for (std::uint32_t layer = 0; layer < layers_; ++layer) {
+        const ops::KvarnBatchLayerView current = kvarn_batch_layer_view(layer);
+        const KvarnCheckpointTailView checkpoint =
+            kvarn_rewrite_checkpoint_tail_view(layer, row);
+        const auto transfer = [&](const Tensor& current_stage, const Tensor& checkpoint_stage) {
+            const Tensor tail = current_stage.slice(3, row, 1).slice(
+                2, kKvarnSinkTokens, kPagedKVPageSize);
+            if (!tail.is_contiguous() || !checkpoint_stage.is_contiguous() ||
+                tail.bytes() != checkpoint_stage.bytes()) {
+                throw std::logic_error("KVarN rewrite checkpoint tail is not contiguous");
+            }
+            CUDA_CHECK(cudaMemcpyAsync(restore ? tail.data : checkpoint_stage.data,
+                                       restore ? checkpoint_stage.data : tail.data, tail.bytes(),
+                                       cudaMemcpyDeviceToDevice, stream));
+        };
+        transfer(current.stage_k, checkpoint.k);
+        transfer(current.stage_v, checkpoint.v);
+    }
+}
+
+void PagedKVCache::capture_kvarn_rewrite_checkpoint(std::int32_t row,
+                                                    cudaStream_t stream) const {
+    transfer_kvarn_rewrite_checkpoint(row, false, stream);
+}
+
+void PagedKVCache::restore_kvarn_rewrite_checkpoint(std::int32_t row,
+                                                    cudaStream_t stream) const {
+    transfer_kvarn_rewrite_checkpoint(row, true, stream);
 }
 
 PagedKVCacheView::PagedKVCacheView(const PagedKVCache& cache, Tensor block_table) noexcept

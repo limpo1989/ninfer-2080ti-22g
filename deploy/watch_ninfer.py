@@ -170,8 +170,7 @@ def parse_request(line: str) -> Row | None:
     ]
     detail = (f"#{request_id} Think={fields.get('think', '-')} tokens | "
               f"Reuse={fields.get('reuse', '-')} | Tool calls={fields.get('tool_calls', '0')} | "
-              f"State={fields.get('state_source', '-')} Restore={fields.get('restore', '-')} "
-              f"Snapshot={fields.get('snapshot', '-')}")
+              f"State={fields.get('state_source', '-')} Restore={fields.get('restore', '-')}")
     return Row(request_id, values, detail)
 
 

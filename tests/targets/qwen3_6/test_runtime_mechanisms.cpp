@@ -104,6 +104,22 @@ void test_decoder_layout() {
            "INT8 MTP KV has scale planes");
     expect(int8.kv_payload_bytes() == int8.text_kv.payload_bytes() + int8.mtp_kv->payload_bytes(),
            "INT8 Text/MTP KV payload accounting");
+
+    ninfer::LayoutBuilder kvarn_builder;
+    q36::DecoderStateSpec kvarn_spec = decoder_spec(ninfer::DType::U8, true);
+    kvarn_spec.attention_head_dim = 128;
+    kvarn_spec.kvarn              = ninfer::KvarnFormat::K4V2G64;
+    const q36::DecoderStateLayout kvarn = q36::plan_decoder_state(kvarn_builder, kvarn_spec);
+    (void)kvarn_builder.finish(256);
+    expect(kvarn.text_kv.stage.size() == 4 &&
+               kvarn.text_kv.rewrite_checkpoint_stage.size() == 4,
+           "KVarN Text KV owns current and checkpoint stages per layer");
+    expect(kvarn.mtp_kv && kvarn.mtp_kv->stage.size() == 2 &&
+               kvarn.mtp_kv->rewrite_checkpoint_stage.size() == 2,
+           "KVarN MTP KV owns current and checkpoint stages");
+    expect(kvarn.text_kv.rewrite_checkpoint_stage.front().shape[2] ==
+               ninfer::kPagedKVPageSize,
+           "KVarN checkpoint stage retains exactly one tail page");
 }
 
 void test_round_layout() {

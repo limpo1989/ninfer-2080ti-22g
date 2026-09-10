@@ -512,6 +512,13 @@ curl http://127.0.0.1:8080/v1/models \
 | `--seed N` | fixed seed when a request omits one | fresh random seed per request |
 | `--greedy` | force exact argmax for all requests | off |
 
+Capacity admission accounts for the prompt and the request's resolved output limit. A high
+`--default-max-tokens` can preserve maximum single-request capability, but clients should send an
+accurate `max_tokens` for each request so unused output headroom does not unnecessarily delay
+otherwise compatible concurrent work. Practical starting points are 4K–16K for ordinary tool work,
+16K–32K for typical long responses, and 128K only when that output length is actually required.
+This affects admission capacity only; it does not alter decoding before the limit is reached.
+
 Engine selects sampling defaults from the loaded model and the request's resolved thinking mode.
 Qwen3.6-27B and Qwen3.8-27B use `1.0/0.95/20/0/0` for
 temperature/top-p/top-k/min-p/presence penalty in thinking mode and `0.7/0.80/20/0/1.5` in

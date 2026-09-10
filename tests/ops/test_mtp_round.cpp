@@ -12,7 +12,8 @@ using namespace ninfer::test;
 
 namespace {
 
-int run_case(int k, const std::vector<std::int32_t>& accepted) {
+int run_case(int k, const std::vector<std::int32_t>& accepted, int frontier_base = 20,
+             int speculative_page_size = 0, int speculative_sink_tokens = 0) {
     const int batch           = static_cast<int>(accepted.size());
     const int T               = k + 1;
     constexpr int max_context = 128;
@@ -33,7 +34,7 @@ int run_case(int k, const std::vector<std::int32_t>& accepted) {
         anchors[static_cast<std::size_t>(b)]  = 90000 + 31 * b;
         licensed[static_cast<std::size_t>(b)] = accepted[static_cast<std::size_t>(b)] + 1;
         frontiers[static_cast<std::size_t>(b)] =
-            20 + 17 * b + licensed[static_cast<std::size_t>(b)];
+            frontier_base + 17 * b + licensed[static_cast<std::size_t>(b)];
         budgets[static_cast<std::size_t>(b)] =
             b == batch - 1 ? licensed[static_cast<std::size_t>(b)] : 12 - b;
         rope_deltas[static_cast<std::size_t>(b)] = 3 * b - 2;
@@ -52,6 +53,14 @@ int run_case(int k, const std::vector<std::int32_t>& accepted) {
             std::max(max_context - frontiers[static_cast<std::size_t>(b)] - 1, 0);
         expected_extents[static_cast<std::size_t>(b)] =
             std::min({k, budget_extent, context_extent});
+        if (speculative_page_size > 0 &&
+            frontiers[static_cast<std::size_t>(b)] >= speculative_sink_tokens) {
+            const int remaining = speculative_page_size -
+                                  frontiers[static_cast<std::size_t>(b)] % speculative_page_size;
+            expected_extents[static_cast<std::size_t>(b)] =
+                std::min(expected_extents[static_cast<std::size_t>(b)],
+                         remaining > 1 ? remaining - 2 : 0);
+        }
         for (int s = 0; s < steps; ++s) {
             const std::size_t offset   = static_cast<std::size_t>(s * batch + b);
             expected_positions[offset] = frontiers[static_cast<std::size_t>(b)] + s;
@@ -93,7 +102,8 @@ int run_case(int k, const std::vector<std::int32_t>& accepted) {
     Tensor t_valid(d_valid.data(), DType::I32, {batch, steps});
     ops::mtp_prepare_next_round(t_verify, t_anchors, t_accepted, t_frontiers, t_budgets, t_licensed,
                                 t_rope_deltas, t_alignment, t_extents, t_positions,
-                                t_rope_positions, t_valid, max_context, nullptr);
+                                t_rope_positions, t_valid, max_context, speculative_page_size,
+                                speculative_sink_tokens, nullptr);
     cuda_synchronize();
 
     const std::string label =
@@ -135,6 +145,7 @@ int main() {
     int failures = 0;
     failures += run_case(1, {0});
     failures += run_case(5, {0, 2, 5});
+    failures += run_case(5, {0}, 62, 64, 0);
 
     if (failures != 0) {
         std::cerr << "mtp_round failures=" << failures << '\n';

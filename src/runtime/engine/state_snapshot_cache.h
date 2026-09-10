@@ -31,10 +31,12 @@ public:
     ~StateSnapshotCache();
     StateSnapshotCache(const StateSnapshotCache&) = delete;
     StateSnapshotCache& operator=(const StateSnapshotCache&) = delete;
+    [[nodiscard]] bool contains(const std::string& key) const;
+    [[nodiscard]] bool can_store(std::size_t payload_bytes,
+                                 std::size_t metadata_bytes) const noexcept;
     [[nodiscard]] bool put(std::shared_ptr<const StateSnapshotImage> image);
     [[nodiscard]] StateSnapshotLoad lookup(const std::vector<std::string>& aliases);
     void flush();
-    [[nodiscard]] std::size_t ram_limit() const noexcept;
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

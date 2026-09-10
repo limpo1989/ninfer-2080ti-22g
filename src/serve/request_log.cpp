@@ -403,7 +403,6 @@ std::string format_request_done(const RequestLogContext& context,
         << " wall=" << seconds_str(metrics.total_seconds)
         << " state_source=" << (metrics.state_cache_source == 1 ? "ram" : metrics.state_cache_source == 2 ? "disk" : "resident")
         << " restore=" << seconds_str(metrics.state_restore_seconds)
-        << " snapshot=" << seconds_str(metrics.state_save_seconds)
         << " speculative=" << speculative_str(metrics);
     return out.str();
 }

@@ -49,6 +49,8 @@ void mtp_prepare_next_round(const Tensor& verify_ids, const Tensor& next_anchors
                             const Tensor& rope_deltas, Tensor& alignment_ids, Tensor& next_extents,
                             Tensor& ar_positions, Tensor& ar_rope_positions,
                             Tensor& ar_valid_columns, std::int32_t max_context,
+                            std::int32_t speculative_page_size,
+                            std::int32_t speculative_sink_tokens,
                             cudaStream_t stream) {
     constexpr const char* op = "mtp_prepare_next_round";
     const std::int32_t T     = verify_ids.ne[0];
@@ -59,6 +61,12 @@ void mtp_prepare_next_round(const Tensor& verify_ids, const Tensor& next_anchors
     if (batch < 1) { throw std::invalid_argument("mtp_prepare_next_round: B must be positive"); }
     if (max_context <= 0) {
         throw std::invalid_argument("mtp_prepare_next_round: max_context must be positive");
+    }
+    if (speculative_page_size < 0 || speculative_sink_tokens < 0 ||
+        (speculative_page_size == 0 && speculative_sink_tokens != 0) ||
+        (speculative_page_size != 0 &&
+         speculative_sink_tokens % speculative_page_size != 0)) {
+        throw std::invalid_argument("mtp_prepare_next_round: invalid speculative page controls");
     }
     require_matrix(verify_ids, DType::I32, T, batch, op, "verify_ids");
     require_vector(next_anchors, DType::I32, batch, op, "next_anchors");
@@ -81,7 +89,8 @@ void mtp_prepare_next_round(const Tensor& verify_ids, const Tensor& next_anchors
     detail::mtp_prepare_next_round_launch(verify_ids, next_anchors, accepted, updated_frontiers,
                                           remaining_budgets, licensed_counts, rope_deltas,
                                           alignment_ids, next_extents, ar_positions,
-                                          ar_rope_positions, ar_valid_columns, max_context, stream);
+                                          ar_rope_positions, ar_valid_columns, max_context,
+                                          speculative_page_size, speculative_sink_tokens, stream);
 }
 
 } // namespace ninfer::ops

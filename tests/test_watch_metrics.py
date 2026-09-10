@@ -27,6 +27,7 @@ class WatchMetricsTest(unittest.TestCase):
         self.assertEqual(row.values, ["12:00:00", "25000/500", "3.00s", "1.50s", "4.8s",
                                       "333.3", "25.0", "1000", "98%", "70.0%", "44.76s", "max_tokens"])
         self.assertIn("Think=800", row.detail)
+        self.assertNotIn("Snapshot", row.detail)
         self.assertNotIn("Think=800", "\n".join(row_lines(row, 160, False)))
         self.assertIn("Think=800", "\n".join(row_lines(row, 160, True)))
 

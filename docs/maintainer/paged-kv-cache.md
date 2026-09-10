@@ -372,9 +372,10 @@ KVarN bytes/token
     = L * H * (kvarn_record_bytes(D, format) / P)
 ```
 
-KVarN 另有一块与 `max_context` 无关的固定 stage 开销
-`2(K,V) * L * H * D * kKvarnStageTokens * table_rows * 2`，它不属于任何 pool；因此 KVarN 相对 BF16 的
-容量优势随 `max_context` 单调变好。
+KVarN 另有两块与 `max_context` 无关的固定 stage 开销：current sink/tail 为
+`2(K,V) * L * H * D * kKvarnStageTokens * table_rows * 2`，rewrite checkpoint tail 为
+`2(K,V) * L * H * D * P * table_rows * 2`。它们都不属于 growing pool；因此 KVarN 相对 BF16 的
+容量优势仍随 `max_context` 单调变好。
 
 一个 homogeneous pool 的 logical page-group payload 是其全部 grouped planes 的 bytes/token 之和乘以
 该 pool 的 `P`。Startup physical pool bytes 则由 registered plane storage spans 之和再加 slab/head
@@ -767,8 +768,9 @@ Qwen3.6 retained sequence 包含：
 - position/model-continuation metadata；
 - 与上述状态一致的 prefix identity。
 
-Current resume frontier 和 rewrite checkpoint 引用同一个 exclusively owned KV bundle；checkpoint 不是第二份
-KV allocation。Incoming prompt 的复用路径为：
+Current resume frontier 和 rewrite checkpoint 引用同一个 exclusively owned growing KV bundle；checkpoint
+不是第二份 KV allocation。KVarN 另外保存 checkpoint 时刻的一份固定 BF16 tail page，因为 current tail
+跨过下一个 record boundary 后会被循环覆盖。Incoming prompt 的复用路径为：
 
 - prompt 正好结束在 current resume frontier，且 decode anchor 完整时，直接成为 decode-ready；
 - prompt 完整包含 current resume frontier 并有 suffix 时，从该 frontier prefill suffix；
@@ -805,7 +807,8 @@ allocations，使相应 IDs 不属于各自 free sets；不需要 page refcount 
 
 选择 rewrite checkpoint 时，claim transaction 保留包含 checkpoint frontier 的最后一个部分 page，并把其后的完整
 pages 返回各自 pool；随后各 pool 的 exact frontier 和 fixed continuation state 一起切换到该 checkpoint。
-该过程不复制 retained KV payload。
+BF16/INT8 不复制 retained KV payload；KVarN 把固定 checkpoint tail 复制回 current stage，避免后来 block
+覆盖的 tail 被当成 checkpoint prefix。
 
 多个 active requests 不从同一 retained bundle 分叉。若未来产品需要同一大 prefix 同时 fan-out，必须
 连同 Linear Attention/backend state branching 一起重新设计；仅共享 Main Text pages 不能形成完整
@@ -831,7 +834,9 @@ backend pool 获取，只是与 Main Text pool 物理分离。
 ```
 
 不同 requests 接受不同 proposal length，只改变各自 bundle frontiers，不形成新的 pool type。Rejected
-bytes 可以留在部分尾页；后续 append 在它们重新变为 valid 前必须完整覆盖对应 code 和 scale planes。
+bytes 可以留在部分尾页；后续 append 在它们重新变为 valid 前必须完整覆盖。KVarN record 一旦压缩便不能
+原位回滚，因此 MTP 在每个 record boundary 前收窄 current/next draft extent：未确认列不能完成一页，页尾
+最后一个 token 由必提交的 target column 写入，越过边界后恢复完整 draft window。
 
 KV Store 不理解 proposal、verify 或 acceptance，也不推导 Main Text、MTP 与 DFlash frontiers 之间的
 关系。Target 把每个 pool 的最终 frontier 作为 transaction result 提交。

@@ -413,7 +413,6 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.metrics.prepare_seconds = prepared.prepare_seconds;
     outcome.metrics.queue_seconds   = result.timings.queue_seconds;
     outcome.metrics.state_restore_seconds = result.timings.state_restore_seconds;
-    outcome.metrics.state_save_seconds = result.timings.state_save_seconds;
     outcome.metrics.state_cache_source = result.timings.state_cache_source;
     outcome.metrics.ttft_seconds =
         prepared.prepare_seconds +

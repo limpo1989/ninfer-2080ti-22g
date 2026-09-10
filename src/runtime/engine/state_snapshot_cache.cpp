@@ -220,13 +220,24 @@ StateSnapshotCache::StateSnapshotCache(std::filesystem::path directory, std::siz
                                      std::size_t ram_bytes, std::string compatibility)
     : impl_(std::make_unique<Impl>(std::move(directory), disk_bytes, ram_bytes, std::move(compatibility))) {}
 StateSnapshotCache::~StateSnapshotCache() = default;
-std::size_t StateSnapshotCache::ram_limit() const noexcept { return impl_->ram_limit; }
+bool StateSnapshotCache::contains(const std::string& key) const {
+    std::lock_guard lock(impl_->mutex);
+    return impl_->entries.contains(key);
+}
+bool StateSnapshotCache::can_store(std::size_t payload_bytes,
+                                   std::size_t metadata_bytes) const noexcept {
+    if (payload_bytes > impl_->ram_limit || metadata_bytes > impl_->ram_limit - payload_bytes) {
+        return false;
+    }
+    const std::size_t image_bytes = payload_bytes + metadata_bytes;
+    return sizeof(Header) <= impl_->disk_limit && image_bytes <= impl_->disk_limit - sizeof(Header);
+}
 bool StateSnapshotCache::put(std::shared_ptr<const StateSnapshotImage> image) {
     if (!image || !valid_key(image->key)) return false;
     std::lock_guard lock(impl_->mutex);
     if (impl_->entries.contains(image->key)) return true;
     const auto size = image->payload.size() + image->metadata.size();
-    if (size + sizeof(Header) > impl_->disk_limit || !impl_->reserve_ram(size)) return false;
+    if (!can_store(image->payload.size(), image->metadata.size()) || !impl_->reserve_ram(size)) return false;
     auto e = std::make_shared<Impl::Entry>();
     e->descriptor = {image->key, image->aliases, image->metadata, {}};
     e->image = std::move(image); e->dirty = true;
@@ -249,10 +260,16 @@ StateSnapshotLoad StateSnapshotCache::lookup(const std::vector<std::string>& ali
         if (entry == impl_->entries.end()) continue;
         auto e = entry->second;
         impl_->lru.splice(impl_->lru.begin(), impl_->lru, e->lru);
-        if (e->loading.result.valid() && !e->loading.ready()) return e->loading;
+        const auto frontier =
+            static_cast<std::uint32_t>(std::stoul(alias.substr(0, alias.find('-'))));
+        if (e->loading.result.valid() && !e->loading.ready()) {
+            StateSnapshotLoad ticket = e->loading;
+            ticket.frontier = frontier;
+            return ticket;
+        }
         auto promise = std::make_shared<std::promise<std::shared_ptr<const StateSnapshotImage>>>();
         StateSnapshotLoad ticket{promise->get_future().share(), e->image ? "ram" : "disk",
-                                 static_cast<std::uint32_t>(std::stoul(alias.substr(0, alias.find('-'))))};
+                                 frontier};
         if (e->image) { promise->set_value(e->image); return ticket; }
         if (!e->disk) continue;
         const auto size = e->descriptor.header.payload_bytes + e->descriptor.metadata.size();

@@ -234,7 +234,8 @@ public:
     [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
     void evict_retained_lane(std::uint32_t lane) noexcept;
     void configure_state_cache(const EngineOptions& options);
-    [[nodiscard]] runtime::StateSnapshotLoad lookup_state(const PreparedPromptData& prompt);
+    [[nodiscard]] runtime::StateSnapshotLoad lookup_state(const PreparedPromptData& prompt,
+                                                          std::uint32_t minimum_frontier);
     [[nodiscard]] bool restore_state(std::uint32_t lane, const PreparedPromptData& prompt,
                                     const runtime::StateSnapshotImage& image) noexcept;
     void save_state(std::uint32_t lane) noexcept;

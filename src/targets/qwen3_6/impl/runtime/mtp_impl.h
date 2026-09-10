@@ -146,6 +146,8 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                                     licensed_counts, rope_deltas, alignment_ids, next_extents,
                                     ar_positions, ar_rope_positions, ar_valid_columns,
                                     static_cast<std::int32_t>(state.text_cache.max_context()),
+                                    state.text_cache.kvarn() ? kPagedKVPageSize : 0,
+                                    state.text_cache.kvarn() ? kKvarnSinkTokens : 0,
                                     state.execution.device.stream);
         card.mtp_forward_decode_batch(alignment_ids, target_hidden, target_positions, target_rope,
                                       licensed_counts, mtp_rows, envelopes.batch, alignment_hidden);

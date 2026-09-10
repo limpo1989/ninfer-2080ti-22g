@@ -18,16 +18,27 @@ int main() {
     try {
         {
             StateSnapshotCache cache(root, 10000, 1500, "model-a");
-            check(cache.put(image("abc", 1000, 0x5a)), "store failed"); cache.flush();
+            check(cache.can_store(1000, 3), "valid image rejected by capacity preflight");
+            check(!cache.can_store(1500, 1), "oversize RAM image passed capacity preflight");
+            check(!cache.contains("abc"), "missing key reported present");
+            auto abc = image("abc", 1000, 0x5a);
+            abc->aliases.push_back("200-abc");
+            check(cache.put(std::move(abc)), "store failed"); cache.flush();
+            check(cache.contains("abc"), "stored key reported missing");
+            check(cache.put(image("abc", 1000, 0xa5)), "duplicate store failed");
+            check(cache.lookup({"100-abc"}).result.get()->payload[10] == 0x5a,
+                  "duplicate store replaced immutable image");
             auto hit = cache.lookup({"100-abc"});
             check(hit.source == "ram" && hit.ready() && hit.result.get()->payload[10] == 0x5a, "RAM hit failed");
             hit = {};
             check(cache.put(image("def", 1000, 0xa5)), "RAM eviction failed"); cache.flush();
             auto disk = cache.lookup({"100-abc"});
-            auto same = cache.lookup({"100-abc"});
+            auto same = cache.lookup({"200-abc"});
             check(disk.source == "disk" && disk.result.get()->payload == image("abc",1000,0x5a)->payload,
                   "disk reload after RAM eviction failed");
             check(same.result.get() == disk.result.get(), "concurrent aliases did not share one immutable load");
+            check(disk.frontier == 100 && same.frontier == 200,
+                  "shared load did not preserve the matched alias frontier");
             check(!cache.put(image("bad", 2000, 1)), "oversize RAM accepted");
         }
         {

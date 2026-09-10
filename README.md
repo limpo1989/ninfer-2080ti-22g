@@ -23,13 +23,13 @@ An **8,201-token** continuation built from a recorded DeepSeek Harness request p
 
 | State available | Time to first token | Tokens requiring prefill | Reused input |
 |---|---:|---:|---:|
-| No reusable state; full recomputation | 42.289s | 8,201 | 0% |
-| **Disk snapshot after process restart** | **1.907s** | **28** | **99.66%** |
-| **RAM snapshot after the GPU slot was overwritten** | **0.892s** | **28** | **99.66%** |
-| GPU-resident reference | 0.811s | 28 | 99.66% |
+| No reusable state; full recomputation | 42.123s | 8,201 | 0% |
+| **Disk snapshot after process restart** | **1.727s** | **28** | **99.66%** |
+| **RAM snapshot after the GPU slot was overwritten** | **0.890s** | **28** | **99.66%** |
+| GPU-resident reference | 0.815s | 28 | 99.66% |
 
-**Disk recovery cut first-token waiting by 95.5% (22.2×), saving 40.38 seconds per tested
-continuation.** RAM recovery reduced the same wait by 47.4×. Both restored 8,173 input tokens.
+**Disk recovery cut first-token waiting by 95.9% (24.4×), saving 40.40 seconds per tested
+continuation.** RAM recovery reduced the same wait by 47.3×. Both restored 8,173 input tokens.
 The approximately 426 MiB restored state was verified byte for byte, and all 64 generated tokens
 matched the GPU-resident reference. State retains its existing numeric formats without additional
 quantization or recompression.
@@ -52,8 +52,9 @@ The deployment launcher enables **4 GiB RAM + 8 GiB disk** by default, allocatin
   --state-cache-dir /path/to/ssd/ninfer-state \
   --state-cache-ram-mib 8192 --state-cache-max-mib 32768
 
-# Inspect RAM/disk restore source, GPU upload time, and snapshot capture time.
+# Inspect RAM/disk restore source and GPU upload time; capture timing is in the service log.
 ./deploy/restart-ninfer.sh watch --details
+./deploy/restart-ninfer.sh logs
 ```
 
 The same cache flags are available on `ninfer-serve`; direct launches require an explicit directory
@@ -61,9 +62,9 @@ and positive disk budget. Set `--state-cache-max-mib 0` to disable state caching
 service, pass the same overrides when opening watch so its configuration header reflects them.
 
 Disk reads, checksums, and durable writes run on a dedicated I/O worker. Capturing the tested state
-to RAM took 0.46–0.51s after generation, and GPU upload took about 0.08–0.09s; these transfers briefly
-occupy the inference worker. The measured benefit is reduced prefill waiting. Concurrent tail
-latency has not yet been measured.
+to RAM took 0.46–0.51s after result publication, and GPU upload took about 0.08–0.09s. Capture and
+upload briefly occupy the inference worker. The measured benefit is reduced prefill waiting;
+concurrent tail latency has not yet been measured.
 
 This first version supports **text with ordinary decode or MTP**. Clients resend conversation
 history after restart; public `previous_response_id` records and tool-format replay metadata remain
@@ -97,7 +98,7 @@ On an RTX 2080 Ti 22GB (~22,528 MiB addressable), available device memory is all
 - **INT8 Group-64 (`--kv-dtype int8`)**: Consumes **33.0 KiB per token**, halving KV memory footprint relative to BF16.
 - **KVarN (`--kv-dtype kvarn`, 4-bit key / 2-bit value)**: Consumes **13.9 KiB per token**, ~4.6x smaller than BF16. `--kv-dtype kvarn-k4v4` (4-bit value) costs 17.9 KiB per token.
 
-KVarN keeps each sequence's first 128 positions and its still-filling tail page unquantized in BF16 and compresses every complete 64-token page into one structured record, so the extra fixed cost is independent of `--max-context` and its advantage grows with context length. It is a **capacity** format first: decode is marginally faster than BF16, and prefill is slower, though the Q-tiled prefill kernel closed most of that gap — on a 31K-token prompt KVarN prefill went from 0.59x BF16 to 0.85x (2.9x on the KVarN attention Op itself). `--spec dflash` is not supported under KVarN; `--spec mtp` is.
+KVarN keeps each sequence's first 128 positions and its still-filling tail page unquantized in BF16 and compresses every complete 64-token page into one structured record, so the extra fixed cost is independent of `--max-context` and its advantage grows with context length. One additional BF16 tail page per lane preserves exact rewrite-checkpoint state. MTP temporarily shortens its speculative window immediately before record boundaries so rejected drafts can never publish an irreversible compressed page. It is a **capacity** format first: decode is marginally faster than BF16, and prefill is slower, though the Q-tiled prefill kernel closed most of that gap — on a 31K-token prompt KVarN prefill went from 0.59x BF16 to 0.85x (2.9x on the KVarN attention Op itself). `--spec dflash` is not supported under KVarN; `--spec mtp` is.
 
 ### 2. Context Limits & Concurrency
 
@@ -438,6 +439,12 @@ capacity, and `default-max-tokens=131072`. On the 22,528 MiB card this uses abou
 startup while retaining about 220 MiB of planner slack. Paths and sizing remain overridable through
 the `NINFER_MODEL`, `NINFER_BIN`, `NINFER_MAX_CONTEXT`, `NINFER_KV_CAPACITY`, and
 `NINFER_DEFAULT_MAX_TOKENS` environment variables.
+The 131,072-token default preserves the server's maximum single-request capability. Clients should
+still send the smallest accurate per-request `max_tokens`: 4K–16K for ordinary tool work, 16K–32K
+for typical long answers, and 128K only when that much output is genuinely required. Admission
+accounts for the declared output budget as well as the prompt, so an unnecessarily large value can
+keep an otherwise compatible second request queued. This changes capacity planning, not model
+quality, unless generation actually reaches the requested limit.
 `NINFER_PREFILL_CHUNK` and `NINFER_DRAFT_TOKENS` override the prefill chunk and MTP window for
 controlled experiments. The script leaves `preserve_thinking` off by default.
 The launcher also accepts `--tool-replay-cache-mib N`, for example
@@ -452,7 +459,11 @@ disables this feature. Direct `ninfer-serve` launches leave it disabled unless a
 positive disk budget are supplied.
 
 Completed text requests with at least 256 retained tokens can capture immutable continuation
-images (Main/MTP KV, KVarN stages, current/checkpoint GDN state, hidden state and prefix identity).
+images (Main/MTP KV, current and checkpoint KVarN stages, current/checkpoint GDN state, hidden
+state and prefix identity).
+The final result is published before capture begins, so snapshot copying no longer extends that
+request's reported Wall time. An identical state already present in RAM or on disk is detected
+before any GPU-to-host copy.
 Capture and upload synchronize on the compute stream and briefly occupy the GPU worker. Payload
 reads, checksums, writes, fsync and atomic publication run on a separate I/O worker. RAM includes
 pending writes; pressure evicts clean images or skips new captures instead of blocking for disk.
@@ -464,16 +475,19 @@ execution; Vision and DFlash configurations reject enabling state caching.
 Cache directories are separated by artifact and executable file identity, storage configuration
 and template. Rebuilding the executable or replacing weights invalidates old namespaces; budgets
 apply to the current namespace. Old incompatible namespaces are retained for manual removal.
-Startup reads descriptors only. Requests search exact token-prefix aliases, retain the existing
-GPU match when it is at least as long, and otherwise request an asynchronous RAM/disk restore.
+Startup reads descriptors only. Once a request has an admissible free lane, it compares the exact
+GPU-resident prefix first. It starts an asynchronous RAM/disk load only when a stored prefix is
+longer, avoiding disk materialization for an equal or better GPU hit.
 Recoverable cache corruption falls back to normal prefill. New physical pages and mappings are
 allocated on restore, leaving CUDA Graph addresses stable. The disk cache does not persist public
 Responses IDs: after restart clients must resend their history. Tool-format replay metadata is
 also process-local, so normalized tool history may still reduce the reusable suffix.
 
-`watch --details` shows `State`, GPU upload time (`Restore`), and capture time (`Snapshot`).
-Disk-read waiting is included in Queue; upload occurs after admission and is included in TTFB;
-capture is included in Wall. These are not decode-throughput improvements. The opt-in
+`watch --details` shows `State` and GPU upload time (`Restore`). Disk-read waiting is included in
+Queue; upload occurs after admission and is included in TTFB. Wall ends when the final result is
+published. The following capture is reported separately as a `[state-cache] capture` service-log
+line; it can still pause other active inference while copying from the GPU. These are not
+decode-throughput improvements. The opt-in
 `ninfer_state_cache_bench MODEL REQUEST_JSON CACHE_DIR FIXTURE_JSON MODE` exercises the actual
 Responses translation and public Engine with `seed`, `resident`, `ram`, `disk`, and `cold` modes.
 `disk` checks the generated tokens against the `resident` reference. Set
