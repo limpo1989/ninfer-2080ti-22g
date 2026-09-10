@@ -168,6 +168,19 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
             message.tool_calls.push_back(ninfer::ToolCall{call.id, call.name, call.arguments_json});
         }
 
+        // Keep the exact generated XML and body separators when the Responses
+        // replay cache has verified that every public field is unchanged.
+        // The request retains structured calls for validation and tool history.
+        if (turn.replay_content && turn.role == ChatRole::Assistant && !turn.tool_calls.empty() &&
+            (!turn.reasoning_content.empty() || turn.replay_content->find("</think>") == std::string::npos)) {
+            message.tool_calls.clear();
+            ninfer::MessagePart text;
+            text.text = *turn.replay_content;
+            message.parts.push_back(std::move(text));
+            input.messages.push_back(std::move(message));
+            continue;
+        }
+
         for (const ContentPart& part : turn.content) {
             if (part.kind == ContentKind::Text) {
                 if (!message.parts.empty() && !part.text.empty() &&

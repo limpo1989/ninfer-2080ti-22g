@@ -159,6 +159,19 @@ bool prefix_matches(const PreparedPromptData& prompt, const std::vector<TokenId>
                          count, prompt.token_ids.size(),
                          static_cast<std::size_t>(mismatch.first - prompt.token_ids.begin()),
                          *mismatch.first, *mismatch.second);
+            if (count + 1 == resident_tokens.size()) {
+                const auto position = static_cast<std::size_t>(mismatch.first - prompt.token_ids.begin());
+                const auto begin = position > 3 ? position - 3 : 0;
+                std::fprintf(stderr, "[prefix-window] start=%zu incoming=", begin);
+                for (auto i = begin; i < std::min(prompt.token_ids.size(), position + 6); ++i) {
+                    std::fprintf(stderr, "%d,", prompt.token_ids[i]);
+                }
+                std::fprintf(stderr, " resident=");
+                for (auto i = begin; i < std::min(resident_tokens.size(), position + 6); ++i) {
+                    std::fprintf(stderr, "%d,", resident_tokens[i]);
+                }
+                std::fprintf(stderr, "\n");
+            }
         }
         return false;
     }

@@ -106,6 +106,12 @@ void gqa_one(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& po
     }
 
     const std::int32_t chunk = query_columns > 0 ? kvarn_attention_chunk_columns(query_columns) : 1;
+    static const bool partial_carveout = [] {
+        cudaFuncSetAttribute(kvarn_gqa_partial_kernel<Spec, Geometry>,
+                             cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+        return true;
+    }();
+    (void)partial_carveout;
     // The split count and the partial stride are properties of the whole call, not of one chunk:
     // the wrapper sized the workspace from them, and a short trailing chunk must not re-derive
     // a larger split count and write past it.

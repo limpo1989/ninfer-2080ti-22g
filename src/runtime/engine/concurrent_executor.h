@@ -285,6 +285,7 @@ private:
         ResolvedRequestOptions options;
         Clock::time_point deadline;
         Clock::time_point submitted;
+        std::optional<Clock::time_point> admitted;
         std::optional<Clock::time_point> first_token;
         std::optional<GenerationBudget> budget;
         std::optional<BeginSummary> begin;
@@ -438,6 +439,10 @@ private:
             result.timings.prepare_seconds = request->prepare_seconds;
             result.speculative = instance_.program->speculative_stats_lane(*request->lane);
         }
+        const auto completed = Clock::now();
+        result.timings.queue_seconds =
+            std::chrono::duration<double>(request->admitted.value_or(completed) -
+                                           request->submitted).count();
         if (request->first_token) {
             result.timings.first_token_seconds =
                 request->prepare_seconds +
@@ -445,7 +450,7 @@ private:
         }
         result.timings.total_seconds =
             request->prepare_seconds +
-            std::chrono::duration<double>(Clock::now() - request->submitted).count();
+            std::chrono::duration<double>(completed - request->submitted).count();
         {
             std::lock_guard lock(request->mutex);
             if (request->done) { return; }
@@ -780,6 +785,7 @@ private:
         Plan selected_plan = std::move(*request->lane_plans[lane]);
         request->lane_plans[lane].reset();
         if (!erase_pending(request)) { return AdmissionProgress::None; }
+        request->admitted = Clock::now();
         release_planning_state(request);
 
         const RequestPlanSummary summary = selected_plan.summary();

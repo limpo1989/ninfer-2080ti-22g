@@ -10,6 +10,7 @@ namespace {
 
 std::size_t estimate_turn_bytes(const ChatTurn& turn) {
     std::size_t bytes = sizeof(ChatTurn) + turn.tool_call_id.size() + turn.reasoning_content.size();
+    if (turn.replay_content) { bytes += turn.replay_content->size(); }
     for (const ContentPart& part : turn.content) {
         bytes += sizeof(ContentPart) + part.text.size() + part.type_raw.size() +
                  part.source.value.size() + part.source.media_type.size() +
@@ -27,6 +28,12 @@ std::size_t record_envelope_bytes(const StoredResponse& record) {
         bytes += sizeof(nlohmann::json) + item.dump().size();
     }
     return bytes;
+}
+
+std::size_t estimate_tool_replay_bytes(const ChatTurn& turn) {
+    return estimate_turn_bytes(turn) + turn.tool_calls.front().id.size() +
+           sizeof(std::pair<const std::string, std::list<ChatTurn>::iterator>) +
+           3 * sizeof(void*);
 }
 
 std::size_t standalone_bytes(const StoredResponse& record) {
@@ -72,8 +79,10 @@ std::vector<ChatTurn> flatten_response_context(const ResponseContext& context) {
     return turns;
 }
 
-ResponseStore::ResponseStore(std::size_t max_records, std::size_t max_bytes)
-    : max_records_(max_records), max_bytes_(max_bytes) {
+ResponseStore::ResponseStore(std::size_t max_records, std::size_t max_bytes,
+                             std::size_t tool_replay_max_bytes)
+    : max_records_(max_records), max_bytes_(max_bytes),
+      tool_replay_max_bytes_(tool_replay_max_bytes) {
     if (max_records_ == 0 || max_bytes_ == 0) {
         throw std::invalid_argument("response store limits must be positive");
     }
@@ -121,6 +130,59 @@ bool ResponseStore::erase(const std::string& id) {
     erase_locked(id);
     current_bytes_ = recompute_bytes_locked();
     return true;
+}
+
+void ResponseStore::remember_tool_output(const ChatTurn& turn) {
+    if (!turn.replay_content || turn.tool_calls.empty()) { return; }
+    const auto bytes = estimate_tool_replay_bytes(turn);
+    if (bytes > tool_replay_max_bytes_) { return; }
+    std::lock_guard lock(mutex_);
+    tool_replays_.push_front(turn);
+    try {
+        const auto [entry, inserted] =
+            tool_replay_index_.try_emplace(turn.tool_calls.front().id, tool_replays_.begin());
+        if (!inserted) {
+            const auto previous = entry->second;
+            entry->second = tool_replays_.begin();
+            tool_replay_bytes_ -= estimate_tool_replay_bytes(*previous);
+            tool_replays_.erase(previous);
+        }
+    } catch (...) {
+        tool_replays_.pop_front();
+        throw;
+    }
+    tool_replay_bytes_ += bytes;
+    while (tool_replay_bytes_ > tool_replay_max_bytes_) {
+        tool_replay_bytes_ -= estimate_tool_replay_bytes(tool_replays_.back());
+        tool_replay_index_.erase(tool_replays_.back().tool_calls.front().id);
+        tool_replays_.pop_back();
+    }
+}
+
+void ResponseStore::restore_tool_outputs(std::vector<ChatTurn>& turns) {
+    std::lock_guard lock(mutex_);
+    for (auto& turn : turns) {
+        if (turn.role != ChatRole::Assistant || turn.tool_calls.empty() || turn.replay_content ||
+            turn.content.size() > 1 ||
+            (!turn.content.empty() && turn.content.front().kind != ContentKind::Text)) { continue; }
+        const auto entry = tool_replay_index_.find(turn.tool_calls.front().id);
+        if (entry == tool_replay_index_.end()) { continue; }
+        const auto found = entry->second;
+        if (found->tool_calls.size() != turn.tool_calls.size() ||
+            found->reasoning_content != turn.reasoning_content || found->content.size() != turn.content.size() ||
+            (!turn.content.empty() && found->content.front().text != turn.content.front().text)) { continue; }
+        bool same = true;
+        for (std::size_t i = 0; i < turn.tool_calls.size(); ++i) {
+            const auto& incoming = turn.tool_calls[i];
+            const auto& saved = found->tool_calls[i];
+            if (incoming.id != saved.id || incoming.name != saved.name ||
+                nlohmann::json::parse(incoming.arguments_json) != nlohmann::json::parse(saved.arguments_json)) {
+                same = false;
+                break;
+            }
+        }
+        if (same) { turn.replay_content = found->replay_content; }
+    }
 }
 
 std::size_t ResponseStore::size() const {

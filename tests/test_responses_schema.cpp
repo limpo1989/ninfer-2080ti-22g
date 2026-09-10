@@ -609,10 +609,21 @@ int test_input_tokens_schema() {
     failures +=
         check(api_code([&] {
                   (void)parse_response_input_tokens_request(
-                      Json{{"model", "qwen3.6-27b"}, {"input", "hello"}, {"instructions", "x"}},
+                      Json{{"model", "qwen3.6-27b"}, {"input", "hello"}, {"stream", true}},
                       limits());
               }) == "unknown_parameter",
-              "input_tokens accepts only model and input");
+              "input_tokens rejects generation-only options");
+    const auto with_tools = parse_response_input_tokens_request(
+        Json{{"model", "qwen3.6-27b"}, {"input", "hello"}, {"instructions", "Use tools."},
+             {"tools", Json::array({Json{{"type", "function"}, {"name", "lookup"},
+                 {"parameters", Json{{"type", "object"}, {"properties", Json::object()}}}}})},
+             {"reasoning", Json{{"effort", "low"}}}}, limits());
+    failures += check(with_tools.generation.tools.size() == 1 &&
+                          with_tools.instructions == "Use tools." &&
+                          with_tools.generation.messages.size() == 2 &&
+                          with_tools.generation.messages.front().content.front().text == "Use tools." &&
+                          with_tools.generation.reasoning_effort.has_value(),
+                      "input_tokens retains tool schemas and prompt-affecting options");
     return failures;
 }
 

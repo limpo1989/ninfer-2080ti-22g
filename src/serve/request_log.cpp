@@ -392,9 +392,12 @@ std::string format_request_done(const RequestLogContext& context,
         << (outcome.tool_calls.empty() ? finish_reason_name(outcome.finish_reason) : "tool_calls");
     if (!outcome.tool_calls.empty()) { out << " tool_calls=" << outcome.tool_calls.size(); }
     out << " prompt=" << outcome.prompt_tokens << " gen=" << outcome.completion_tokens
+        << " think=" << outcome.reasoning_tokens
         << " cache=" << metrics.prefix_cache_hit_tokens
         << " reuse=" << prefix_reuse_path_name(metrics.prefix_reuse_path) << " ttft=" << std::fixed
         << std::setprecision(0) << ttft_ms << "ms"
+        << " queue=" << seconds_str(metrics.queue_seconds)
+        << " prefill_time=" << seconds_str(metrics.prefill_seconds)
         << " prefill=" << rate(computed_prefill_tokens, metrics.prefill_seconds)
         << " decode=" << rate(decode_tokens, metrics.decode_seconds)
         << " wall=" << seconds_str(metrics.total_seconds)
@@ -556,9 +559,10 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
              {"prefix_reuse_path", prefix_reuse_path_name(outcome.metrics.prefix_reuse_path)},
              {"tool_call_count", outcome.tool_calls.size()}};
     record["timings_seconds"] = Json{
-        {"prepare", outcome.metrics.prepare_seconds}, {"ttft", outcome.metrics.ttft_seconds},
-        {"vision", outcome.metrics.vision_seconds},   {"prefill", outcome.metrics.prefill_seconds},
-        {"decode", outcome.metrics.decode_seconds},   {"total", outcome.metrics.total_seconds}};
+        {"prepare", outcome.metrics.prepare_seconds}, {"queue", outcome.metrics.queue_seconds},
+        {"ttft", outcome.metrics.ttft_seconds},       {"vision", outcome.metrics.vision_seconds},
+        {"prefill", outcome.metrics.prefill_seconds}, {"decode", outcome.metrics.decode_seconds},
+        {"total", outcome.metrics.total_seconds}};
     record["speculative"] = speculative_json(outcome.metrics);
     return record.dump();
 }

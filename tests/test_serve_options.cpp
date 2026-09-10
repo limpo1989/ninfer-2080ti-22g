@@ -2,6 +2,7 @@
 #include "serve/translate.h"
 
 #include <iostream>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -49,6 +50,8 @@ int main() {
     failures += check(defaults.response_store_max_records == kDefaultResponseStoreRecords &&
                           defaults.response_store_max_bytes == kDefaultResponseStoreBytes,
                       "Responses store defaults mismatch");
+    failures += check(defaults.tool_replay_cache_bytes == (1024ULL << 20),
+                      "tool replay cache must default to 1 GiB");
     failures += check(!defaults.model_id_override.has_value(),
                       "model id override is unexpectedly configured by default");
     failures += check(
@@ -145,6 +148,19 @@ int main() {
     failures += check(response_store.response_store_max_records == 42 &&
                           response_store.response_store_max_bytes == (8ULL << 20),
                       "Responses store limits did not reach serving options");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--tool-replay-cache-mib", "2048"})
+                          .tool_replay_cache_bytes == (2048ULL << 20),
+                      "tool replay cache byte budget did not reach serving options");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--tool-replay-cache-mib", "0"})
+                          .tool_replay_cache_bytes == 0,
+                      "zero must disable the tool replay cache");
+    for (const char* invalid : {"-1", "bad", "18446744073709551615"}) {
+        bool rejected = false;
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", "--tool-replay-cache-mib", invalid});
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "invalid tool replay cache budget was accepted");
+    }
 
     const ServeOptions sampling =
         parse({"ninfer-serve", "model.ninfer", "--temperature", "0", "--top-p", "0.9", "--top-k",

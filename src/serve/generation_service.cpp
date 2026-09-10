@@ -408,6 +408,7 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.finish_reason     = result.finish_reason;
 
     outcome.metrics.prepare_seconds = prepared.prepare_seconds;
+    outcome.metrics.queue_seconds   = result.timings.queue_seconds;
     outcome.metrics.ttft_seconds =
         prepared.prepare_seconds +
         std::max(0.0, result.timings.first_token_seconds - result.timings.prepare_seconds);
@@ -432,6 +433,10 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     if (prepared.tool_capable) {
         ParsedToolCallOutput parsed =
             parse_qwen_tool_call_output(outcome.text, prepared.tool_name_max_length);
+        if (parsed.is_tool_call_response && options_.chat_style == ChatStyle::Default &&
+            options_.chat_template_path.empty()) {
+            outcome.raw_tool_content = outcome.text;
+        }
         outcome.text          = std::move(parsed.content);
         is_tool_call_response = parsed.is_tool_call_response;
         if (is_tool_call_response) { outcome.tool_calls = std::move(parsed.tool_calls); }

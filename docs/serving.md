@@ -54,6 +54,10 @@ cannot be combined with `--vision`. A later request cannot enable a capability o
 | `POST /v1/messages` | Anthropic-style message generation |
 | `POST /v1/messages/count_tokens` | checkpoint-native expanded input-token count |
 
+Responses token counting accepts `model`, `input`, `instructions`, `tools`, `tool_choice`,
+`reasoning`, and the supported template/preserve-thinking options. It renders the same tool
+schemas and effort instructions as generation, without running inference.
+
 ## OpenAI Chat Completions
 
 ```bash
@@ -484,6 +488,7 @@ curl http://127.0.0.1:8080/v1/models \
 | `--request-log-jsonl FILE` | append full-precision server/request records | disabled |
 | `--response-store-max-records N` | maximum locally retained Responses objects | `1024` |
 | `--response-store-max-mib N` | total local Response envelope/Item/context budget | `256` |
+| `--tool-replay-cache-mib N` | tool-format replay memory budget; `0` disables it | `1024` |
 | `--kv-dtype bf16\|int8\|kvarn\|kvarn-k4v4` | KV-cache storage | `bf16` |
 | `--spec mtp\|dflash` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; DFlash `1..15` | unset |
@@ -525,7 +530,7 @@ is also rejected if it resolves to the model artifact.
   --request-log-jsonl profiles/bench/run/server.requests.jsonl
 ```
 
-Every line is one `ninfer_serve_request_log` schema-v10 JSON object. All events carry
+Every line is one `ninfer_serve_request_log` schema-v11 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
 that server instance. Successful request-start records include request-scoped acquisition,
 media-preprocessing wall/work, tokenizer, cache hit/miss/single-flight, and payload-size fields;
@@ -540,15 +545,22 @@ they do not infer request behavior from process-global counter deltas.
 | `request_error` | the resolved request configuration and generation error message |
 | `throughput` | interval token deltas and rates, scheduler occupancy, and decode-round batch statistics |
 
-`request_done.timings_seconds` contains `prepare`, `ttft`, `vision`, `prefill`, `decode`, and `total`
-as full-precision JSON numbers. Its `speculative` object contains `backend`, `draft_window`, `rounds`,
+`request_done.timings_seconds` contains `prepare`, `queue`, `ttft`, `vision`, `prefill`, `decode`,
+and `total` as full-precision JSON numbers. `queue` measures submission to scheduler admission,
+including the wait for an execution lane and admission planning. It excludes prompt preparation
+and execution after admission, and is already included in `ttft` and `total`; do not add it again.
+For requests cancelled before admission, it measures submission to cancellation completion.
+Its `speculative` object contains `backend`, `draft_window`, `rounds`,
 `drafted_tokens`, `accepted_tokens`, `fallback_steps`, and `accepted_per_position`. Rates can be
 derived downstream from raw token counts and seconds instead of rounded stderr strings.
 
 The JSONL file contains no generated response text and never records an API-key value; `argv`
 replaces that value with `<redacted>`. The existing stderr summaries remain available for operators
-but are rounded and are not the aggregation source. Console lines use local
-`[YYYY-MM-DD HH:MM:SS.mmm] [level]` timestamps. OpenAI Responses, OpenAI Chat, and Anthropic
+but are rounded and are not the aggregation source. Console summaries use
+`queue` and `prefill_time` for durations in seconds, `ttft` for the full first-token wait in
+milliseconds, and `prefill` / `decode` for token rates. The deployment watch table converts `ttft`
+to seconds under its TTFB column and displays Queue and Prefill durations separately. Console lines
+use local `[YYYY-MM-DD HH:MM:SS.mmm] [level]` timestamps. OpenAI Responses, OpenAI Chat, and Anthropic
 generation requests receive a request ID when they enter synchronous preparation. Successful
 preparation produces `request_start`; a preparation failure produces `request_rejected` without a
 matching start. Later generation failures produce `request_error`. Schema/model validation
@@ -561,8 +573,13 @@ tokens finally committed by decode rounds, excluding the first token produced by
 and DFlash this is the accepted committed output, not draft or rejected tokens.
 `avg_decode_batch` is decode row-rounds divided by decode rounds during the same interval. The
 `running`, `prefilling`, `decode_ready`, and `waiting` fields are the Engine scheduler snapshot at
-the end of the interval. Fully idle zero intervals are omitted. The JSONL `throughput` event keeps
-the raw token and round deltas as well as derived rates; downstream measurement should prefer those
+the end of the interval. A transition to zero running/waiting requests is logged even without new
+tokens, so live monitors can show the idle state. Subsequent fully idle zero intervals are omitted.
+The console completion record also includes `think`, the reasoning-token count within `gen`.
+The deployment dashboard reads these records to show scheduler occupancy, Input/New, finish reasons,
+and optional thinking/reuse details; request errors and preparation rejections appear alongside
+completed requests. GPU readings are sampled separately every three seconds. The JSONL `throughput`
+event keeps the raw token and round deltas as well as derived rates; downstream measurement should prefer those
 raw values.
 
 ## Execution behavior
@@ -627,6 +644,21 @@ that frontier does not split a tiny trailing prologue into a separate prefill un
 response which no longer matches the raw generated tokens replays only that response and its
 suffix. Stable `false` keeps the first assistant opener in the open turn so a newly closed turn can
 be recomputed without its reasoning.
+
+Responses also retains generated tool-response bodies in a separate ephemeral formatting cache,
+including for `store:false`. It is bounded only by estimated record/index memory, with no entry-count
+limit. `--tool-replay-cache-mib N` defaults to 1024 MiB (1 GiB); zero disables this formatting cache.
+Memory is allocated on demand. The oldest records are evicted when the budget is exceeded, and a
+record larger than the budget is not retained. A hash index locates records by tool-call ID; writing
+the same ID replaces its previous record. Matching call IDs, names, argument values, reasoning,
+and assistant text allow the stock template to replay the original tool markup and separators.
+Edited fields use normal rendering. This does not create public Response records, and custom chat
+templates do not use it. Eviction or restart can remove this formatting metadata. The same content
+checks apply to Codex and pi-ai clients; no User-Agent routing is required.
+
+Qwen XML string parameters preserve indentation, tabs, and intentional blank lines. Parsing removes
+only one leading and one trailing framing newline (LF or CRLF), rather than trimming the string
+value. Quoted JSON strings and structured JSON values retain their existing parsing behavior.
 
 Exact generated-prefix reuse works with `preserve_thinking=false` during tool loops. The builtin
 renderers use the artifact's `<think>` / `</think>` markers, and streamed reasoning replay is not

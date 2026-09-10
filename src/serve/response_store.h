@@ -39,13 +39,19 @@ struct StoredResponse {
 
 class ResponseStore {
 public:
-    ResponseStore(std::size_t max_records, std::size_t max_bytes);
+    ResponseStore(std::size_t max_records, std::size_t max_bytes,
+                  std::size_t tool_replay_max_bytes);
 
     // get() refreshes LRU recency. Returned immutable records remain valid if
     // another request evicts or deletes their public store entry.
     std::shared_ptr<const StoredResponse> get(const std::string& id);
     void put(StoredResponse response);
     bool erase(const std::string& id);
+
+    // Ephemeral formatting metadata also serves store:false requests. It does
+    // not create publicly retrievable Response records or change prompt values.
+    void remember_tool_output(const ChatTurn& turn);
+    void restore_tool_outputs(std::vector<ChatTurn>& turns);
 
     [[nodiscard]] std::size_t size() const;
     [[nodiscard]] std::size_t bytes() const;
@@ -65,6 +71,10 @@ private:
     std::unordered_map<std::string, Entry> records_;
     std::list<std::string> lru_;
     std::size_t current_bytes_ = 0;
+    std::list<ChatTurn> tool_replays_;
+    std::unordered_map<std::string, std::list<ChatTurn>::iterator> tool_replay_index_;
+    std::size_t tool_replay_max_bytes_ = 0;
+    std::size_t tool_replay_bytes_ = 0;
 };
 
 } // namespace ninfer::serve

@@ -24,6 +24,7 @@ struct RequestCapacity;
 
 struct GenerationMetrics {
     double prepare_seconds = 0.0;
+    double queue_seconds   = 0.0;
     double ttft_seconds    = 0.0;
     double vision_seconds  = 0.0;
     double prefill_seconds = 0.0;
@@ -45,6 +46,7 @@ struct GenerationOutcome {
     std::string text;
     std::string reasoning;
     std::vector<ToolCall> tool_calls;
+    std::optional<std::string> raw_tool_content;
     int prompt_tokens                  = 0;
     int completion_tokens              = 0;
     int reasoning_tokens               = 0;

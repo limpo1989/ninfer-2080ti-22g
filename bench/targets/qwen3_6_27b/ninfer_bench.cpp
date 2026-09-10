@@ -9,6 +9,8 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <map>
+#include <cstdlib>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -98,6 +100,17 @@ ninfer::bench::RepTiming run_repetition(ninfer::Engine& engine,
     for (const auto token : generated.generated_token_ids) {
         timing.generated_token_hash ^= static_cast<std::uint32_t>(token);
         timing.generated_token_hash *= 1099511628211ULL;
+    }
+    if (const char* trace = std::getenv("NINFER_BENCH_TRACE_OUTPUT"); trace && std::string_view(trace) == "1") {
+        std::map<ninfer::TokenId, std::size_t> counts;
+        for (const auto token : generated.generated_token_ids) { ++counts[token]; }
+        std::pair<ninfer::TokenId, std::size_t> most_common{};
+        for (const auto& entry : counts) {
+            if (entry.second > most_common.second) { most_common = entry; }
+        }
+        std::cerr << "[bench_output] generated=" << generated.generated_token_ids.size()
+                  << " unique=" << counts.size() << " most_common_id=" << most_common.first
+                  << " most_common_count=" << most_common.second << '\n';
     }
     return timing;
 }

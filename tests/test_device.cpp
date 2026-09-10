@@ -86,6 +86,28 @@ int main() {
     }
     failures += check_context(moved, "moved");
 
+    // synchronize() must make asynchronous stream results visible before returning,
+    // under both the default blocking policy and the opt-in spin policy.
+    constexpr std::size_t bytes = 4096;
+    unsigned char* host = nullptr;
+    unsigned char* gpu  = nullptr;
+    CUDA_CHECK(cudaMallocHost(&host, bytes));
+    CUDA_CHECK(cudaMalloc(&gpu, bytes));
+    for (const unsigned char value : {0x5a, 0xa5}) {
+        CUDA_CHECK(cudaMemsetAsync(gpu, value, bytes, moved.stream));
+        CUDA_CHECK(cudaMemcpyAsync(host, gpu, bytes, cudaMemcpyDeviceToHost, moved.stream));
+        moved.synchronize();
+        for (std::size_t i = 0; i < bytes; ++i) {
+            if (host[i] != value) {
+                ++failures;
+                std::cerr << "stream result was not visible after synchronize\n";
+                break;
+            }
+        }
+    }
+    CUDA_CHECK(cudaFree(gpu));
+    CUDA_CHECK(cudaFreeHost(host));
+
     failures += expect_throws_device(count);
 
     ninfer::CudaEventTimer timer(moved);

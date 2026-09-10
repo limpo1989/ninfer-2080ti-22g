@@ -74,6 +74,19 @@ target_include_directories(ninfer_bench PRIVATE
 target_compile_definitions(ninfer_bench PRIVATE NINFER_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
 target_link_libraries(ninfer_bench PRIVATE ninfer_engine CUDA::cudart)
 
+# Recorded Responses histories through the same protocol translation and Engine
+# settings as the 2080 Ti deployment, including its real sampling policy.
+add_executable(ninfer_responses_bench targets/qwen3_6_27b/responses_bench.cpp)
+target_include_directories(ninfer_responses_bench PRIVATE
+  ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party)
+target_link_libraries(ninfer_responses_bench PRIVATE ninfer_serve ninfer_engine CUDA::cudart)
+
+add_executable(ninfer_token_decode targets/qwen3_6_27b/token_decode.cpp)
+target_include_directories(ninfer_token_decode PRIVATE
+  ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party)
+target_link_libraries(ninfer_token_decode PRIVATE ninfer_engine)
+
+
 # Native target-private MTP proposal/verification microbenchmark. It enters through the target
 # Program facade and executes the production round schedule over a real .ninfer artifact.
 add_executable(ninfer_qwen3_6_27b_mtp_round_bench

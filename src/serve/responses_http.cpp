@@ -227,6 +227,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
             previous_context = previous->context;
         }
         compose_responses_generation_messages(request, flatten_response_context(previous_context));
+        response_store_.restore_tool_outputs(request.generation.messages);
     } catch (const ApiException& exception) {
         write_error(res, responses_error(exception.error()));
         return;
@@ -265,6 +266,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                 service_->run(prepared, nullptr, [&req] { return disconnected(req); });
             const ResponsesRuntimeValues runtime = runtime_values(prepared, &outcome);
             BuiltResponse response = make_response_object(id, created, request, runtime, outcome);
+            for (const auto& turn : response.output_history) { response_store_.remember_tool_output(turn); }
             if (request.store) {
                 StoredResponse stored;
                 stored.id                = id;
@@ -418,6 +420,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                 if (worker_error) { std::rethrow_exception(worker_error); }
                 if (sink_failed.load(std::memory_order_acquire)) { throw ClientDisconnected(); }
                 ResponsesStreamFinish finished  = stream->encoder->finish(outcome);
+                for (const auto& turn : finished.response.output_history) { response_store_.remember_tool_output(turn); }
                 if (stream->request.store) {
                     StoredResponse stored;
                     stored.id          = finished.response.body.at("id").get<std::string>();
@@ -463,6 +466,7 @@ void HttpServer::handle_response_input_tokens(const httplib::Request& req, httpl
         limits.default_max_tokens = options_.default_max_tokens;
         ResponsesRequest request =
             parse_response_input_tokens_request(parse_json_body(req), limits);
+        response_store_.restore_tool_outputs(request.generation.messages);
         validate_model(request.generation.model, public_model_id_);
         const int tokens =
             service_->count_prompt_tokens(request.generation, [&req] { return disconnected(req); });

@@ -231,7 +231,7 @@ __device__ __forceinline__ void kvarn_fold_page(KvarnGqaShared<Spec, Geometry>& 
 }
 
 template <typename Spec, typename Geometry>
-__launch_bounds__(Spec::HeadDim) __global__ void kvarn_gqa_partial_kernel(
+__launch_bounds__(Spec::HeadDim, 2) __global__ void kvarn_gqa_partial_kernel(
     const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k,
     const __nv_bfloat16* __restrict__ v, const std::int32_t* __restrict__ positions,
     const std::int32_t* __restrict__ valid_columns, const std::int32_t* __restrict__ table_rows,

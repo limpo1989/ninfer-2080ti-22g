@@ -107,16 +107,28 @@ path, `=2` selects FP16 HMMA without register prefetch, and `=3` selects the def
 The experimental W8 `KMODE=3` is not enabled by default and is not part of this optimization.
 
 Short prefills use the fused Q4 C128 route from 17 tokens and the Q5 C128 route from 49 tokens.
-Smaller decode/verify shapes retain their existing routes. The measured Q4 64-token latency fell
+Q4 decode/verify uses the paired GEMV through eight columns. Its next weight tile is held in
+registers, so one shared staging buffer suffices; this also keeps the eight-column batch resident
+at two CTAs per SM. The measured Q4 64-token latency fell
 from 14.48 ms to 3.49 ms; Q5 down-projection at 80 tokens fell from 6.99 ms to 2.94 ms. Set
 `NINFER_SWIGLU_FUSED_PREFILL=0`, `NINFER_Q5ADD_SMALL_HMMA=0`, `NINFER_GROUPED_HMMA=0`, or
 `NINFER_GDN_OUTPUT_HMMA=0` to disable the corresponding optimization for comparison.
 Detailed per-layer profiling is opt-in with `NINFER_PROFILE_PREFILL=1`; ordinary serving metrics
 remain available without per-layer CUDA timing events.
 
+The KVarN decode kernel limits register allocation to support two resident CTAs and requests
+the corresponding shared-memory carveout. On SM75 this reduced its register count from about
+247 to 128 per thread without spills. At a 27,885-token history and four query columns, the
+isolated attention latency decreased from 1.677 ms to 1.425 ms. Q4 paired gate/up latency changed
+from 368 to 348 microseconds at four columns and from 1,261 to 543 microseconds at eight columns.
+These changes retain the existing numerical formats and oracle tolerances.
+
 On the Linux dual E5-2690 v3 host (125 GiB RAM), the public Engine benchmark with the same
 Qwen3.8-27B artifact, KVarN, 8,192 input tokens, 256 decode tokens, MTP3, and two repetitions
 measured:
+
+This is a forced-length greedy token-stream benchmark. Its MTP acceptance was approximately 98%;
+agent conversations with longer histories and stochastic sampling require their own measurements.
 
 | Configuration | Prefill | Decode |
 |---|---:|---:|
@@ -140,19 +152,52 @@ LD_LIBRARY_PATH="$HOME/.local/ninfer-deps/lib:/usr/local/cuda-12.8/lib64" \
   --mtp-draft-tokens 3 --lm-head-draft -o json
 ```
 
+`ninfer_responses_bench` accepts a recorded Responses request and uses the deployment's context,
+concurrency, KVarN, MTP3, temperature 0.6, and presence penalty 1.0 through the same request
+translation as HTTP serving. Its output limit applies to the benchmark only, and it never executes
+returned tool calls. `--profile-decode` brackets GPU profiling from the first visible token onward:
+
+```bash
+./build/bench/ninfer_responses_bench /path/to/model.ninfer /path/to/request.json 512 2
+```
+
+`tools/bench/replay_harness_session.mjs` reconstructs text requests from a DeepSeek Harness v0
+session log and checks their token counts. `tools/bench/run_pi_ai_cache.mjs` tests the pi-ai
+Responses serialization path. Both need a separately installed `@earendil-works/pi-ai` package
+whose directory is supplied through `NINFER_PI_AI_ROOT`; they do not modify the client or its settings.
+
 ### Responses cache reuse
 
 The builtin template replays the actual `<think>` / `</think>` tokens. Responses replay prefers
 raw reasoning `content` over its `summary`, so clients that return both do not duplicate it.
 Assistant text and immediately following function calls replay as one assistant turn, and tool
 parameters keep their generation order through JSON parsing.
+String parameters lose only the single framing newline on each side of the XML value; indentation,
+tabs, and intentional blank lines remain part of the argument. Unchanged tool responses can replay
+their original generated markup after the server verifies IDs, names, argument values, reasoning,
+and assistant text. This prevents formatting normalization from invalidating long prefixes.
 These fixes allow exact `append_frontier` reuse during tool loops with `preserve_thinking` off.
+The tool-format replay cache is limited only by estimated record/index memory, with a default
+budget of 1 GiB and no entry-count limit. Set `--tool-replay-cache-mib N` on `ninfer-serve` to
+change the budget in MiB, or use zero to disable this cache. It allocates on demand, replaces
+duplicate tool-call IDs, and evicts the oldest records under memory pressure. Tool-call IDs are
+hash-indexed so lookup does not scan the full cache as it grows.
 At the default 250 W limit, Codex CLI 0.153.4 with three sequential shell calls produced warm
 continuation hits of 98.65%, 99.09%, and 99.09% with 0.834–0.956 s time to first token;
 a controlled five-request tool loop with an initial 6,583-token prompt reached 99.55–99.56%
 after the cold start.
 Cold starts, large new tool outputs, edited history, and stripping reasoning at a new user turn
 are excluded from this warm-continuation claim.
+
+A recorded DeepSeek Harness request with 25,063 input tokens reproduced a later tool-continuation
+hit of 70.34% and 55.80 s to first token. Preserving parameter whitespace and original tool markup
+raised that continuation to 99.76% and reduced the wait to 1.21 s. A further continuation retained
+99.89%. The first response's client-observed decode rate changed from 28.40 to 29.09 tok/s;
+the request, seed, output count (916), and MTP acceptance (84.4%) matched. Subsequent output lengths
+changed after the corrected history, so their total wall times are not used as a decode-speed claim.
+
+`ninfer_token_decode MODEL.ninfer TOKEN_ID...` decodes trace IDs directly from the artifact's
+embedded tokenizer on the CPU. It can distinguish an actual token mismatch from SSE text chunking.
 
 To reproduce against a running service:
 
@@ -274,13 +319,50 @@ allocations to drain, starts the public HTTP server, and waits for `/v1/models` 
 ./deploy/restart-ninfer.sh restart-daemon
 ./deploy/restart-ninfer.sh status
 ./deploy/restart-ninfer.sh watch
+./deploy/restart-ninfer.sh watch --details
 ./deploy/restart-ninfer.sh logs
 ./deploy/restart-ninfer.sh stop
 ```
 
-`restart` attaches a fixed-width live table after startup with TTFB, prefill and decode rates,
-generated tokens, prompt-cache hit rate, MTP acceptance, and wall time. `Ctrl+C` exits only the
-view. Use `restart-daemon` (or `--daemon`) when the restart command must return immediately.
+`restart` attaches a fixed-width live table after startup with Queue, Prefill, TTFB, prefill and
+decode rates, generated tokens, prompt-cache hit rate, MTP acceptance, and wall time. `Ctrl+C`
+exits only the view. Use `restart-daemon` (or `--daemon`) when the restart command must return
+immediately.
+The duration columns are displayed in seconds after the request completes: `Queue` measures Engine
+submission to scheduler admission; `Prefill` is the Engine's recorded prefill duration; `TTFB`
+retains the full server-side time to first token, including queueing, prompt preparation, and work
+up to that token. Thinking tokens count. Queue plus Prefill need not equal TTFB because preparation
+and other scheduling overhead also contribute. `Prefill/s` and `Decode/s` are token rates, while
+`Wall` is the full request duration. Missing durations in older logs show `-`; requests with no
+generated token show `-` for TTFB. Restart the rebuilt server to emit Queue and Prefill durations.
+
+The watch header shows the GPU model and refreshes every three seconds with running/queued requests,
+inference-process CPU utilization, GPU utilization, VRAM, fan percentage, temperature, and power.
+CPU is measured from process-wide CPU-time deltas over the sampling interval: 100% means one fully
+busy core, and 150% means 1.5 cores. The first sample or an unavailable process shows `-`.
+It keeps the script's launch configuration visible above the live
+status: URL, nonempty API key, model, context/KV and output limits, KVarN, MTP, concurrency, and
+prefill chunk size. Scheduler counts use the server's five-second throughput snapshots;
+unknown counts show `-`. `Input/New` is total prompt tokens / tokens requiring prefill. `Finish`
+distinguishes completion, tool calls, output limits, cancellation, rejection, and queue timeouts;
+errors include their messages even without `--details`. `--details` adds request IDs, thinking
+token counts, and prefix reuse paths. Narrow terminals wrap each request into a compact block.
+Terminal colors highlight throughput in cyan, successful completion in green, queued/cancelled
+or output-limited requests in yellow, and errors in red. Borders and secondary details are muted.
+Color is automatic for terminals; redirected output stays plain. Use `--color never` or `NO_COLOR=1`
+to disable colors, or `--color always` to retain them in a snapshot.
+The view uses a Python 3 standard-library helper and never stops the server. `watch --once` prints
+a snapshot without entering the live view. Watch also opens when the service is stopped, showing
+its state and recent logs; it follows the PID file when the service starts again. The script starts
+the server in a separate session so Ctrl+C in the restart/watch terminal cannot stop inference.
+Reopen watch to use the new layout; the new thinking
+counter and idle-transition snapshots require restarting the rebuilt server.
+
+The deployment script enables API-key authentication using the fixed shared `API_KEY` near its
+top. Configure clients with that same key using `Authorization: Bearer <key>` or `x-api-key: <key>`.
+Startup and status probes include the key. The Ready line shows the configured key after the URL
+when it is nonempty. Script changes take effect on the next server restart;
+direct `ninfer-serve` launches still require an explicit `--api-key` to enable authentication.
 
 Its tested defaults are KVarN, MTP3, concurrency 2, a 245,760-token maximum context and shared KV
 capacity, and `default-max-tokens=131072`. On the 22,528 MiB card this uses about 21,610 MiB after
@@ -289,6 +371,25 @@ the `NINFER_MODEL`, `NINFER_BIN`, `NINFER_MAX_CONTEXT`, `NINFER_KV_CAPACITY`, an
 `NINFER_DEFAULT_MAX_TOKENS` environment variables.
 `NINFER_PREFILL_CHUNK` and `NINFER_DRAFT_TOKENS` override the prefill chunk and MTP window for
 controlled experiments. The script leaves `preserve_thinking` off by default.
+The launcher also accepts `--tool-replay-cache-mib N`, for example
+`./deploy/restart-ninfer.sh restart --tool-replay-cache-mib 2048`, or the
+`NINFER_TOOL_REPLAY_CACHE_MIB` environment variable (default `1024`). The command-line value takes
+precedence, and the selected budget appears in the watch header. The Responses object/context store
+has its own separate limits.
+`NINFER_SEED` optionally fixes the server's sampling seed for repeatable measurements; leaving it
+unset retains fresh request seeds. The script identifies processes by their executable path so
+wrapper command lines are not mistaken for the inference service.
+
+CUDA stream synchronization defaults to blocking the host thread until GPU work completes,
+avoiding the default driver's busy wait without a fixed sleep between decode rounds. Set
+`NINFER_CUDA_WAIT=spin` before starting the process to compare with busy waiting;
+`blocking` (or an unset value) selects the default. This changes host waiting only, leaving the
+GPU computation and request cancellation boundaries unchanged.
+On the dual E5-2690 v3 / RTX 2080 Ti host with driver 595.99.02, a controlled 20 ms
+asynchronous stream-completion test (40 interleaved samples per mode) reduced the waiting thread's
+CPU use from 100.0% to 0.35%. Median completion-to-return latency was 104 microseconds with
+blocking synchronization, versus 4 microseconds with spin and 952 microseconds with 1 ms polling.
+This measures host waiting overhead, not end-to-end model throughput.
 
 The optional GPU power override is disabled by default. To explicitly request 280 W at startup,
 use `NINFER_GPU_POWER_LIMIT_W=280 ./deploy/restart-ninfer.sh restart-daemon`; applying it requires

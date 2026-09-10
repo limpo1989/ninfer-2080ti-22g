@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 namespace ninfer {
 namespace {
@@ -43,6 +44,15 @@ void cuda_check(cudaError_t err, const char* expr, const char* file, int line) {
 }
 
 DeviceContext::DeviceContext(int device_id) : device(device_id) {
+    const char* wait_env = std::getenv("NINFER_CUDA_WAIT");
+    const std::string_view wait_mode = wait_env == nullptr ? "" : wait_env;
+    unsigned int schedule = cudaDeviceScheduleBlockingSync;
+    if (wait_mode == "spin") {
+        schedule = cudaDeviceScheduleSpin;
+    } else if (!wait_mode.empty() && wait_mode != "blocking") {
+        throw std::runtime_error("NINFER_CUDA_WAIT must be blocking or spin");
+    }
+
     int count       = 0;
     cudaError_t err = cudaGetDeviceCount(&count);
     if (err != cudaSuccess) {
@@ -54,6 +64,19 @@ DeviceContext::DeviceContext(int device_id) : device(device_id) {
     err = cudaSetDevice(device_id);
     if (err != cudaSuccess) {
         throw std::runtime_error(cuda_error_message("cudaSetDevice failed", err));
+    }
+
+    // CUDA's default auto policy spins on this many-core host. Block until the
+    // GPU completes instead, without adding a fixed polling interval per round.
+    // CUDA 12.8+ permits updating the initialized device's scheduling flags.
+    unsigned int flags = 0;
+    err = cudaGetDeviceFlags(&flags);
+    if (err != cudaSuccess) {
+        throw std::runtime_error(cuda_error_message("cudaGetDeviceFlags failed", err));
+    }
+    err = cudaSetDeviceFlags((flags & ~cudaDeviceScheduleMask) | schedule);
+    if (err != cudaSuccess) {
+        throw std::runtime_error(cuda_error_message("cudaSetDeviceFlags failed", err));
     }
 
     err = cudaGetDeviceProperties(&props, device_id);

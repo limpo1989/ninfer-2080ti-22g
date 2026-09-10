@@ -126,7 +126,8 @@ httplib::Server::HandlerResponse handle_unrendered_http_error(const ServeOptions
 
 HttpServer::HttpServer(ServeOptions options)
     : options_(std::move(options)),
-      response_store_(options_.response_store_max_records, options_.response_store_max_bytes),
+      response_store_(options_.response_store_max_records, options_.response_store_max_bytes,
+                      options_.tool_replay_cache_bytes),
       request_jsonl_(options_.request_log_jsonl, options_.artifact_path) {
     const std::size_t queued_requests =
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests;
@@ -184,7 +185,11 @@ void HttpServer::run_stats_reporter() {
         const Clock::time_point now        = Clock::now();
         const ThroughputReport report      = make_throughput_report(
             previous, current, std::chrono::duration<double>(now - previous_time).count());
-        if (report_has_activity(report)) { log_throughput(report); }
+        if (report_has_activity(report) ||
+            current.running_requests != previous.running_requests ||
+            current.waiting_requests != previous.waiting_requests) {
+            log_throughput(report);
+        }
         previous      = current;
         previous_time = now;
     }

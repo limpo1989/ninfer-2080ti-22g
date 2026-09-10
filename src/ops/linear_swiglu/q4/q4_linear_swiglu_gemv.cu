@@ -108,11 +108,13 @@ constexpr auto kSmallTLaunchers = make_small_t_launchers(
 // keeps the CTA's shared footprint independent of T and leaves the bf16x2 reads
 // bank-conflict-free (lane L reads word L of its group).
 template <int ActiveTokens>
-__global__ __launch_bounds__(kBlockThreads, 2) void q4_linear_swiglu_gemv_pair_kernel(
+__global__ __launch_bounds__(kBlockThreads, (ActiveTokens <= 6 ? 3 : 2)) void q4_linear_swiglu_gemv_pair_kernel(
     const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
     const std::uint8_t* __restrict__ scales, __nv_bfloat16* __restrict__ out) {
     static_assert(ActiveTokens >= 1);
-    constexpr int kStages    = 2;
+    // The next tile waits in registers until the consumption barrier below,
+    // so one shared staging buffer is sufficient for both gate and up weights.
+    constexpr int kStages    = 1;
     constexpr int kXTileVecs = ActiveTokens * kTileK / 8;
 
     __shared__ __align__(16) __nv_bfloat16 x_tile[ActiveTokens][kTileK];
@@ -191,7 +193,7 @@ __global__ __launch_bounds__(kBlockThreads, 2) void q4_linear_swiglu_gemv_pair_k
         const bool has_next = tile + 1 < kTiles;
         if (has_next) { load_tile_regs(tile + 1); }
 
-        const int buf           = tile & 1;
+        const int buf           = 0;
         const auto* gate_codes  = reinterpret_cast<const std::uint8_t*>(code_tile[warp][buf][0]);
         const auto* up_codes    = reinterpret_cast<const std::uint8_t*>(code_tile[warp][buf][1]);
         const auto* gate_scales = reinterpret_cast<const std::uint16_t*>(scale_tile[warp][buf][0]);
@@ -226,7 +228,7 @@ __global__ __launch_bounds__(kBlockThreads, 2) void q4_linear_swiglu_gemv_pair_k
 
         if (has_next) {
             __syncthreads();
-            spill_tile_regs((tile + 1) & 1);
+            spill_tile_regs(0);
             stage_x_tile(tile + 1);
             __syncthreads();
         }
@@ -248,6 +250,14 @@ using GemvPairLauncher = void (*)(const Tensor&, const Weight&, Tensor&, cudaStr
 template <int ActiveTokens>
 void launch_gemv_pair_active(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     constexpr int kBlocks = kIntermediate / kPairsPerBlock;
+#if defined(NINFER_SM75)
+    static const bool carveout = [] {
+        cudaFuncSetAttribute(q4_linear_swiglu_gemv_pair_kernel<ActiveTokens>,
+                             cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+        return true;
+    }();
+    (void)carveout;
+#endif
     q4_linear_swiglu_gemv_pair_kernel<ActiveTokens><<<kBlocks, kBlockThreads, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
         static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(out.data));
@@ -271,7 +281,7 @@ void q4_linear_swiglu_gemv_pair_launch(const Tensor& x, const Weight& w, Tensor&
         throw std::invalid_argument("q4 linear_swiglu GEMV requires weight [34816,5120]");
     }
     if (x.ne[1] < 1 || x.ne[1] > kQ4SwiGluLastGemvPair) {
-        throw std::invalid_argument("q4 linear_swiglu GEMV pair requires T=1..6");
+        throw std::invalid_argument("q4 linear_swiglu GEMV pair requires T=1..8");
     }
     kGemvPairLaunchers[static_cast<std::size_t>(x.ne[1] - 1)](x, w, out, stream);
 }
@@ -279,7 +289,7 @@ void q4_linear_swiglu_gemv_pair_launch(const Tensor& x, const Weight& w, Tensor&
 void q4_linear_swiglu_small_t_exact_launch(const Tensor& x, const Weight& w, Tensor& out,
                                            cudaStream_t stream) {
     if (x.ne[1] <= kQ4SwiGluLastGemvPair || x.ne[1] > 32) {
-        throw std::invalid_argument("Q4 LinearSwiGLU exact small-T requires T=7..32");
+        throw std::invalid_argument("Q4 LinearSwiGLU exact small-T requires T=9..32");
     }
     kSmallTLaunchers[static_cast<std::size_t>(x.ne[1] - kQ4SwiGluLastGemvPair - 1)](x, w, out,
                                                                                     stream);

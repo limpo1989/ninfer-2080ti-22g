@@ -251,13 +251,15 @@ int main() {
     GenerationOutcome outcome;
     outcome.prompt_tokens                       = 401;
     outcome.completion_tokens                   = 1024;
+    outcome.reasoning_tokens                    = 800;
     outcome.finish_reason                       = ninfer::FinishReason::OutputLimit;
     outcome.metrics.prepare_seconds             = 0.1234567890123;
-    outcome.metrics.ttft_seconds                = 0.3580246791357;
+    outcome.metrics.queue_seconds               = 1.2345678901234;
+    outcome.metrics.ttft_seconds                = 1.5925925692591;
     outcome.metrics.vision_seconds              = 0.0;
     outcome.metrics.prefill_seconds             = 0.2345678901234;
     outcome.metrics.decode_seconds              = 5.3456789012345;
-    outcome.metrics.total_seconds               = 5.7037035803702;
+    outcome.metrics.total_seconds               = 6.9382714704936;
     outcome.metrics.prefix_cache_hit_tokens     = 101;
     outcome.metrics.prefix_reuse_path           = ninfer::PrefixReusePath::RestoreTurnCheckpoint;
     outcome.metrics.speculative_backend         = ninfer::SpeculativeBackend::Mtp;
@@ -288,6 +290,9 @@ int main() {
     failures +=
         check(done.at("timings_seconds").at("ttft").get<double>() == outcome.metrics.ttft_seconds,
               "TTFT missing or lost precision");
+    failures +=
+        check(done.at("timings_seconds").at("queue").get<double>() == outcome.metrics.queue_seconds,
+              "queue time missing or lost precision");
     failures += check(done.at("speculative").at("backend") == "mtp", "speculative backend missing");
     failures +=
         check(done.at("speculative").at("draft_window") == 3, "speculative draft window missing");
@@ -314,6 +319,19 @@ int main() {
               "human request log omits response checkpoint reuse path");
     failures += check(format_request_start(context).find("submitted") != std::string::npos,
                       "human request log mislabels a submitted request");
+    failures += check(format_request_done(context, outcome).find(" queue=1.23s ") !=
+                          std::string::npos,
+                      "human request log omits queue duration in seconds");
+    failures += check(format_request_done(context, outcome).find(" prefill_time=0.23s ") !=
+                          std::string::npos,
+                      "human request log omits prefill duration in seconds");
+    failures += check(format_request_done(context, outcome).find(" think=800 ") !=
+                          std::string::npos,
+                      "human request log omits thinking token count");
+    outcome.metrics.queue_seconds = 0.0;
+    failures += check(format_request_done(context, outcome).find(" queue=0.00s ") !=
+                          std::string::npos,
+                      "human request log omits zero queue duration");
 
     ThroughputReport throughput;
     throughput.interval_seconds                = 2.0;

@@ -905,6 +905,7 @@ BuiltResponse build_response(const std::string& id, std::int64_t created_at,
     history.role              = ChatRole::Assistant;
     history.reasoning_content = outcome.reasoning;
     history.tool_calls        = outcome.tool_calls;
+    history.replay_content    = outcome.raw_tool_content;
     if (!outcome.text.empty()) {
         ContentPart part;
         part.kind     = ContentKind::Text;
@@ -962,7 +963,8 @@ ResponsesRequest parse_response_input_tokens_request(const Json& body,
     require_object(body);
     for (auto it = body.begin(); it != body.end(); ++it) {
         if (it.key() != "model" && it.key() != "input" && it.key() != "chat_template_kwargs" &&
-            it.key() != "preserve_thinking") {
+            it.key() != "preserve_thinking" && it.key() != "tools" && it.key() != "instructions" &&
+            it.key() != "reasoning" && it.key() != "tool_choice") {
             bad_request("unknown parameter: " + it.key(), it.key(), "unknown_parameter");
         }
     }
@@ -970,6 +972,7 @@ ResponsesRequest parse_response_input_tokens_request(const Json& body,
     parsed.store             = false;
     parsed.stream            = false;
     parsed.generation.stream = false;
+    compose_responses_generation_messages(parsed, {});
     return parsed;
 }
 

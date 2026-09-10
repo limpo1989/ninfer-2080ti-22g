@@ -75,6 +75,24 @@ int test_parameter_order_survives_replay() {
                  "tool parameter order changed between generation and replay");
 }
 
+int test_parameter_whitespace_survives_replay() {
+    const auto result = ninfer::serve::parse_qwen_tool_call_output(
+        "<tool_call>\n<function=edit>\n"
+        "<parameter=old_string>\n  const HIP = 10;\n</parameter>\n"
+        "<parameter=new_string>\n\n\tconst HIP = 20;  \n\n</parameter>\n"
+        "<parameter=inline>  literal  </parameter>\n"
+        "<parameter=quoted>\n\"  quoted  \"\n</parameter>\n"
+        "<parameter=windows>\r\n  line\r\n\r\n</parameter>\n"
+        "</function>\n</tool_call>", 64);
+    if (!result.is_tool_call_response) { return fail("whitespace-bearing tool call was rejected"); }
+    const auto args = Json::parse(result.tool_calls.front().arguments_json);
+    return check(args.at("old_string") == "  const HIP = 10;" &&
+                 args.at("new_string") == "\n\tconst HIP = 20;  \n" &&
+                 args.at("inline") == "  literal  " && args.at("quoted") == "  quoted  " &&
+                 args.at("windows") == "  line\r\n",
+                 "tool string indentation and blank lines must survive parsing");
+}
+
 int test_malformed_falls_back_to_text() {
     const std::string text = "<tool_call>\n<function=get_weather>\n";
     const ninfer::serve::ParsedToolCallOutput parsed =
@@ -167,6 +185,7 @@ int main() {
     failures += test_single_call();
     failures += test_multiple_calls_and_json_values();
     failures += test_parameter_order_survives_replay();
+    failures += test_parameter_whitespace_survives_replay();
     failures += test_malformed_falls_back_to_text();
     failures += test_suffix_after_tool_falls_back_to_text();
     failures += test_configured_name_limit();

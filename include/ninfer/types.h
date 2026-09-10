@@ -384,6 +384,8 @@ struct PreparationControl {
 
 struct GenerationTimings {
     double prepare_seconds     = 0.0;
+    // Submission to scheduler admission, or completion if cancelled while still pending.
+    double queue_seconds       = 0.0;
     double first_token_seconds = 0.0;
     double vision_seconds      = 0.0;
     double prefill_seconds     = 0.0;

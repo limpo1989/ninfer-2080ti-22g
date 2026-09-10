@@ -102,6 +102,9 @@ struct ChatTurn {
     std::string tool_call_id;      // populated for role=tool
     std::string reasoning_content; // assistant thinking carried across turns (round-tripped to the
                                    // template)
+    // Server-owned original body for an unchanged generated tool response.
+    // Wire parsers never populate this field from client-provided markup.
+    std::optional<std::string> replay_content;
 };
 
 // OpenAI sampling fields carried by the protocol adapter. `logit_bias` remains

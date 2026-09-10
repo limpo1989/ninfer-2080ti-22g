@@ -6,12 +6,9 @@
 
 namespace ninfer::ops::detail {
 
-// Largest token count the fused gate/up decode GEMV is instantiated for. Above it the exact
-// small-T MMA core wins: the GEMV's activation tile is T * 2 KiB of shared memory on top of the
-// weight staging, and past six tokens that drops the CTA below two per SM and gives back more
-// than the single pass over the matrix is worth (measured 683 us against the MMA core's 672 at
-// T=8, against 363 versus 651 at T=4).
-inline constexpr int kQ4SwiGluLastGemvPair = 6;
+// One shared weight buffer leaves room for two CTAs even at eight tokens,
+// covering the flattened verification batch of two MTP3 lanes.
+inline constexpr int kQ4SwiGluLastGemvPair = 8;
 
 void q4_linear_swiglu_gemv_pair_launch(const Tensor& x, const Weight& w, Tensor& out,
                                        cudaStream_t stream);
