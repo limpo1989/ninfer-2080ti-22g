@@ -12,5 +12,5 @@ name = "NInfer local"
 base_url = "http://127.0.0.1:8321/v1"
 wire_api = "responses"
 requires_openai_auth = false
-stream_idle_timeout_ms = 300000
+stream_idle_timeout_ms = 7200000
 stream_max_retries = 0

@@ -56,6 +56,7 @@ int main() {
                       "state cache must be disabled by default");
     failures += check(defaults.state_cache_idle_ms == 1000,
                       "state cache idle delay default mismatch");
+    failures += check(defaults.default_max_tokens == 32768, "server output-token default mismatch");
     failures += check(!defaults.model_id_override.has_value(),
                       "model id override is unexpectedly configured by default");
     failures += check(

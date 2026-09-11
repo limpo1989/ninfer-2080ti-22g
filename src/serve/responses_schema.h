@@ -29,6 +29,7 @@ struct ResponsesRequest {
 
     std::optional<std::string> instructions;
     std::optional<std::string> previous_response_id;
+    std::optional<std::string> reasoning_summary;
     nlohmann::json metadata    = nlohmann::json::object();
     nlohmann::json tools       = nlohmann::json::array();
     nlohmann::json tool_choice = "auto";
@@ -92,7 +93,6 @@ public:
     ResponsesEventStream& operator=(const ResponsesEventStream&) = delete;
 
     std::vector<std::string> start();
-    std::vector<std::string> keepalive();
     std::vector<std::string> reasoning_delta(const std::string& text);
     std::vector<std::string> content_delta(const std::string& text);
     ResponsesStreamFinish finish(const GenerationOutcome& outcome);

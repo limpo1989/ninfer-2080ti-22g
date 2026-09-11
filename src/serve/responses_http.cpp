@@ -266,7 +266,9 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                 service_->run(prepared, nullptr, [&req] { return disconnected(req); });
             const ResponsesRuntimeValues runtime = runtime_values(prepared, &outcome);
             BuiltResponse response = make_response_object(id, created, request, runtime, outcome);
-            for (const auto& turn : response.output_history) { response_store_.remember_tool_output(turn); }
+            for (const auto& turn : response.output_history) {
+                response_store_.remember_tool_output(turn);
+            }
             if (request.store) {
                 StoredResponse stored;
                 stored.id                = id;
@@ -325,12 +327,8 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                     }
                     q_cv.notify_one();
                 };
-                output.on_reasoning = [&](const std::string& text) {
-                    push_delta(true, text);
-                };
-                output.on_content = [&](const std::string& text) {
-                    push_delta(false, text);
-                };
+                output.on_reasoning = [&](const std::string& text) { push_delta(true, text); };
+                output.on_content   = [&](const std::string& text) { push_delta(false, text); };
                 output.is_cancelled = [&] {
                     return stream->cancelled.load(std::memory_order_acquire) ||
                            sink_failed.load(std::memory_order_acquire);
@@ -341,9 +339,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                 std::jthread worker([&] {
                     try {
                         outcome = service_->run(stream->prepared, &output);
-                    } catch (...) {
-                        worker_error = std::current_exception();
-                    }
+                    } catch (...) { worker_error = std::current_exception(); }
                     {
                         std::lock_guard lock(q_mutex);
                         producer_done = true;
@@ -371,8 +367,8 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                         }
                         if (delta) {
                             const auto batch = delta->first
-                                ? stream->encoder->reasoning_delta(delta->second)
-                                : stream->encoder->content_delta(delta->second);
+                                                   ? stream->encoder->reasoning_delta(delta->second)
+                                                   : stream->encoder->content_delta(delta->second);
                             for (const std::string& item : batch) {
                                 if (!sink.write(item.data(), item.size())) {
                                     sink_failed.store(true, std::memory_order_release);
@@ -391,20 +387,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                         if (drained) { break; }
                         const auto now = std::chrono::steady_clock::now();
                         if (now - last_activity >= std::chrono::seconds(5)) {
-                            // SSE comments are stripped by client parsers before the app layer,
-                            // so thinking streams also emit an empty semantic delta that pi-ai
-                            // observes without changing the accumulated reasoning text.
-                            bool wrote = sink.write(": ping\n\n", 8);
-                            if (wrote) {
-                                const auto items = stream->encoder->keepalive();
-                                for (const std::string& item : items) {
-                                    if (!sink.write(item.data(), item.size())) {
-                                        wrote = false;
-                                        break;
-                                    }
-                                }
-                            }
-                            if (!wrote) {
+                            if (!sink.write(": ping\n\n", 8)) {
                                 sink_failed.store(true, std::memory_order_release);
                                 break;
                             }
@@ -419,8 +402,10 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                 worker.join();
                 if (worker_error) { std::rethrow_exception(worker_error); }
                 if (sink_failed.load(std::memory_order_acquire)) { throw ClientDisconnected(); }
-                ResponsesStreamFinish finished  = stream->encoder->finish(outcome);
-                for (const auto& turn : finished.response.output_history) { response_store_.remember_tool_output(turn); }
+                ResponsesStreamFinish finished = stream->encoder->finish(outcome);
+                for (const auto& turn : finished.response.output_history) {
+                    response_store_.remember_tool_output(turn);
+                }
                 if (stream->request.store) {
                     StoredResponse stored;
                     stored.id          = finished.response.body.at("id").get<std::string>();

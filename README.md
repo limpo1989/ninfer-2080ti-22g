@@ -207,8 +207,8 @@ agent conversations with longer histories and stochastic sampling require their 
 At the same default power limit, prefill improved by 6.4%. Decode was effectively unchanged
 (-0.3%, within run-to-run variation); this measurement does not establish a decode speedup.
 
-The benchmark context capacity was 32,768; serving retains 245,760 and the 131,072 default
-output allowance. This host retains the card's default 250 W power limit. The restart script
+The benchmark context capacity was 32,768; serving retains 245,760 with a 32,768 default output
+allowance. This host retains the card's default 250 W power limit. The restart script
 does not change it unless explicitly requested; the fan-control systemd unit does not set power.
 The new kernels are enabled directly in source on SM75, so their effect does not depend on
 setting environment variables in the restart script. The delivered path avoids conversion
@@ -287,7 +287,9 @@ python3 tools/bench/run_responses_cache.py --base-url http://127.0.0.1:8321/v1 -
 ```
 
 `deploy/codex-ninfer.config.toml` is an optional Codex profile. Copy it to
-`~/.codex/ninfer.config.toml` and select it with `codex --profile ninfer`.
+`~/.codex/ninfer.config.toml` and select it with `codex --profile ninfer`. Its two-hour stream idle
+limit covers long queue and prefill phases at the full 245K context; NInfer continues to send
+transport-only SSE comment pings every five seconds.
 
 ---
 
@@ -446,7 +448,7 @@ when it is nonempty. Script changes take effect on the next server restart;
 direct `ninfer-serve` launches still require an explicit `--api-key` to enable authentication.
 
 Its tested defaults are KVarN, MTP3, concurrency 2, a 245,760-token maximum context and shared KV
-capacity, and `default-max-tokens=131072`. On the 22,528 MiB card this uses about 21,610 MiB after
+capacity, and `default-max-tokens=32768`. On the 22,528 MiB card this uses about 21,610 MiB after
 startup while retaining about 220 MiB of planner slack. Paths and sizing remain overridable through
 the `NINFER_MODEL`, `NINFER_BIN`, `NINFER_MAX_CONTEXT`, `NINFER_KV_CAPACITY`, and
 `NINFER_DEFAULT_MAX_TOKENS` environment variables.
@@ -471,12 +473,12 @@ token envelope. Consequently this 22GB configuration cannot combine Vision with 
 budget. Vision remains opt-in via `--vision`; the default launcher preserves the 245,760-token text
 profile and its persistent state cache.
 
-The 131,072-token default preserves the server's maximum single-request capability. Clients should
-still send the smallest accurate per-request `max_tokens`: 4K–16K for ordinary tool work, 16K–32K
-for typical long answers, and 128K only when that much output is genuinely required. Admission
-accounts for the declared output budget as well as the prompt, so an unnecessarily large value can
-keep an otherwise compatible second request queued. This changes capacity planning, not model
-quality, unless generation actually reaches the requested limit.
+The 32,768-token default leaves more shared KV capacity available for concurrent work. Clients can
+still request up to the remaining context capacity explicitly: 4K–16K for ordinary tool work,
+16K–32K for typical long answers, and 128K only when that much output is genuinely required.
+Admission accounts for the declared output budget as well as the prompt, so an unnecessarily large
+value can keep an otherwise compatible second request queued. This changes capacity planning, not
+model quality, unless generation actually reaches the requested limit.
 `NINFER_PREFILL_CHUNK` and `NINFER_DRAFT_TOKENS` override the prefill chunk and MTP window for
 controlled experiments. The script leaves `preserve_thinking` off by default.
 The launcher also accepts `--tool-replay-cache-mib N`, for example

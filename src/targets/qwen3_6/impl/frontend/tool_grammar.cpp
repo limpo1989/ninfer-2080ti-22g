@@ -228,6 +228,7 @@ bool ToolGrammarState::fill_draft_masks(std::span<std::int32_t> output, std::uin
                           constrained;
             if (column == drafts.size() || !impl_->matcher.AcceptToken(drafts[column])) { break; }
             ++advanced;
+            if (impl_->matcher.IsTerminated()) { break; }
         }
     } catch (...) {
         if (advanced != 0) { impl_->matcher.Rollback(static_cast<int>(advanced)); }

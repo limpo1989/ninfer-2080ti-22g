@@ -166,16 +166,17 @@ int test_reasoning_effort() {
              .enable_thinking,
         "null Responses reasoning did not disable thinking");
 
-    Json codex_custom         = base;
-    codex_custom["reasoning"] = Json{{"summary", "auto"}};
-    const GenerationRequest codex_request =
-        parse_responses_request(codex_custom, limits()).generation;
+    Json codex_custom                      = base;
+    codex_custom["reasoning"]              = Json{{"summary", "auto"}};
+    const ResponsesRequest codex_response  = parse_responses_request(codex_custom, limits());
+    const GenerationRequest& codex_request = codex_response.generation;
     ServeOptions thinking_off_server;
     thinking_off_server.enable_thinking = false;
     const ResolvedPromptSemantics codex_semantics =
         resolve_prompt_semantics(codex_request, thinking_off_server, effort_capabilities());
     failures += check(codex_semantics.enable_thinking && !codex_semantics.reasoning_effort &&
-                          codex_request.enable_thinking == true,
+                          codex_request.enable_thinking == true &&
+                          codex_response.reasoning_summary == "auto",
                       "Codex summary-only reasoning did not preserve default thinking");
 
     Json empty_reasoning         = base;
@@ -584,7 +585,8 @@ int test_sse_sequence() {
     int failures                    = 0;
     std::uint64_t expected_sequence = 0;
     std::string text_deltas;
-    bool saw_reasoning_delta = false;
+    bool saw_reasoning_delta         = false;
+    bool saw_reasoning_summary_delta = false;
     for (const std::string& event : wire) {
         failures += check(event.find("[DONE]") == std::string::npos,
                           "Responses stream must not emit Chat [DONE]");
@@ -595,6 +597,9 @@ int test_sse_sequence() {
             text_deltas += payload.at("delta").get<std::string>();
         }
         if (payload.at("type") == "response.reasoning_text.delta") { saw_reasoning_delta = true; }
+        if (payload.at("type") == "response.reasoning_summary_text.delta") {
+            saw_reasoning_summary_delta = true;
+        }
     }
     failures += check(parse_event(wire.front()).at("type") == "response.created",
                       "stream starts with response.created");
@@ -602,23 +607,23 @@ int test_sse_sequence() {
                       "stream ends with response.completed");
     failures += check(text_deltas == "answer", "text deltas reconstruct terminal output");
     failures += check(saw_reasoning_delta, "raw reasoning delta emitted");
+    failures +=
+        check(!saw_reasoning_summary_delta, "raw reasoning request also emitted a summary delta");
     return failures;
 }
 
-int test_sse_keepalive_activity() {
-    ResponsesRequest request = parse_responses_request(Json{{"model", "qwen3.6-27b"},
-                                                            {"input", "hello"},
-                                                            {"max_output_tokens", 32},
-                                                            {"stream", true}},
-                                                       limits());
+int test_sse_summary_and_raw_channels_are_exclusive() {
+    ResponsesRequest request =
+        parse_responses_request(Json{{"model", "qwen3.6-27b"},
+                                     {"input", "hello"},
+                                     {"reasoning", Json{{"effort", "low"}, {"summary", "auto"}}},
+                                     {"max_output_tokens", 32},
+                                     {"stream", true}},
+                                limits());
     ResponsesRuntimeValues runtime;
     runtime.enable_thinking = true;
-    ResponsesEventStream encoder("resp_keepalive", 123, request, runtime);
+    ResponsesEventStream encoder("resp_summary", 123, request, runtime);
     std::vector<std::string> wire = encoder.start();
-    for (int i = 0; i < 2; ++i) {
-        std::vector<std::string> more = encoder.keepalive();
-        wire.insert(wire.end(), more.begin(), more.end());
-    }
     std::vector<std::string> more = encoder.reasoning_delta("thought");
     wire.insert(wire.end(), more.begin(), more.end());
     more = encoder.content_delta("answer");
@@ -627,40 +632,27 @@ int test_sse_keepalive_activity() {
     ResponsesStreamFinish finish = encoder.finish(outcome);
     wire.insert(wire.end(), finish.events_before_terminal.begin(),
                 finish.events_before_terminal.end());
-    wire.push_back(encoder.terminal(finish.response));
 
-    int failures                    = 0;
-    std::uint64_t expected_sequence = 0;
-    int reasoning_items             = 0;
-    int empty_activity_deltas       = 0;
+    int summary_deltas = 0;
+    int raw_deltas     = 0;
     for (const std::string& event : wire) {
         const Json payload = parse_event(event);
-        failures += check(payload.at("sequence_number") == expected_sequence++,
-                          "keepalive sequence_number is contiguous");
-        if (payload.at("type") == "response.output_item.added" &&
-            payload.at("item").at("type") == "reasoning") {
-            ++reasoning_items;
-        }
         if (payload.at("type") == "response.reasoning_summary_text.delta" &&
-            payload.at("delta").get<std::string>().empty()) {
-            ++empty_activity_deltas;
+            !payload.at("delta").get<std::string>().empty()) {
+            ++summary_deltas;
+        }
+        if (payload.at("type") == "response.reasoning_text.delta" &&
+            !payload.at("delta").get<std::string>().empty()) {
+            ++raw_deltas;
         }
     }
-    failures += check(reasoning_items == 1, "keepalive must open at most one reasoning item");
-    failures += check(empty_activity_deltas == 2,
-                      "each keepalive must emit one pi-ai-visible empty reasoning delta");
+    const Json& item = finish.response.body.at("output").at(0);
+    int failures     = check(summary_deltas == 1 && raw_deltas == 0,
+                             "summary request emitted duplicate raw reasoning deltas");
     failures +=
-        check(finish.response.body.at("output").at(0).at("content").at(0).at("text") == "thought",
-              "keepalive changed terminal reasoning text");
-
-    ResponsesRuntimeValues no_thinking;
-    no_thinking.enable_thinking = false;
-    ResponsesEventStream plain("resp_plain_keepalive", 123, request, no_thinking);
-    (void)plain.start();
-    const std::vector<std::string> plain_keepalive = plain.keepalive();
-    failures += check(plain_keepalive.size() == 1 &&
-                          parse_event(plain_keepalive.front()).at("type") == "response.in_progress",
-                      "non-thinking keepalive created synthetic output");
+        check(item.at("summary").at(0).at("text") == "thought" && item.at("content").empty() &&
+                  finish.response.body.at("reasoning").at("summary") == "auto",
+              "summary request did not retain its exclusive terminal channel");
     return failures;
 }
 
@@ -799,7 +791,7 @@ int main() {
     failures += test_explicit_rejections();
     failures += test_response_object();
     failures += test_sse_sequence();
-    failures += test_sse_keepalive_activity();
+    failures += test_sse_summary_and_raw_channels_are_exclusive();
     failures += test_reasoning_replay_is_not_duplicated();
     failures += test_text_and_tool_call_replay_stays_one_turn();
     failures += test_sse_function_call();

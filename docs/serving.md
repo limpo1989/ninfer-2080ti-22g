@@ -314,7 +314,8 @@ forced Qwen grammar. NInfer does not execute tools.
 A terminal wire response has `object: "response"`, one of `completed`, `incomplete`, or
 `cancelled` in `status`, and a typed `output` array. NInfer may emit:
 
-- a `reasoning` Item containing raw `reasoning_text` and an empty summary;
+- a `reasoning` Item using exactly one representation: `summary_text` when
+  `reasoning.summary` is requested, otherwise raw `reasoning_text`;
 - an assistant `message` containing an `output_text` part;
 - one or more `function_call` Items.
 
@@ -355,30 +356,51 @@ data: {"type":"response.output_text.delta","sequence_number":7,...}
 The normal lifecycle is:
 
 1. `response.created`, then `response.in_progress`;
-2. `response.output_item.added` and `response.content_part.added`;
-3. zero or more `response.reasoning_text.delta` or `response.output_text.delta` events;
-4. matching `*.done`, `response.content_part.done`, and `response.output_item.done` events;
+2. `response.output_item.added` and the matching content or reasoning-summary part;
+3. zero or more `response.reasoning_text.delta`, `response.reasoning_summary_text.delta`, or
+   `response.output_text.delta` events;
+4. matching part and item `*.done` events;
 5. exactly one `response.completed`, `response.incomplete`, or `response.failed` terminal event.
 
 Function arguments use `response.function_call_arguments.delta` and `.done`. IDs, output indices,
 and content indices remain stable, and concatenated deltas equal the terminal Item. Responses SSE
 does not emit the Chat Completions `[DONE]` sentinel. With tools enabled, ordinary answer text still
 streams immediately; only an ambiguous `<tool_call>` suffix or the structured tool region is held.
-Malformed tool markup is flushed back as ordinary text without losing bytes.
+Malformed tool-shaped output fails with `malformed_tool_call` instead of being exposed as text.
 
-During streaming, raw reasoning events also have `reasoning_summary_*` counterparts for clients
-that consume the standard summary channel. Do not concatenate these two representations. Inbound
-replay prefers raw `content` and uses `summary` only when raw content is absent or empty.
+During streaming, reasoning channels are mutually exclusive. Requests with a non-null
+`reasoning.summary` use `reasoning_summary_*`; other thinking requests use raw `reasoning_text.*`.
+NInfer exposes the model's visible reasoning through the selected channel and does not run a second
+summarizer. Inbound replay prefers raw `content` and uses `summary` only when raw content is absent
+or empty.
 An assistant message followed immediately by function-call Items is reconstructed as one assistant
 turn, including its preceding reasoning. Tool parameters retain their generation order through
 parsing and replay; JSON object key sorting must not rewrite an otherwise reusable prefix.
 
-The Responses transport sends a heartbeat after five seconds without output. During thinking it
-opens the reasoning Item if necessary and sends an empty summary delta; during an open text Item
-it sends an empty text delta. These events carry no generated tokens and do not change Engine
-TTFT, throughput, or usage. Clients may show an empty thinking indicator before actual generation.
-The provider thread alone owns the event encoder and socket, including sequence numbers. Closing
-the stream cancels the Engine request at the next decode-round or prefill-chunk boundary.
+The Responses transport sends the SSE comment `: ping` after five seconds without output. It does
+not synthesize model-content events: no empty text/reasoning delta is added to the response or a
+client's durable history. This transport heartbeat keeps proxies and HTTP readers alive, but client
+application timeouts must still cover the longest silent queue-plus-prefill interval. For the full
+245K deployment, use a two-hour bound for Codex:
+
+```toml
+[model_providers.ninfer]
+stream_idle_timeout_ms = 7200000
+```
+
+For DeepSeek Harness/pi-ai, set both its overall provider request timeout and its iterator idle
+timeout:
+
+```yaml
+llm-pi-ai:
+  providers:
+    ninfer:
+      timeoutMs: 7200000
+      streamIdleTimeoutMs: 7200000
+```
+
+These limits do not reserve resources or change generation. Closing the stream cancels the Engine
+request at the next decode-round or prefill-chunk boundary.
 
 ### Local response state and resources
 
@@ -521,7 +543,7 @@ curl http://127.0.0.1:8080/v1/models \
 | `--spec mtp\|dflash` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; DFlash `1..15` | unset |
 | `--lm-head-draft` | optimized proposal head | off |
-| `--default-max-tokens N` | output limit when omitted by a request | `8192` |
+| `--default-max-tokens N` | output limit when omitted by a request | `32768` |
 | `--vision` | enable media input and load Vision GPU allocations | off |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |

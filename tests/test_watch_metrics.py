@@ -94,7 +94,7 @@ class WatchMetricsTest(unittest.TestCase):
     def test_startup_information_stays_above_live_status_and_empty_key_is_hidden(self):
         args = argparse.Namespace(server_url="http://0.0.0.0:8321/v1", api_key="fixture-key",
                                   model="/models/qwen.ninfer", max_context=245760,
-                                  kv_capacity=245760, max_output=131072, draft_tokens=3,
+                                  kv_capacity=245760, max_output=32768, draft_tokens=3,
                                   prefill_chunk=1024, max_concurrency=2,
                                   tool_replay_cache_mib=1024, state_cache_max_mib=8192,
                                   state_cache_ram_mib=4096, state_cache_idle_ms=1000,
@@ -103,7 +103,7 @@ class WatchMetricsTest(unittest.TestCase):
         view = frame(WatchState(), GpuSnapshot(metrics="GPU 0%"), 2, 80, 30, False, False, startup)
         self.assertLess(view.index("API http"), view.index("Service stopped"))
         self.assertIn("Key fixture-key", view)
-        self.assertIn("Max output 131,072", view)
+        self.assertIn("Max output 32,768", view)
         self.assertIn("Turbo OFF", view)
         self.assertIn("idle 1,000 ms", view)
         self.assertTrue(all(len(line) <= 80 for line in view.splitlines()))

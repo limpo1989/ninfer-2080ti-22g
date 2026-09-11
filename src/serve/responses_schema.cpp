@@ -605,8 +605,9 @@ void parse_reasoning(const Json& body, ResponsesRequest& out) {
         if (summary != "auto" && summary != "concise" && summary != "detailed") {
             bad_request("reasoning.summary must be one of auto, concise, or detailed", "reasoning");
         }
-        // Compatibility hint only. NInfer already publishes its visible reasoning through both
-        // reasoning_text and reasoning_summary SSE channels; it does not run a second summarizer.
+        // NInfer exposes its visible reasoning as the requested summary; it does not run a second
+        // summarizer over the model output.
+        out.reasoning_summary = summary;
     }
     if (!reasoning.contains("effort") || reasoning.at("effort").is_null()) {
         out.generation.enable_thinking = true;
@@ -884,7 +885,7 @@ Json response_common(const std::string& id, std::int64_t created_at,
         {"effort", request.generation.reasoning_effort
                        ? Json(requested_reasoning_effort_name(*request.generation.reasoning_effort))
                        : Json(nullptr)},
-        {"summary", nullptr}};
+        {"summary", request.reasoning_summary ? Json(*request.reasoning_summary) : Json(nullptr)}};
     return Json{
         {"id", id},
         {"object", "response"},
@@ -922,13 +923,20 @@ BuiltResponse build_response(const std::string& id, std::int64_t created_at,
         const char* reasoning_status = (!outcome.text.empty() || !outcome.tool_calls.empty())
                                            ? "completed"
                                            : item_status.c_str();
-        built.output_items.push_back(
-            Json{{"id", ids.reasoning},
-                 {"type", "reasoning"},
-                 {"status", reasoning_status},
-                 {"summary", Json::array()},
-                 {"content",
-                  Json::array({Json{{"type", "reasoning_text"}, {"text", outcome.reasoning}}})}});
+        const bool summary_mode      = request.reasoning_summary.has_value();
+        const Json summary =
+            summary_mode
+                ? Json::array({Json{{"type", "summary_text"}, {"text", outcome.reasoning}}})
+                : Json::array();
+        const Json content =
+            summary_mode
+                ? Json::array()
+                : Json::array({Json{{"type", "reasoning_text"}, {"text", outcome.reasoning}}});
+        built.output_items.push_back(Json{{"id", ids.reasoning},
+                                          {"type", "reasoning"},
+                                          {"status", reasoning_status},
+                                          {"summary", summary},
+                                          {"content", content}});
     }
 
     if (!outcome.text.empty() || outcome.tool_calls.empty()) {
@@ -1087,51 +1095,63 @@ public:
 
     std::vector<std::string> ensure_reasoning() {
         if (reasoning_started) { return {}; }
-        reasoning_started = true;
-        ids.reasoning     = new_response_item_id("rs");
-        reasoning_index   = next_output_index++;
-        const Json spart  = {{"type", "summary_text"}, {"text", ""}};
-        const Json item   = {{"id", ids.reasoning},
-                             {"type", "reasoning"},
-                             {"status", "in_progress"},
-                             {"summary", Json::array({spart})},
-                             {"content", Json::array()}};
-        const Json part   = {{"type", "reasoning_text"}, {"text", ""}};
-        return {sse(event("response.output_item.added",
-                          Json{{"output_index", reasoning_index}, {"item", item}})),
+        reasoning_started       = true;
+        ids.reasoning           = new_response_item_id("rs");
+        reasoning_index         = next_output_index++;
+        const bool summary_mode = request.reasoning_summary.has_value();
+        const Json spart        = {{"type", "summary_text"}, {"text", ""}};
+        const Json item         = {{"id", ids.reasoning},
+                                   {"type", "reasoning"},
+                                   {"status", "in_progress"},
+                                   {"summary", summary_mode ? Json::array({spart}) : Json::array()},
+                                   {"content", Json::array()}};
+        const Json part         = {{"type", "reasoning_text"}, {"text", ""}};
+        std::vector<std::string> events{
+            sse(event("response.output_item.added",
+                      Json{{"output_index", reasoning_index}, {"item", item}}))};
+        if (summary_mode) {
+            events.push_back(sse(event("response.reasoning_summary_part.added",
+                                       Json{{"item_id", ids.reasoning},
+                                            {"output_index", reasoning_index},
+                                            {"summary_index", 0},
+                                            {"part", spart}})));
+        } else {
+            events.push_back(
                 sse(event("response.content_part.added", Json{{"item_id", ids.reasoning},
                                                               {"output_index", reasoning_index},
                                                               {"content_index", 0},
-                                                              {"part", part}})),
-                sse(event("response.reasoning_summary_part.added",
-                          Json{{"item_id", ids.reasoning},
-                               {"output_index", reasoning_index},
-                               {"summary_index", 0},
-                               {"part", spart}}))};
+                                                              {"part", part}})));
+        }
+        return events;
     }
 
     std::vector<std::string> close_reasoning(const std::string& final_text,
                                              const char* item_status = "completed") {
         if (!reasoning_started || reasoning_done) { return {}; }
-        reasoning_done   = true;
-        reasoning_text   = final_text;
-        const Json part  = {{"type", "reasoning_text"}, {"text", reasoning_text}};
-        const Json spart = {{"type", "summary_text"}, {"text", reasoning_text}};
-        const Json item  = {{"id", ids.reasoning},
-                            {"type", "reasoning"},
-                            {"status", item_status},
-                            {"summary", Json::array({spart})},
-                            {"content", Json::array({part})}};
-        return {sse(event("response.reasoning_summary_text.done",
-                          Json{{"item_id", ids.reasoning},
-                               {"output_index", reasoning_index},
-                               {"summary_index", 0},
-                               {"text", reasoning_text}})),
-                sse(event("response.reasoning_summary_part.done",
-                          Json{{"item_id", ids.reasoning},
-                               {"output_index", reasoning_index},
-                               {"summary_index", 0},
-                               {"part", spart}})),
+        reasoning_done          = true;
+        reasoning_text          = final_text;
+        const bool summary_mode = request.reasoning_summary.has_value();
+        const Json part         = {{"type", "reasoning_text"}, {"text", reasoning_text}};
+        const Json spart        = {{"type", "summary_text"}, {"text", reasoning_text}};
+        const Json item         = {{"id", ids.reasoning},
+                                   {"type", "reasoning"},
+                                   {"status", item_status},
+                                   {"summary", summary_mode ? Json::array({spart}) : Json::array()},
+                                   {"content", summary_mode ? Json::array() : Json::array({part})}};
+        std::vector<std::string> events;
+        if (summary_mode) {
+            events = {sse(event("response.reasoning_summary_text.done",
+                                Json{{"item_id", ids.reasoning},
+                                     {"output_index", reasoning_index},
+                                     {"summary_index", 0},
+                                     {"text", reasoning_text}})),
+                      sse(event("response.reasoning_summary_part.done",
+                                Json{{"item_id", ids.reasoning},
+                                     {"output_index", reasoning_index},
+                                     {"summary_index", 0},
+                                     {"part", spart}}))};
+        } else {
+            events = {
                 sse(event("response.reasoning_text.done", Json{{"item_id", ids.reasoning},
                                                                {"output_index", reasoning_index},
                                                                {"content_index", 0},
@@ -1139,9 +1159,11 @@ public:
                 sse(event("response.content_part.done", Json{{"item_id", ids.reasoning},
                                                              {"output_index", reasoning_index},
                                                              {"content_index", 0},
-                                                             {"part", part}})),
-                sse(event("response.output_item.done",
-                          Json{{"output_index", reasoning_index}, {"item", item}}))};
+                                                             {"part", part}}))};
+        }
+        events.push_back(sse(event("response.output_item.done",
+                                   Json{{"output_index", reasoning_index}, {"item", item}})));
+        return events;
     }
 
     std::vector<std::string> ensure_message() {
@@ -1226,39 +1248,6 @@ std::vector<std::string> ResponsesEventStream::start() {
             sse(impl_->event("response.in_progress", Json{{"response", response}}))};
 }
 
-std::vector<std::string> ResponsesEventStream::keepalive() {
-    if (!impl_->started || impl_->finish_built) {
-        throw std::logic_error("invalid Responses stream keepalive state");
-    }
-    const Json response =
-        in_progress_response(impl_->id, impl_->created_at, impl_->request, impl_->runtime);
-    std::vector<std::string> events{
-        sse(impl_->event("response.in_progress", Json{{"response", response}}))};
-
-    if (impl_->message_started && !impl_->message_done) {
-        events.push_back(sse(
-            impl_->event("response.output_text.delta", Json{{"item_id", impl_->ids.message},
-                                                            {"output_index", impl_->message_index},
-                                                            {"content_index", 0},
-                                                            {"delta", ""},
-                                                            {"logprobs", Json::array()}})));
-        return events;
-    }
-    if (!impl_->runtime.enable_thinking || impl_->reasoning_done) { return events; }
-
-    std::vector<std::string> added = impl_->ensure_reasoning();
-    events.insert(events.end(), std::make_move_iterator(added.begin()),
-                  std::make_move_iterator(added.end()));
-    if (!impl_->reasoning_done) {
-        events.push_back(sse(impl_->event("response.reasoning_summary_text.delta",
-                                          Json{{"item_id", impl_->ids.reasoning},
-                                               {"output_index", impl_->reasoning_index},
-                                               {"summary_index", 0},
-                                               {"delta", ""}})));
-    }
-    return events;
-}
-
 std::vector<std::string> ResponsesEventStream::reasoning_delta(const std::string& text) {
     if (!impl_->started || impl_->finish_built) {
         throw std::logic_error("invalid reasoning delta event state");
@@ -1266,15 +1255,12 @@ std::vector<std::string> ResponsesEventStream::reasoning_delta(const std::string
     if (text.empty()) { return {}; }
     std::vector<std::string> events = impl_->ensure_reasoning();
     impl_->reasoning_text += text;
-    events.push_back(sse(
-        impl_->event("response.reasoning_text.delta", Json{{"item_id", impl_->ids.reasoning},
-                                                           {"output_index", impl_->reasoning_index},
-                                                           {"content_index", 0},
-                                                           {"delta", text}})));
-    events.push_back(sse(impl_->event("response.reasoning_summary_text.delta",
+    const bool summary_mode = impl_->request.reasoning_summary.has_value();
+    events.push_back(sse(impl_->event(summary_mode ? "response.reasoning_summary_text.delta"
+                                                   : "response.reasoning_text.delta",
                                       Json{{"item_id", impl_->ids.reasoning},
                                            {"output_index", impl_->reasoning_index},
-                                           {"summary_index", 0},
+                                           {summary_mode ? "summary_index" : "content_index", 0},
                                            {"delta", text}})));
     return events;
 }
@@ -1314,12 +1300,15 @@ ResponsesStreamFinish ResponsesEventStream::finish(const GenerationOutcome& outc
     };
     if (!outcome.reasoning.empty() && !impl_->reasoning_started) {
         append(impl_->ensure_reasoning());
-        impl_->reasoning_text = outcome.reasoning;
-        finished.events_before_terminal.push_back(sse(impl_->event(
-            "response.reasoning_text.delta", Json{{"item_id", impl_->ids.reasoning},
-                                                  {"output_index", impl_->reasoning_index},
-                                                  {"content_index", 0},
-                                                  {"delta", outcome.reasoning}})));
+        impl_->reasoning_text   = outcome.reasoning;
+        const bool summary_mode = impl_->request.reasoning_summary.has_value();
+        finished.events_before_terminal.push_back(
+            sse(impl_->event(summary_mode ? "response.reasoning_summary_text.delta"
+                                          : "response.reasoning_text.delta",
+                             Json{{"item_id", impl_->ids.reasoning},
+                                  {"output_index", impl_->reasoning_index},
+                                  {summary_mode ? "summary_index" : "content_index", 0},
+                                  {"delta", outcome.reasoning}})));
     }
     const char* reasoning_status =
         (!outcome.text.empty() || !outcome.tool_calls.empty()) ? "completed" : item_status;

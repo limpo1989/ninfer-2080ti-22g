@@ -147,6 +147,27 @@ int test_thinking_must_close_before_tool_call() {
     return failures;
 }
 
+int test_stop_draft_terminates_preview_and_rolls_back() {
+    ninfer::targets::qwen3_6::ToolGrammarCompiler compiler(vocabulary(), {kStop});
+    ninfer::targets::qwen3_6::ToolGrammarState state(compiler.compile(tools(), false, true));
+    state.accept(std::array<ninfer::TokenId, 2>{kPlain, kThinkClose});
+    const std::size_t words = state.bitmask_words();
+    std::vector<std::int32_t> masks(words * 3);
+    const std::array<ninfer::TokenId, 2> drafts{kStop, kPlain};
+
+    (void)state.fill_draft_masks(masks, 3, drafts);
+    int failures = check(allows(std::span<const std::int32_t>(masks).subspan(0, words), kStop),
+                         "completed grammar rejected its stop token");
+    failures += check(allows(std::span<const std::int32_t>(masks).subspan(words, words), kPlain),
+                      "unused row after a stop draft was not all-allow");
+
+    state.accept(std::array<ninfer::TokenId, 1>{kPlain});
+    std::vector<std::int32_t> current(words);
+    (void)state.fill_draft_masks(current, 1, {});
+    failures += check(allows(current, kStop), "rollback no longer permits the stop token");
+    return failures;
+}
+
 int test_strict_schema_constrains_parameters() {
     ninfer::targets::qwen3_6::ToolGrammarCompiler compiler(vocabulary(), {kStop});
     ninfer::targets::qwen3_6::ToolGrammarState strict(compiler.compile(strict_tools(), false));
@@ -230,6 +251,7 @@ int main(int argc, char** argv) {
     failures += test_parallel_draft_masks();
     failures += test_required_call_blocks_early_stop();
     failures += test_thinking_must_close_before_tool_call();
+    failures += test_stop_draft_terminates_preview_and_rolls_back();
     failures += test_strict_schema_constrains_parameters();
     if (argc == 2 || argc == 3) {
         const std::filesystem::path workload = argc == 3 ? argv[2] : std::filesystem::path{};
