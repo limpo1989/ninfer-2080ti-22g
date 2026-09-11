@@ -8,6 +8,7 @@
 #include "core/decode_graph.h"
 #include "runtime/engine/state_snapshot_cache.h"
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
+#include <ninfer/targets/qwen3_6/tool_grammar.h>
 
 #include "targets/qwen3_6/impl/runtime/layouts.h"
 #include "targets/qwen3_6/impl/runtime/dflash_context.h"
@@ -178,6 +179,7 @@ struct RequestControl {
     Lifecycle lifecycle = Lifecycle::Empty;
     PendingCandidate pending;
     ops::SamplingConfig sampling_host;
+    qwen3_6::ToolGrammarState tool_grammar;
     GenerationTimings timings;
     SpeculativeStats speculative_stats;
 
@@ -237,7 +239,7 @@ public:
     [[nodiscard]] runtime::StateSnapshotLoad lookup_state(const PreparedPromptData& prompt,
                                                           std::uint32_t minimum_frontier);
     [[nodiscard]] bool restore_state(std::uint32_t lane, const PreparedPromptData& prompt,
-                                    const runtime::StateSnapshotImage& image) noexcept;
+                                     const runtime::StateSnapshotImage& image) noexcept;
     void save_state(std::uint32_t lane) noexcept;
     [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept;
@@ -275,6 +277,7 @@ public:
     Tensor prefill_hidden;
     Tensor sampling_config;
     Tensor token_counts;
+    Tensor tool_grammar_masks;
     Tensor tail_hidden_store;
     Tensor rewrite_checkpoint_hidden_store;
 
@@ -296,6 +299,7 @@ public:
     std::optional<PinnedHostBuffer> dflash_host;
     qwen3_6::DFlashDecodeIngress* dflash_host_ingress = nullptr;
     qwen3_6::DFlashDecodeEgress* dflash_host_egress   = nullptr;
+    std::optional<PinnedHostBuffer> tool_grammar_mask_host;
 
     std::size_t workspace_logical_peak_bytes = 0;
     std::unique_ptr<runtime::StateSnapshotCache> state_cache;
@@ -305,7 +309,9 @@ private:
     void ordered_reset(SequenceState& sequence);
     void prepare_graphs();
     void install_sampling(SequenceState& sequence, RequestControl& request,
-                          const ops::SamplingConfig& config);
+                          const ops::SamplingConfig& config, const PreparedPromptData& prompt);
+    void prepare_tool_grammar_masks(SequenceState& sequence, RequestControl& request,
+                                    std::span<const TokenId> drafts);
     void set_device_i32(Tensor& tensor, std::int32_t value);
     void copy_tail(SequenceState& sequence, const Tensor& source);
     void copy_round_token();

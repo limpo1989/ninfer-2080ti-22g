@@ -11,6 +11,7 @@ namespace ninfer::serve {
 
 struct ParsedToolCallOutput {
     bool is_tool_call_response = false;
+    bool malformed_tool_call   = false;
     std::string content;
     std::vector<ToolCall> tool_calls;
 };
@@ -20,7 +21,8 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
 
 // Incrementally publishes text that is provably outside a possible Qwen
 // <tool_call> suffix. At terminal time, a valid tool response discards the
-// buffered tool region; malformed/non-tool output flushes it verbatim.
+// buffered tool region. The caller discards malformed tool-shaped output and only flushes an
+// ordinary non-tool response.
 class ToolCallStreamFilter {
 public:
     std::string feed(std::string_view text);

@@ -361,11 +361,11 @@ ChatTurn parse_function_call_output_item(const Json& item, Json& canonical) {
     turn.tool_call_id = item.at("call_id").get<std::string>();
     Json output;
     if (item.at("output").is_string()) {
-    ContentPart content;
-    content.kind     = ContentKind::Text;
-    content.type_raw = "input_text";
-    content.text     = item.at("output").get<std::string>();
-    turn.content.push_back(std::move(content));
+        ContentPart content;
+        content.kind     = ContentKind::Text;
+        content.type_raw = "input_text";
+        content.text     = item.at("output").get<std::string>();
+        turn.content.push_back(std::move(content));
         output = item.at("output");
     } else {
         if (item.at("output").empty()) {
@@ -458,7 +458,7 @@ void parse_input(const Json& input, ResponsesRequest& out) {
             }
             can_group_function_calls = message.turn.role == ChatRole::Assistant;
             out.input_turns.push_back(std::move(message.turn));
-            canonical                = std::move(message.canonical);
+            canonical = std::move(message.canonical);
         } else if (type == "reasoning") {
             if (pending_reasoning_present) {
                 bad_request("adjacent reasoning Items are not supported", "input");
@@ -533,25 +533,23 @@ void parse_tools(const Json& body, ResponsesRequest& out) {
             }
             parameters = item.at("parameters");
         }
+        bool strict = false;
         if (item.contains("strict") && !item.at("strict").is_null()) {
             if (!item.at("strict").is_boolean()) {
                 bad_request("function strict must be a boolean", "tools");
             }
-            if (item.at("strict").get<bool>()) {
-                bad_request("strict function schema enforcement is not supported", "tools",
-                            "strict_tools_not_supported");
-            }
+            strict = item.at("strict").get<bool>();
         }
-        tool.strict          = false;
+        tool.strict          = strict;
         tool.parameters_json = parameters.dump();
         Json canonical       = {{"type", "function"},
                                 {"name", tool.name},
                                 {"parameters", parameters},
-                                {"strict", false}};
+                                {"strict", strict}};
         if (!tool.description.empty()) { canonical["description"] = tool.description; }
-        Json nested = {
-            {"type", "function"},
-            {"function", Json{{"name", tool.name}, {"parameters", parameters}, {"strict", false}}}};
+        Json nested = {{"type", "function"},
+                       {"function",
+                        Json{{"name", tool.name}, {"parameters", parameters}, {"strict", strict}}}};
         if (!tool.description.empty()) { nested["function"]["description"] = tool.description; }
         tool.definition_json = nested.dump();
         out.generation.tools.push_back(std::move(tool));
@@ -1115,15 +1113,15 @@ public:
     std::vector<std::string> close_reasoning(const std::string& final_text,
                                              const char* item_status = "completed") {
         if (!reasoning_started || reasoning_done) { return {}; }
-        reasoning_done  = true;
-        reasoning_text  = final_text;
-        const Json part = {{"type", "reasoning_text"}, {"text", reasoning_text}};
+        reasoning_done   = true;
+        reasoning_text   = final_text;
+        const Json part  = {{"type", "reasoning_text"}, {"text", reasoning_text}};
         const Json spart = {{"type", "summary_text"}, {"text", reasoning_text}};
-        const Json item = {{"id", ids.reasoning},
-                           {"type", "reasoning"},
-                           {"status", item_status},
-                           {"summary", Json::array({spart})},
-                           {"content", Json::array({part})}};
+        const Json item  = {{"id", ids.reasoning},
+                            {"type", "reasoning"},
+                            {"status", item_status},
+                            {"summary", Json::array({spart})},
+                            {"content", Json::array({part})}};
         return {sse(event("response.reasoning_summary_text.done",
                           Json{{"item_id", ids.reasoning},
                                {"output_index", reasoning_index},
@@ -1253,10 +1251,10 @@ std::vector<std::string> ResponsesEventStream::keepalive() {
                   std::make_move_iterator(added.end()));
     if (!impl_->reasoning_done) {
         events.push_back(sse(impl_->event("response.reasoning_summary_text.delta",
-            Json{{"item_id", impl_->ids.reasoning},
-                 {"output_index", impl_->reasoning_index},
-                 {"summary_index", 0},
-                 {"delta", ""}})));
+                                          Json{{"item_id", impl_->ids.reasoning},
+                                               {"output_index", impl_->reasoning_index},
+                                               {"summary_index", 0},
+                                               {"delta", ""}})));
     }
     return events;
 }
@@ -1274,10 +1272,10 @@ std::vector<std::string> ResponsesEventStream::reasoning_delta(const std::string
                                                            {"content_index", 0},
                                                            {"delta", text}})));
     events.push_back(sse(impl_->event("response.reasoning_summary_text.delta",
-                     Json{{"item_id", impl_->ids.reasoning},
-                          {"output_index", impl_->reasoning_index},
-                          {"summary_index", 0},
-                          {"delta", text}})));
+                                      Json{{"item_id", impl_->ids.reasoning},
+                                           {"output_index", impl_->reasoning_index},
+                                           {"summary_index", 0},
+                                           {"delta", text}})));
     return events;
 }
 

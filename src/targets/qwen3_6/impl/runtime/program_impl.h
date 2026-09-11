@@ -251,8 +251,10 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     prefill_hidden                  = plan.persistent.prefill_hidden.bind(backing);
     token_counts                    = plan.persistent.token_counts.bind(backing);
     sampling_config                 = plan.persistent.sampling_config.bind(backing);
+    tool_grammar_masks              = plan.persistent.tool_grammar_masks.bind(backing);
     tail_hidden_store               = plan.persistent.tail_hidden.bind(backing);
     rewrite_checkpoint_hidden_store = plan.persistent.rewrite_checkpoint_hidden.bind(backing);
+    tool_grammar_mask_host.emplace(tool_grammar_masks.bytes());
     for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
         SequenceState& sequence = sequences[lane];
         sequence.lane           = lane;
@@ -566,7 +568,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             : speculative_backend == SpeculativeBackend::DFlash ? prompt_tokens
                                                                 : 0U;
         materialize_sequence_kv(sequence, prompt_tokens, backend_materialized);
-        install_sampling(sequence, request, request_plan.sampling);
+        install_sampling(sequence, request, request_plan.sampling, prompt);
         sequence.rope_delta = prompt.rope_delta;
         set_device_i32(io.rope_delta, sequence.rope_delta);
 
@@ -811,6 +813,7 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
                 speculative_backend == SpeculativeBackend::Mtp
                     ? mtp_host_egress->licensed_tokens.data() + row * width
                     : dflash_host_egress->licensed_tokens.data() + row * width;
+            request.tool_grammar.accept(std::span<const TokenId>(token_base, committed));
             sequence.ledger.insert(sequence.ledger.end(), token_base, token_base + committed);
             sequence.prefix_identity.append_generated(committed, sequence.rope_delta);
             sequence.execution_frontier = pending.base_E + committed;
@@ -879,6 +882,7 @@ SpeculativeStats ProgramImplCore::speculative_stats_lane(std::uint32_t lane) con
 
 void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& request) noexcept {
     request.prefill.reset();
+    request.tool_grammar = {};
     sequence.kv.reset();
     request.lifecycle           = Lifecycle::Empty;
     sequence.execution_frontier = 0;
@@ -1405,11 +1409,15 @@ void ProgramImplCore::prepare_graphs() {
 }
 
 void ProgramImplCore::install_sampling(SequenceState& sequence, RequestControl& request,
-                                       const ops::SamplingConfig& config) {
+                                       const ops::SamplingConfig& config,
+                                       const PreparedPromptData& prompt) {
     Tensor counts = token_counts.slice(1, static_cast<std::int32_t>(sequence.lane), 1)
                         .view({TextConfig::token_domain});
     CUDA_CHECK(cudaMemsetAsync(counts.data, 0, counts.bytes(), device.stream));
-    request.sampling_host     = config;
+    request.sampling_host = config;
+    request.tool_grammar  = prompt.tool_grammar && speculative_backend != SpeculativeBackend::DFlash
+                                ? qwen3_6::ToolGrammarState(prompt.tool_grammar)
+                                : qwen3_6::ToolGrammarState{};
     request.speculative_stats = SpeculativeStats{
         .backend               = speculative_backend,
         .enabled               = speculative_backend != SpeculativeBackend::None,
@@ -1420,10 +1428,38 @@ void ProgramImplCore::install_sampling(SequenceState& sequence, RequestControl& 
                            request.sampling_host.frequency_penalty != 0.0F;
     request.sampling_host.token_counts =
         penalties ? static_cast<std::int32_t*>(counts.data) : nullptr;
+    prepare_tool_grammar_masks(sequence, request, {});
     Tensor config_lane = sampling_config.slice(1, static_cast<std::int32_t>(sequence.lane), 1);
     CUDA_CHECK(cudaMemcpyAsync(config_lane.data, &request.sampling_host,
                                sizeof(request.sampling_host), cudaMemcpyHostToDevice,
                                device.stream));
+}
+
+void ProgramImplCore::prepare_tool_grammar_masks(SequenceState& sequence, RequestControl& request,
+                                                 std::span<const TokenId> drafts) {
+    request.sampling_host.token_bitmask = nullptr;
+    if (!request.tool_grammar) { return; }
+
+    const std::size_t words   = request.tool_grammar.bitmask_words();
+    const std::size_t columns = static_cast<std::size_t>(
+        speculative_backend == SpeculativeBackend::Mtp ? draft_window + 1U : 1U);
+    if (words != static_cast<std::size_t>(tool_grammar_masks.ne[0]) ||
+        columns != static_cast<std::size_t>(tool_grammar_masks.ne[1]) ||
+        drafts.size() + 1 > columns || !tool_grammar_mask_host) {
+        throw std::logic_error("tool grammar mask storage does not match the active request");
+    }
+
+    const std::size_t lane_words = words * columns;
+    auto* host                   = static_cast<std::int32_t*>(tool_grammar_mask_host->data()) +
+                 static_cast<std::size_t>(sequence.lane) * lane_words;
+    const bool constrained = request.tool_grammar.fill_draft_masks(
+        std::span<std::int32_t>(host, lane_words), static_cast<std::uint32_t>(columns), drafts);
+    if (!constrained) { return; }
+
+    Tensor lane_mask = tool_grammar_masks.slice(2, static_cast<std::int32_t>(sequence.lane), 1);
+    CUDA_CHECK(cudaMemcpyAsync(lane_mask.data, host, lane_mask.bytes(), cudaMemcpyHostToDevice,
+                               device.stream));
+    request.sampling_host.token_bitmask = static_cast<const std::int32_t*>(lane_mask.data);
 }
 
 void ProgramImplCore::copy_tail(SequenceState& sequence, const Tensor& source) {
@@ -1617,7 +1653,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                         static_cast<std::int32_t>(sequence.lane), device.stream);
                 }
             }
-            staged.cursor = next_cursor;
+            staged.cursor          = next_cursor;
             sequence.text_kv_valid = staged.cursor;
             if (staged.prepare_mtp) { sequence.mtp_kv_valid = staged.cursor; }
             if (speculative_backend == SpeculativeBackend::DFlash) {
@@ -1785,9 +1821,10 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         }
 
         for (std::size_t row = 0; row < lanes.size(); ++row) {
-            SequenceState& sequence            = sequences[lanes[row]];
-            const RequestControl& request      = requests[lanes[row]];
-            const std::uint32_t frontier       = sequence.execution_frontier;
+            SequenceState& sequence      = sequences[lanes[row]];
+            RequestControl& request      = requests[lanes[row]];
+            const std::uint32_t frontier = sequence.execution_frontier;
+            prepare_tool_grammar_masks(sequence, request, {});
             ordinary_host_ingress->tokens[row] = sequence.ledger.back();
             ordinary_host_ingress->cache_positions[row] =
                 checked_i32(frontier, "ordinary batch position");
@@ -1899,7 +1936,7 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
 
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence           = sequences[lanes[row]];
-            const RequestControl& request     = requests[lanes[row]];
+            RequestControl& request           = requests[lanes[row]];
             const std::uint32_t frontier      = sequence.execution_frontier;
             const std::uint32_t max_by_budget = budgets[row].generated_tokens_remaining > 1
                                                     ? budgets[row].generated_tokens_remaining - 1
@@ -1911,11 +1948,13 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                 if (!decoder->text_kv.kvarn() || frontier < kKvarnSinkTokens) {
                     return draft_window;
                 }
-                const std::uint32_t remaining =
-                    kPagedKVPageSize - frontier % kPagedKVPageSize;
+                const std::uint32_t remaining = kPagedKVPageSize - frontier % kPagedKVPageSize;
                 return remaining > 1 ? remaining - 2 : 0U;
             }();
             const std::uint32_t transactional_extent = std::min(extent, page_safe_extent);
+            prepare_tool_grammar_masks(
+                sequence, request,
+                std::span<const TokenId>(sequence.mtp_drafts.data(), transactional_extent));
             mtp_host_ingress->anchors[row]        = sequence.ledger.back();
             mtp_host_ingress->base_frontiers[row] = checked_i32(frontier, "MTP batch frontier");
             mtp_host_ingress->remaining_budgets[row] =
@@ -2202,6 +2241,7 @@ void ProgramImplCore::resolve_non_speculative_pending(SequenceState& sequence,
         request.pending.produced != 1 || accepted_tokens != 1) {
         throw std::logic_error("non-speculative pending round must commit its single token");
     }
+    request.tool_grammar.accept(std::span<const TokenId>(&sequence.ledger.back(), accepted_tokens));
 
     switch (request.pending.kind) {
     case PendingKind::Begin:
@@ -2234,10 +2274,10 @@ void ProgramImplCore::resolve_non_speculative_pending(SequenceState& sequence,
 
 MemorySummary ProgramImplCore::memory_summary() const noexcept {
     MemorySummary out;
-    out.device      = device.device;
-    out.max_context = capacity;
-    out.kv_capacity = kv_capacity;
-    out.kv_cache = kv_storage;
+    out.device           = device.device;
+    out.max_context      = capacity;
+    out.kv_capacity      = kv_capacity;
+    out.kv_cache         = kv_storage;
     DeviceArena& weights = *model.weights_arena;
     out.weights = ArenaMemorySummary{weights.capacity(), weights.used(), weights.peak_used()};
     out.sequence =

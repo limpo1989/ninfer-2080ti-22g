@@ -37,7 +37,6 @@ std::string load_chat_template(const std::filesystem::path& path) {
 
 } // namespace
 
-
 namespace ninfer::serve {
 
 struct RequestCapacity {
@@ -156,6 +155,15 @@ using Clock = std::chrono::steady_clock;
     error.type    = "request_cancelled";
     error.code    = "client_disconnected";
     error.message = "client disconnected during media preparation";
+    throw ApiException(std::move(error));
+}
+
+[[noreturn]] void throw_malformed_tool_call() {
+    ApiError error;
+    error.status  = 500;
+    error.type    = "server_error";
+    error.code    = "malformed_tool_call";
+    error.message = "model output entered a tool-call block but did not complete a valid call";
     throw ApiException(std::move(error));
 }
 
@@ -301,9 +309,9 @@ std::shared_ptr<RequestLifetime> GenerationService::acquire_request_lifetime(
     }
 }
 
-PreparedRequest GenerationService::prepare(
-    const GenerationRequest& request, std::function<bool()> is_cancelled,
-    std::optional<std::chrono::milliseconds> timeout_override) const {
+PreparedRequest
+GenerationService::prepare(const GenerationRequest& request, std::function<bool()> is_cancelled,
+                           std::optional<std::chrono::milliseconds> timeout_override) const {
     PreparedRequest prepared;
     ninfer::RequestOptions request_options = to_request_options(request, options_);
     prepared.include_usage                 = request.include_usage;
@@ -411,10 +419,10 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.reasoning_tokens  = static_cast<int>(result.reasoning_tokens);
     outcome.finish_reason     = result.finish_reason;
 
-    outcome.metrics.prepare_seconds = prepared.prepare_seconds;
-    outcome.metrics.queue_seconds   = result.timings.queue_seconds;
+    outcome.metrics.prepare_seconds       = prepared.prepare_seconds;
+    outcome.metrics.queue_seconds         = result.timings.queue_seconds;
     outcome.metrics.state_restore_seconds = result.timings.state_restore_seconds;
-    outcome.metrics.state_cache_source = result.timings.state_cache_source;
+    outcome.metrics.state_cache_source    = result.timings.state_cache_source;
     outcome.metrics.ttft_seconds =
         prepared.prepare_seconds +
         std::max(0.0, result.timings.first_token_seconds - result.timings.prepare_seconds);
@@ -439,6 +447,10 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     if (prepared.tool_capable) {
         ParsedToolCallOutput parsed =
             parse_qwen_tool_call_output(outcome.text, prepared.tool_name_max_length);
+        if (parsed.malformed_tool_call) {
+            if (output_sink) { (void)output_sink->finish(true); }
+            throw_malformed_tool_call();
+        }
         if (parsed.is_tool_call_response && options_.chat_style == ChatStyle::Default &&
             options_.chat_template_path.empty()) {
             outcome.raw_tool_content = outcome.text;
@@ -464,8 +476,8 @@ void GenerationService::warmup() {
         content.type_raw = "text";
         turn.content.push_back(std::move(content));
         request.messages.push_back(std::move(turn));
-        request.max_tokens       = 4;
-        request.max_tokens_set   = true;
+        request.max_tokens     = 4;
+        request.max_tokens_set = true;
         // Warmup is internal startup priming and must not inherit the client-facing
         // request deadline (--pending-timeout-ms bounds incoming HTTP queue waiting).
         constexpr auto kWarmupTimeout = std::chrono::seconds(60);

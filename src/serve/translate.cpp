@@ -172,7 +172,8 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
         // replay cache has verified that every public field is unchanged.
         // The request retains structured calls for validation and tool history.
         if (turn.replay_content && turn.role == ChatRole::Assistant && !turn.tool_calls.empty() &&
-            (!turn.reasoning_content.empty() || turn.replay_content->find("</think>") == std::string::npos)) {
+            (!turn.reasoning_content.empty() ||
+             turn.replay_content->find("</think>") == std::string::npos)) {
             message.tool_calls.clear();
             ninfer::MessagePart text;
             text.text = *turn.replay_content;
@@ -220,6 +221,8 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
     input.options.preserve_thinking     = semantics.preserve_thinking;
     input.options.add_vision_id         = false;
     input.options.tool_jsons            = effective_tool_jsons(request);
+    input.options.require_tool_call     = request.tool_choice.mode == ToolChoiceMode::Required ||
+                                      request.tool_choice.mode == ToolChoiceMode::Named;
     return input;
 }
 

@@ -12,6 +12,8 @@
 
 namespace ninfer::targets::qwen3_6 {
 
+class ToolGrammarPlan;
+
 inline constexpr std::size_t kPreparedVisionPatchFeatures = 3ULL * 2ULL * 16ULL * 16ULL;
 inline constexpr std::uint64_t kRawPatchesPerVisionToken  = 4;
 inline constexpr std::uint64_t kMaximumVisionTokens       = 32'768;
@@ -102,6 +104,7 @@ struct PreparedPromptData {
     std::vector<std::shared_ptr<const PreparedMediaPayload>> media_payloads;
     std::vector<VisionItem> vision_items;
     PromptIdentity identity;
+    std::shared_ptr<const ToolGrammarPlan> tool_grammar;
     bool starts_in_reasoning = false;
     PrepareStats prepare;
 

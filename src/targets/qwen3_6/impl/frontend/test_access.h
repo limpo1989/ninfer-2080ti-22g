@@ -9,7 +9,8 @@ namespace ninfer::targets::qwen3_6 {
 class FrontendTestAccess {
 public:
     [[nodiscard]] static Frontend create_component(const FrontendResources& resources,
-                                                   bool vision_enabled = true);
+                                                   bool vision_enabled       = true,
+                                                   bool tool_grammar_enabled = true);
     [[nodiscard]] static const PreparedPromptData& inspect(const PreparedPrompt& prompt);
 };
 

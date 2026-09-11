@@ -30,7 +30,18 @@ struct SamplingConfig {
     float frequency_penalty    = 0.0f;
     unsigned long long seed    = 0;
     std::int32_t* token_counts = nullptr; // device [token_domain] i32, or null
+    // Optional packed allow-bit mask on device. Layout is [columns,ceil(token_domain/32)] I32;
+    // speculative callers provide one column for every draft verification position and bonus.
+    const std::int32_t* token_bitmask = nullptr;
 };
+
+/**
+ * Sets disallowed logits to -infinity according to SamplingConfig::token_bitmask. `logits` is
+ * contiguous BF16 [physical_rows,total_columns], or [physical_rows,columns_per_request,batch].
+ * Configs contains one entry per request. A null mask leaves that request unchanged.
+ */
+void apply_token_bitmask(Tensor& logits, std::int32_t token_domain, const SamplingConfig* configs,
+                         std::int32_t columns_per_request, cudaStream_t stream);
 
 // Caller-owned transient capacity for every parallel sampling-lane count in the inclusive
 // interval. For sample(), one lane is one batch row; speculative acceptance uses the same
@@ -68,12 +79,14 @@ struct SamplingConfig {
  * (configs[b].seed,logical_positions[b],purpose), without mutable RNG state or dependence on the
  * compact row index. In the positive-temperature branch the selected token atomically increments
  * configs[b].token_counts when it is non-null. Non-null token-count arrays belonging to distinct
- * active requests must not alias. `out` must not overlap logits, configs, logical_positions, or any
- * token-count array. The Op writes all of out, uses caller-owned transient storage reported by
- * sampling_workspace_capacity_bytes(), and has no other persistent-state side effect.
+ * active requests must not alias. A non-null token bitmask replaces disallowed logits with
+ * negative infinity before selection; logits are otherwise unchanged. `out` must not overlap
+ * logits, configs, logical_positions, token bitmasks, or any token-count array. The Op writes all
+ * of out, uses caller-owned transient storage reported by sampling_workspace_capacity_bytes(), and
+ * has no other persistent-state side effect.
  */
-void sample(const Tensor& logits, Tensor& out, std::int32_t token_domain,
-            const SamplingConfig* configs, const Tensor& logical_positions, std::int32_t purpose,
-            WorkspaceArena& workspace, cudaStream_t stream);
+void sample(Tensor& logits, Tensor& out, std::int32_t token_domain, const SamplingConfig* configs,
+            const Tensor& logical_positions, std::int32_t purpose, WorkspaceArena& workspace,
+            cudaStream_t stream);
 
 } // namespace ninfer::ops

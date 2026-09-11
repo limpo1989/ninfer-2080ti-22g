@@ -214,6 +214,14 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     out.sampling_config = add_tensor(
         builder, DType::I32, {config_words, static_cast<std::int32_t>(plan.max_concurrency)},
         "sampling config");
+    const auto grammar_words = static_cast<std::int32_t>(
+        (static_cast<std::uint32_t>(TextConfig::token_domain) + 31U) / 32U);
+    const auto grammar_columns =
+        static_cast<std::int32_t>(plan.features.mtp() ? plan.draft_window + 1U : 1U);
+    out.tool_grammar_masks = add_tensor(
+        builder, DType::I32,
+        {grammar_words, grammar_columns, static_cast<std::int32_t>(plan.max_concurrency)},
+        "tool grammar token masks");
     out.tail_hidden = add_tensor(
         builder, DType::BF16, {TextConfig::hidden, static_cast<std::int32_t>(plan.max_concurrency)},
         "tail hidden");
@@ -255,9 +263,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
             return ops::kvarn_gqa_attention_workspace_capacity_bytes(
                 TextConfig::query_heads, TextConfig::head_dim, max_width, batch_size);
         }
-        return ops::gqa_attention_workspace_capacity_bytes(TextConfig::query_heads, plan.kv_dtype,
-                                                           envelope, batch_size, min_width,
-                                                           max_width);
+        return ops::gqa_attention_workspace_capacity_bytes(
+            TextConfig::query_heads, plan.kv_dtype, envelope, batch_size, min_width, max_width);
     };
 
     const auto text_common_root = [&](WorkspaceLayoutBuilder& layout, std::int32_t tokens) {
@@ -740,11 +747,11 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .prefill_chunk       = std::min(options.prefill_chunk, options.max_context),
         .draft_window        = options.speculative.draft_tokens,
         .speculative_backend = options.speculative.backend,
-        .kv_dtype       = kv_storage_is_kvarn(options.kv_cache) ? DType::U8
-                          : options.kv_cache == KvCacheStorage::BFloat16 ? DType::BF16
-                                                                         : DType::I8,
-        .kv_quant_group = options.kv_cache == KvCacheStorage::Int8Group64 ? qwen3_6::kKvQuantGroup
-                                                                         : 0,
+        .kv_dtype            = kv_storage_is_kvarn(options.kv_cache)          ? DType::U8
+                               : options.kv_cache == KvCacheStorage::BFloat16 ? DType::BF16
+                                                                              : DType::I8,
+        .kv_quant_group =
+            options.kv_cache == KvCacheStorage::Int8Group64 ? qwen3_6::kKvQuantGroup : 0,
         .kvarn          = kv_storage_kvarn_format(options.kv_cache),
         .kv_storage     = options.kv_cache,
         .proposal_head  = options.speculative.proposal_head,

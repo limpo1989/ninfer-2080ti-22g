@@ -683,6 +683,17 @@ std::vector<int> Tokenizer::encode(std::string_view text, EncodeOptions options)
     return ids;
 }
 
+std::vector<std::string> Tokenizer::grammar_vocabulary() const {
+    std::vector<std::string> result = id_to_token_;
+    for (std::size_t id = 0; id < valid_token_ids_.size(); ++id) {
+        if (!valid_token_ids_[id]) { result[id].clear(); }
+    }
+    for (const AddedToken& token : added_tokens_) {
+        if (token.special) { result.at(static_cast<std::size_t>(token.id)).clear(); }
+    }
+    return result;
+}
+
 std::string Tokenizer::decode(std::span<const int> ids, DecodeOptions options) const {
     std::string text;
     const std::size_t terminal_stop_index =

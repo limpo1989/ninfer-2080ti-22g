@@ -69,9 +69,10 @@ int test_multiple_calls_and_json_values() {
 int test_parameter_order_survives_replay() {
     const auto result = ninfer::serve::parse_qwen_tool_call_output(
         "<tool_call>\n<function=run>\n<parameter=z>\n1\n</parameter>\n"
-        "<parameter=a>\n2\n</parameter>\n</function>\n</tool_call>", 64);
+        "<parameter=a>\n2\n</parameter>\n</function>\n</tool_call>",
+        64);
     return check(result.is_tool_call_response &&
-                 result.tool_calls[0].arguments_json == R"({"z":1,"a":2})",
+                     result.tool_calls[0].arguments_json == R"({"z":1,"a":2})",
                  "tool parameter order changed between generation and replay");
 }
 
@@ -83,13 +84,14 @@ int test_parameter_whitespace_survives_replay() {
         "<parameter=inline>  literal  </parameter>\n"
         "<parameter=quoted>\n\"  quoted  \"\n</parameter>\n"
         "<parameter=windows>\r\n  line\r\n\r\n</parameter>\n"
-        "</function>\n</tool_call>", 64);
+        "</function>\n</tool_call>",
+        64);
     if (!result.is_tool_call_response) { return fail("whitespace-bearing tool call was rejected"); }
     const auto args = Json::parse(result.tool_calls.front().arguments_json);
     return check(args.at("old_string") == "  const HIP = 10;" &&
-                 args.at("new_string") == "\n\tconst HIP = 20;  \n" &&
-                 args.at("inline") == "  literal  " && args.at("quoted") == "  quoted  " &&
-                 args.at("windows") == "  line\r\n",
+                     args.at("new_string") == "\n\tconst HIP = 20;  \n" &&
+                     args.at("inline") == "  literal  " && args.at("quoted") == "  quoted  " &&
+                     args.at("windows") == "  line\r\n",
                  "tool string indentation and blank lines must survive parsing");
 }
 
@@ -99,6 +101,8 @@ int test_malformed_falls_back_to_text() {
         ninfer::serve::parse_qwen_tool_call_output(text, 64);
     int failures = 0;
     failures += check(!parsed.is_tool_call_response, "malformed xml is not tool response");
+    failures +=
+        check(parsed.malformed_tool_call, "tool-shaped malformed output was not classified");
     failures += check(parsed.content == text, "malformed xml preserved as text");
     failures += check(parsed.tool_calls.empty(), "malformed xml has no calls");
     return failures;
@@ -115,6 +119,7 @@ int test_suffix_after_tool_falls_back_to_text() {
         ninfer::serve::parse_qwen_tool_call_output(text, 64);
     int failures = 0;
     failures += check(!parsed.is_tool_call_response, "non-whitespace suffix falls back to text");
+    failures += check(parsed.malformed_tool_call, "tool suffix failure was not classified");
     failures += check(parsed.content == text, "suffix fallback preserves text");
     return failures;
 }

@@ -8,7 +8,24 @@
 #include "ops/kernel/sampling.cuh"
 #include "core/device.h"
 
+#include <algorithm>
+
 namespace ninfer::ops::detail {
+
+void apply_token_bitmask_launch(Tensor& logits, std::int32_t token_domain,
+                                const SamplingConfig* configs, std::int32_t columns_per_request,
+                                cudaStream_t stream) {
+    constexpr int kBlock             = 256;
+    const std::int32_t total_columns = logits.ne[1] * logits.ne[2];
+    const std::int32_t batch         = total_columns / columns_per_request;
+    const auto vocab_blocks = static_cast<unsigned int>(std::min(32, div_up(token_domain, kBlock)));
+    const dim3 grid(vocab_blocks, static_cast<unsigned int>(columns_per_request),
+                    static_cast<unsigned int>(batch));
+    apply_token_bitmask_kernel<<<grid, kBlock, 0, stream>>>(
+        static_cast<__nv_bfloat16*>(logits.data), configs, token_domain, logits.ne[0],
+        columns_per_request);
+    CUDA_CHECK(cudaGetLastError());
+}
 
 std::size_t sampling_workspace_exact_bytes(std::int32_t token_domain, std::int32_t columns) {
     return make_sampling_workspace_layout(token_domain, columns).bytes;

@@ -235,6 +235,17 @@ session log and checks their token counts. `tools/bench/run_pi_ai_cache.mjs` tes
 Responses serialization path. Both need a separately installed `@earendil-works/pi-ai` package
 whose directory is supplied through `NINFER_PI_AI_ROOT`; they do not modify the client or its settings.
 
+### Structured tool decoding
+
+Qwen function calls use XGrammar structural decoding on the ordinary and MTP paths. Automatic tool
+choice does not force a call or constrain normal reasoning/text, but once the model starts the
+`<tool_call>` marker, per-token masks require a declared function name and a complete Qwen XML call.
+MTP applies the grammar independently at every draft and bonus position. `strict:true` functions
+also enforce their parameter JSON Schema; non-strict functions retain open parameters while keeping
+the envelope structurally valid. Malformed tool-shaped output fails closed instead of appearing as
+assistant text. DFlash retains parser-only automatic tool handling and rejects `strict:true`,
+required, or named tool contracts rather than silently ignoring their constraints.
+
 ### Responses cache reuse
 
 The builtin template replays the actual `<think>` / `</think>` tokens. Responses replay prefers
@@ -597,6 +608,8 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 
 - **Batched Decode**: Small-scale concurrent request scheduling with round-boundary compaction and CUDA Graph replay.
 - **Speculative Decoding**: Multi-Token Prediction (MTP) with draft windows (1–5 tokens) and optimized draft heads; DFlash support on 35B-A3B.
+- **Structural Tool Decoding**: XGrammar C++ constraints for Qwen XML calls, including native
+  per-position MTP verification and strict JSON Schema enforcement.
 - **Memory Management**: Paged INT8 (group-64) and BF16 KV cache with automatic VRAM capacity detection and prefix reuse.
 - **Native Vision**: Image and video token encoding with frozen request-transient allocations.
 - **Compiled Chat Frontend**: In-engine chat template rendering avoiding Python/Jinja runtime overhead.

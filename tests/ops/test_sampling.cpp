@@ -43,7 +43,7 @@ bool same_config(const ops::SamplingConfig& a, const ops::SamplingConfig& b) {
     return a.temperature == b.temperature && a.top_k == b.top_k && a.top_p == b.top_p &&
            a.min_p == b.min_p && a.presence_penalty == b.presence_penalty &&
            a.frequency_penalty == b.frequency_penalty && a.seed == b.seed &&
-           a.token_counts == b.token_counts;
+           a.token_counts == b.token_counts && a.token_bitmask == b.token_bitmask;
 }
 
 std::vector<std::uint16_t> bf16_bits(const std::vector<float>& values) {
@@ -579,6 +579,78 @@ int workspace_route_boundary_contract() {
     return failures;
 }
 
+int token_bitmask_contract() {
+    constexpr int physical_rows = 8;
+    constexpr int token_domain  = 6;
+    constexpr int batch         = 2;
+    std::vector<float> logits(static_cast<std::size_t>(physical_rows) * batch, -10.0F);
+    logits[1]                 = 9.0F;
+    logits[3]                 = 5.0F;
+    logits[physical_rows + 1] = 9.0F;
+    logits[physical_rows + 3] = 5.0F;
+
+    DeviceBuffer device_logits = to_device(bf16_bits(logits));
+    DeviceBuffer device_mask   = to_device(std::vector<std::int32_t>{1 << 3});
+    std::vector<ops::SamplingConfig> configs(batch);
+    configs[0].token_bitmask      = static_cast<const std::int32_t*>(device_mask.p);
+    DeviceBuffer device_configs   = to_device(configs);
+    DeviceBuffer device_positions = to_device(std::vector<std::int32_t>{0, 0});
+    GuardedDeviceBuffer device_out(batch * sizeof(std::int32_t));
+    Tensor logits_tensor(device_logits.p, DType::BF16, {physical_rows, batch});
+    Tensor out_tensor(device_out.data(), DType::I32, {batch});
+    Tensor positions_tensor(device_positions.p, DType::I32, {batch});
+    WorkspaceArena workspace(256);
+    ops::sample(logits_tensor, out_tensor, token_domain,
+                static_cast<const ops::SamplingConfig*>(device_configs.p), positions_tensor,
+                ops::kSamplePurposeDecode, workspace, nullptr);
+    cuda_synchronize();
+
+    int failures = verify_exact("sample per-request token bitmask",
+                                from_device<int>(device_out.data(), batch), {3, 1});
+    failures += device_out.verify_guards("sample token bitmask output");
+    return failures;
+}
+
+int speculative_position_bitmask_contract() {
+    constexpr int physical_rows = 8;
+    constexpr int token_domain  = 6;
+    constexpr int columns       = 3;
+    constexpr int batch         = 2;
+    std::vector<float> logits(static_cast<std::size_t>(physical_rows) * columns * batch, 1.0F);
+    const std::vector<std::uint16_t> input = bf16_bits(logits);
+    DeviceBuffer device_logits             = to_device(input);
+    const std::vector<std::int32_t> masks{1 << 1, 1 << 2, 1 << 3};
+    DeviceBuffer device_masks = to_device(masks);
+    std::vector<ops::SamplingConfig> configs(batch);
+    configs[0].token_bitmask    = static_cast<const std::int32_t*>(device_masks.p);
+    DeviceBuffer device_configs = to_device(configs);
+    Tensor logits_tensor(device_logits.p, DType::BF16, {physical_rows, columns, batch});
+    ops::apply_token_bitmask(logits_tensor, token_domain,
+                             static_cast<const ops::SamplingConfig*>(device_configs.p), columns,
+                             nullptr);
+    cuda_synchronize();
+
+    const std::vector<std::uint16_t> actual =
+        from_device<std::uint16_t>(device_logits, input.size());
+    int failures = 0;
+    for (int request = 0; request < batch; ++request) {
+        for (int column = 0; column < columns; ++column) {
+            for (int token = 0; token < token_domain; ++token) {
+                const std::size_t index =
+                    (static_cast<std::size_t>(request) * columns + column) * physical_rows + token;
+                const bool should_survive = request == 1 || token == column + 1;
+                const float value         = bf16_to_f32(actual[index]);
+                if ((should_survive && value != 1.0F) || (!should_survive && !std::isinf(value))) {
+                    std::cerr << "speculative mask mismatch at request=" << request
+                              << " column=" << column << " token=" << token << '\n';
+                    ++failures;
+                }
+            }
+        }
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -608,6 +680,8 @@ int main() {
     failures += real_shape_distribution_contract();
     failures += rng_key_contract();
     failures += workspace_route_boundary_contract();
+    failures += token_bitmask_contract();
+    failures += speculative_position_bitmask_contract();
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " sample public contract\n";
     return failures == 0 ? 0 : 1;

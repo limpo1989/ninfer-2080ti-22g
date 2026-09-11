@@ -21,10 +21,16 @@ std::string parameter_value(std::string_view text) {
     // The template places one newline on each side of a parameter value.
     // Everything inside those delimiters belongs to the value, including code
     // indentation and intentional leading/trailing blank lines.
-    if (text.starts_with("\r\n")) { text.remove_prefix(2); }
-    else if (text.starts_with("\n")) { text.remove_prefix(1); }
-    if (text.ends_with("\r\n")) { text.remove_suffix(2); }
-    else if (text.ends_with("\n")) { text.remove_suffix(1); }
+    if (text.starts_with("\r\n")) {
+        text.remove_prefix(2);
+    } else if (text.starts_with("\n")) {
+        text.remove_prefix(1);
+    }
+    if (text.ends_with("\r\n")) {
+        text.remove_suffix(2);
+    } else if (text.ends_with("\n")) {
+        text.remove_suffix(1);
+    }
     return std::string(text);
 }
 
@@ -119,9 +125,10 @@ bool parse_one_tool_call(std::string_view block, std::size_t max_name_length, To
     return true;
 }
 
-ParsedToolCallOutput fallback(const std::string& text) {
+ParsedToolCallOutput fallback(const std::string& text, bool malformed_tool_call = false) {
     ParsedToolCallOutput out;
-    out.content = text;
+    out.content             = text;
+    out.malformed_tool_call = malformed_tool_call;
     return out;
 }
 
@@ -142,20 +149,20 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
     while (pos < text.size()) {
         skip_ws(text, pos);
         if (pos >= text.size()) { break; }
-        if (!starts_with_at(text, pos, kToolOpen)) { return fallback(text); }
+        if (!starts_with_at(text, pos, kToolOpen)) { return fallback(text, true); }
         const std::size_t inner_begin = pos + kToolOpen.size();
         const std::size_t close       = text.find(kToolClose, inner_begin);
-        if (close == std::string::npos) { return fallback(text); }
+        if (close == std::string::npos) { return fallback(text, true); }
         ToolCall call;
         if (!parse_one_tool_call(std::string_view(text).substr(inner_begin, close - inner_begin),
                                  max_tool_name_length, call)) {
-            return fallback(text);
+            return fallback(text, true);
         }
         out.tool_calls.push_back(std::move(call));
         pos = close + kToolClose.size();
     }
 
-    if (out.tool_calls.empty()) { return fallback(text); }
+    if (out.tool_calls.empty()) { return fallback(text, true); }
     out.is_tool_call_response = true;
     return out;
 }

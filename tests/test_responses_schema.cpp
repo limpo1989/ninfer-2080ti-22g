@@ -222,9 +222,9 @@ int test_reasoning_effort() {
     high["reasoning"]                    = Json{{"effort", "high"}};
     const GenerationRequest high_request = parse_responses_request(high, limits()).generation;
     failures += check(resolve_prompt_semantics(high_request, ServeOptions{}, effort_capabilities())
-                          .reasoning_effort == ninfer::ReasoningEffort::XHigh,
+                              .reasoning_effort == ninfer::ReasoningEffort::XHigh,
                       "Responses high alias did not resolve to xhigh");
-    auto unavailable = effort_capabilities();
+    auto unavailable                   = effort_capabilities();
     unavailable.reasoning_effort.xhigh = false;
     failures += check(api_code([&] {
                           (void)resolve_prompt_semantics(high_request, ServeOptions{}, unavailable);
@@ -236,8 +236,8 @@ int test_reasoning_effort() {
         compatible["reasoning"] = Json{{"effort", "xhigh"}, {"summary", summary}};
         failures +=
             check(parse_responses_request(compatible, limits()).generation.reasoning_effort ==
-                              RequestedReasoningEffort::XHigh,
-                          std::string("Responses rejected compatible reasoning summary ") + summary);
+                      RequestedReasoningEffort::XHigh,
+                  std::string("Responses rejected compatible reasoning summary ") + summary);
     }
     Json null_summary         = base;
     null_summary["reasoning"] = Json{{"effort", "medium"}, {"summary", nullptr}};
@@ -457,12 +457,14 @@ int test_explicit_rejections() {
     const Json base = {{"model", "qwen3.6-27b"}, {"input", "hello"}, {"max_output_tokens", 32}};
     int failures    = 0;
 
-    Json strict     = base;
-    strict["tools"] = Json::array({Json{
-        {"type", "function"}, {"name", "f"}, {"parameters", Json::object()}, {"strict", true}}});
-    failures += check(api_code([&] { (void)parse_responses_request(strict, limits()); }) ==
-                          "strict_tools_not_supported",
-                      "strict tools rejected explicitly");
+    Json strict                           = base;
+    strict["tools"]                       = Json::array({Json{
+                              {"type", "function"}, {"name", "f"}, {"parameters", Json::object()}, {"strict", true}}});
+    const ResponsesRequest strict_request = parse_responses_request(strict, limits());
+    failures += check(strict_request.generation.tools.size() == 1 &&
+                          strict_request.generation.tools.front().strict &&
+                          strict_request.tools.front().at("strict") == true,
+                      "strict tool schema did not reach generation and response metadata");
 
     Json required           = base;
     required["tools"]       = Json::array({Json{{"type", "function"}, {"name", "f"}}});
@@ -649,7 +651,7 @@ int test_sse_keepalive_activity() {
                       "each keepalive must emit one pi-ai-visible empty reasoning delta");
     failures +=
         check(finish.response.body.at("output").at(0).at("content").at(0).at("text") == "thought",
-                      "keepalive changed terminal reasoning text");
+              "keepalive changed terminal reasoning text");
 
     ResponsesRuntimeValues no_thinking;
     no_thinking.enable_thinking = false;
@@ -666,8 +668,8 @@ int test_reasoning_replay_is_not_duplicated() {
     Json reasoning = {
         {"type", "reasoning"},
         {"id", "rs_replay"},
-                      {"summary", Json::array({Json{{"type", "summary_text"}, {"text", "summary"}}})},
-                      {"content", Json::array({Json{{"type", "reasoning_text"}, {"text", "raw thought"}}})}};
+        {"summary", Json::array({Json{{"type", "summary_text"}, {"text", "summary"}}})},
+        {"content", Json::array({Json{{"type", "reasoning_text"}, {"text", "raw thought"}}})}};
     auto parse = [&](const Json& item) {
         return parse_responses_request(
             Json{
@@ -693,24 +695,24 @@ int test_text_and_tool_call_replay_stays_one_turn() {
               Json::array({Json{{"role", "user"}, {"content", "Look it up"}},
                            Json{{"type", "reasoning"},
                                 {"content", Json::array({Json{{"type", "reasoning_text"},
-                  {"text", "Need the data"}}})}},
-            Json{{"role", "assistant"}, {"content", "I will check the record."}},
+                                                              {"text", "Need the data"}}})}},
+                           Json{{"role", "assistant"}, {"content", "I will check the record."}},
                            Json{{"type", "function_call"},
                                 {"call_id", "call_a"},
                                 {"name", "lookup"},
-                 {"arguments", R"({"key":"a"})"}},
+                                {"arguments", R"({"key":"a"})"}},
                            Json{{"type", "function_call"},
                                 {"call_id", "call_b"},
                                 {"name", "lookup"},
-                 {"arguments", R"({"key":"b"})"}},
+                                {"arguments", R"({"key":"b"})"}},
                            Json{{"type", "function_call_output"},
                                 {"call_id", "call_a"},
                                 {"output", "17"}}})}},
         limits());
     return check(request.input_turns.size() == 3 &&
-                 request.input_turns[1].reasoning_content == "Need the data" &&
-                 request.input_turns[1].content[0].text == "I will check the record." &&
-                 request.input_turns[1].tool_calls.size() == 2,
+                     request.input_turns[1].reasoning_content == "Need the data" &&
+                     request.input_turns[1].content[0].text == "I will check the record." &&
+                     request.input_turns[1].tool_calls.size() == 2,
                  "assistant text and following tool calls were split into separate turns");
 }
 
@@ -760,11 +762,11 @@ int test_input_tokens_schema() {
                           Json{{"object", "response.input_tokens"}, {"input_tokens", 9}},
                       "input_tokens response shape");
     failures += check(api_code([&] {
-                  (void)parse_response_input_tokens_request(
-                      Json{{"model", "qwen3.6-27b"}, {"input", "hello"}, {"stream", true}},
-                      limits());
-              }) == "unknown_parameter",
-              "input_tokens rejects generation-only options");
+                          (void)parse_response_input_tokens_request(
+                              Json{{"model", "qwen3.6-27b"}, {"input", "hello"}, {"stream", true}},
+                              limits());
+                      }) == "unknown_parameter",
+                      "input_tokens rejects generation-only options");
     const auto with_tools = parse_response_input_tokens_request(
         Json{{"model", "qwen3.6-27b"},
              {"input", "hello"},
@@ -777,10 +779,10 @@ int test_input_tokens_schema() {
         limits());
     failures +=
         check(with_tools.generation.tools.size() == 1 && with_tools.instructions == "Use tools." &&
-                          with_tools.generation.messages.size() == 2 &&
-                          with_tools.generation.messages.front().content.front().text == "Use tools." &&
-                          with_tools.generation.reasoning_effort.has_value(),
-                      "input_tokens retains tool schemas and prompt-affecting options");
+                  with_tools.generation.messages.size() == 2 &&
+                  with_tools.generation.messages.front().content.front().text == "Use tools." &&
+                  with_tools.generation.reasoning_effort.has_value(),
+              "input_tokens retains tool schemas and prompt-affecting options");
     return failures;
 }
 

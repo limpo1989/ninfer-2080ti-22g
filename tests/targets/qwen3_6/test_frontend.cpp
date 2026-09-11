@@ -1,5 +1,6 @@
 #include <ninfer/targets/qwen3_6/frontend.h>
 #include <ninfer/targets/qwen3_6/frontend_resources.h>
+#include <ninfer/targets/qwen3_6/prepared_prompt.h>
 
 #include "targets/qwen3_6/impl/frontend/chat_template.h"
 #include "targets/qwen3_6/impl/frontend/media_cache.h"
@@ -17,6 +18,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <fstream>
 #include <future>
 #include <iostream>
@@ -88,13 +90,23 @@ const fi::CompiledChatTemplate& reasoning_effort_template() {
     return value;
 }
 
+const std::string& official_tokenizer_root() {
+    static const std::string root = [] {
+        const char* override_path = std::getenv("NINFER_TEST_QWEN_TOKENIZER_DIR");
+        return override_path != nullptr
+                   ? std::string(override_path)
+                   : std::string("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16");
+    }();
+    return root;
+}
+
 const fi::Tokenizer& official_tokenizer() {
-    static const std::string tokenizer_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/tokenizer.json");
+    const std::string& root                 = official_tokenizer_root();
+    static const std::string tokenizer_json = read_file((root + "/tokenizer.json").c_str());
     static const std::string tokenizer_config_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/tokenizer_config.json");
+        read_file((root + "/tokenizer_config.json").c_str());
     static const std::string generation_config_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/generation_config.json");
+        read_file((root + "/generation_config.json").c_str());
     static const fi::Tokenizer tokenizer({.tokenizer_json         = tokenizer_json,
                                           .tokenizer_config_json  = tokenizer_config_json,
                                           .generation_config_json = generation_config_json});
@@ -162,6 +174,16 @@ FrontendResources resources(const std::string& chat_template = thinking_toggle_t
         R"({"patch_size":16,"temporal_patch_size":2,"merge_size":2,"image_mean":[0.5,0.5,0.5],"image_std":[0.5,0.5,0.5],"size":{"shortest_edge":4096,"longest_edge":16777216}})";
     result.video_preprocessor_config_json =
         R"({"patch_size":16,"temporal_patch_size":2,"merge_size":2,"image_mean":[0.5,0.5,0.5],"image_std":[0.5,0.5,0.5],"size":{"shortest_edge":4096,"longest_edge":25165824}})";
+    return result;
+}
+
+FrontendResources official_frontend_resources() {
+    FrontendResources result      = resources();
+    const std::string& root       = official_tokenizer_root();
+    result.tokenizer_json         = read_file((root + "/tokenizer.json").c_str());
+    result.tokenizer_config_json  = read_file((root + "/tokenizer_config.json").c_str());
+    result.chat_template_jinja    = read_file((root + "/chat_template.jinja").c_str());
+    result.generation_config_json = read_file((root + "/generation_config.json").c_str());
     return result;
 }
 
@@ -1286,6 +1308,54 @@ int test_many_images_prepare_in_one_parallel_batch() {
                  "one request with 19 distinct images did not complete as a parallel media batch");
 }
 
+ninfer::ChatMessage prompt_text(std::string text) {
+    ninfer::ChatMessage message;
+    message.role = ninfer::ChatRole::User;
+    message.parts.push_back(ninfer::MessagePart{
+        .kind = ninfer::MessagePartKind::Text, .text = std::move(text), .media = {}});
+    return message;
+}
+
+int test_parser_only_backend_rejects_enforced_tool_contracts() {
+    const FrontendResources owned = official_frontend_resources();
+    const Frontend constrained    = FrontendFactory::create_component(owned);
+    const Frontend parser_only    = FrontendFactory::create_component(owned, true, false);
+
+    ninfer::PromptInput enabled;
+    enabled.messages.push_back(prompt_text("plain"));
+    enabled.options.tool_jsons.push_back(
+        R"({"type":"function","function":{"name":"edit","parameters":{"type":"object"},"strict":false}})");
+    auto enabled_prompt = constrained.prepare(std::move(enabled));
+    int failures        = check(FrontendFactory::inspect(enabled_prompt).tool_grammar != nullptr,
+                                "constrained backend discarded its tool grammar");
+
+    ninfer::PromptInput strict;
+    strict.messages.push_back(prompt_text("plain"));
+    strict.options.tool_jsons.push_back(
+        R"({"type":"function","function":{"name":"edit","parameters":{"type":"object"},"strict":true}})");
+    failures +=
+        check(throws_invalid_argument([&] { (void)parser_only.prepare(std::move(strict)); }),
+              "parser-only backend accepted a strict tool schema");
+
+    ninfer::PromptInput required;
+    required.messages.push_back(prompt_text("plain"));
+    required.options.tool_jsons.push_back(
+        R"({"type":"function","function":{"name":"edit","parameters":{"type":"object"},"strict":false}})");
+    required.options.require_tool_call = true;
+    failures +=
+        check(throws_invalid_argument([&] { (void)parser_only.prepare(std::move(required)); }),
+              "parser-only backend accepted required tool choice");
+
+    ninfer::PromptInput automatic;
+    automatic.messages.push_back(prompt_text("plain"));
+    automatic.options.tool_jsons.push_back(
+        R"({"type":"function","function":{"name":"edit","parameters":{"type":"object"},"strict":false}})");
+    auto prepared = parser_only.prepare(std::move(automatic));
+    failures += check(!FrontendFactory::inspect(prepared).tool_grammar,
+                      "parser-only backend unexpectedly retained a tool grammar");
+    return failures;
+}
+
 int test_media_preparation_cancellation() {
     const Frontend frontend = FrontendFactory::create_component(resources());
     ninfer::PreparationControl control{
@@ -1304,7 +1374,14 @@ int test_media_preparation_cancellation() {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 2 && std::string_view(argv[1]) == "--tool-grammar-only") {
+        return test_parser_only_backend_rejects_enforced_tool_contracts() == 0 ? 0 : 1;
+    }
+    if (argc != 1) {
+        std::cerr << "usage: " << argv[0] << " [--tool-grammar-only]\n";
+        return 2;
+    }
     const FrontendResources owned = resources();
     const Frontend frontend       = FrontendFactory::create_component(owned);
     int failures                  = 0;
@@ -1331,6 +1408,7 @@ int main() {
     failures += test_media_cache_singleflight();
     failures += test_media_cache_runs_independent_misses_in_parallel();
     failures += test_many_images_prepare_in_one_parallel_batch();
+    failures += test_parser_only_backend_rejects_enforced_tool_contracts();
     failures += test_media_preparation_cancellation();
     failures += test_disabled_vision();
     return failures == 0 ? 0 : 1;

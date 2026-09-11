@@ -2,6 +2,7 @@
 
 #include <ninfer/targets/qwen3_6/frontend_resources.h>
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
+#include <ninfer/targets/qwen3_6/tool_grammar.h>
 
 #include "targets/qwen3_6/impl/frontend/chat_template.h"
 #include "targets/qwen3_6/impl/frontend/media_cache.h"
@@ -69,6 +70,20 @@ Json parse_resource_json(std::string_view bytes, std::string_view name) {
     } catch (const nlohmann::json::exception& error) {
         throw std::invalid_argument("malformed " + std::string(name) + ": " + error.what());
     }
+}
+
+bool has_strict_tool(std::span<const std::string> tool_jsons) {
+    for (const std::string& source : tool_jsons) {
+        try {
+            const Json tool = Json::parse(source);
+            if (!tool.is_object()) { continue; }
+            const Json& function = tool.contains("function") ? tool.at("function") : tool;
+            if (function.is_object() && function.value("strict", false)) { return true; }
+        } catch (const nlohmann::json::exception& error) {
+            throw std::invalid_argument(std::string("invalid tool definition: ") + error.what());
+        }
+    }
+    return false;
 }
 
 std::int64_t require_integer(const Json& object, std::string_view field,
@@ -207,16 +222,16 @@ void validate_tokenizer_config(const FrontendResources& resources, bool template
 }
 
 fi::CompiledChatTemplate compile_chat_template(const FrontendResources& resources,
-                                              ChatStyle chat_style,
-                                              const std::string& chat_template_override) {
+                                               ChatStyle chat_style,
+                                               const std::string& chat_template_override) {
     const bool overridden = !chat_template_override.empty();
     validate_tokenizer_config(resources, overridden);
     // An overriding template is deliberately different from the artifact's, so it
     // never matches the built-in digests and always takes the interpreted path.
-    return fi::CompiledChatTemplate::resolve(
-        overridden ? std::string_view(chat_template_override)
-                   : std::string_view(resources.chat_template_jinja),
-        chat_style);
+    return fi::CompiledChatTemplate::resolve(overridden
+                                                 ? std::string_view(chat_template_override)
+                                                 : std::string_view(resources.chat_template_jinja),
+                                             chat_style);
 }
 
 [[noreturn]] void throw_processor_error(const fi::ProcessorError& error) {
@@ -605,12 +620,14 @@ DecoderState terminal_state(DecoderState state) {
 class Frontend::Impl {
 public:
     Impl(const FrontendResources& resources, bool registered_checkpoint, FrontendOptions options)
-        : chat_template(compile_chat_template(resources, options.chat_style, options.chat_template_override)),
+        : chat_template(
+              compile_chat_template(resources, options.chat_style, options.chat_template_override)),
           tokenizer(std::make_shared<const fi::Tokenizer>(
               fi::TokenizerResources{.tokenizer_json         = resources.tokenizer_json,
                                      .tokenizer_config_json  = resources.tokenizer_config_json,
                                      .generation_config_json = resources.generation_config_json})),
-          processor(processor_options(resources)), vision_enabled(options.vision_enabled) {
+          processor(processor_options(resources)), vision_enabled(options.vision_enabled),
+          tool_grammar_enabled(options.tool_grammar_enabled) {
         if (options.max_context == 0) {
             throw std::invalid_argument("frontend max_context must be nonzero");
         }
@@ -637,14 +654,22 @@ public:
             }
             defaults.token_ids.push_back(token);
         }
+        if (tool_grammar_enabled) {
+            std::vector<std::int32_t> stop_token_ids(defaults.token_ids.begin(),
+                                                     defaults.token_ids.end());
+            tool_grammar = std::make_unique<ToolGrammarCompiler>(tokenizer->grammar_vocabulary(),
+                                                                 std::move(stop_token_ids));
+        }
     }
 
     fi::CompiledChatTemplate chat_template;
     std::shared_ptr<const fi::Tokenizer> tokenizer;
     fi::ProcessorOptions processor;
     std::shared_ptr<fi::MediaPreprocessCache> media_cache;
+    std::unique_ptr<ToolGrammarCompiler> tool_grammar;
     StopPolicy defaults;
-    bool vision_enabled = true;
+    bool vision_enabled       = true;
+    bool tool_grammar_enabled = true;
 };
 
 class OutputSession::Impl {
@@ -858,10 +883,11 @@ Frontend make_frontend(const FrontendResources& resources, FrontendOptions optio
 }
 
 Frontend FrontendTestAccess::create_component(const FrontendResources& resources,
-                                              bool vision_enabled) {
+                                              bool vision_enabled, bool tool_grammar_enabled) {
     FrontendOptions options;
-    options.vision_enabled = vision_enabled;
-    options.max_context    = static_cast<std::uint32_t>(kMaximumVisionTokens);
+    options.vision_enabled       = vision_enabled;
+    options.tool_grammar_enabled = tool_grammar_enabled;
+    options.max_context          = static_cast<std::uint32_t>(kMaximumVisionTokens);
     return Frontend(std::make_shared<const Frontend::Impl>(resources, false, options));
 }
 
@@ -882,8 +908,28 @@ const PreparedPromptData& FrontendTestAccess::inspect(const PreparedPrompt& prom
 
 PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& control) const {
     fi::check_preparation_control(control);
-    const auto start                      = Clock::now();
-    const PromptOptions options           = input.options;
+    const auto start            = Clock::now();
+    const PromptOptions options = input.options;
+    if (options.require_tool_call && options.tool_jsons.empty()) {
+        throw std::invalid_argument("required tool call has no available functions");
+    }
+    if (!impl_->tool_grammar_enabled && options.require_tool_call) {
+        throw std::invalid_argument(
+            "required or named tool choice needs ordinary or MTP decoding; DFlash tool handling "
+            "is parser-only");
+    }
+    if (!impl_->tool_grammar_enabled && has_strict_tool(options.tool_jsons)) {
+        throw std::invalid_argument(
+            "strict tool schemas need ordinary or MTP decoding; DFlash tool handling is "
+            "parser-only");
+    }
+    const std::shared_ptr<const ToolGrammarPlan> tool_grammar =
+        options.tool_jsons.empty() || !impl_->tool_grammar_enabled
+            ? nullptr
+            : impl_->tool_grammar->compile(options.tool_jsons, options.require_tool_call,
+                                           options.add_generation_prompt &&
+                                               options.enable_thinking);
+    fi::check_preparation_control(control, "tool grammar compilation");
     std::vector<fi::ChatMessage> messages = convert_messages(std::move(input.messages));
     const bool has_media =
         std::any_of(messages.begin(), messages.end(),
@@ -940,6 +986,7 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     }
     (void)checked_token_count(result.token_ids.size());
     result.identity.reusable   = true;
+    result.tool_grammar        = tool_grammar;
     result.starts_in_reasoning = options.add_generation_prompt && options.enable_thinking;
     result.prepare.seconds     = std::chrono::duration<double>(Clock::now() - start).count();
     return PreparedPrompt(std::move(prepared));

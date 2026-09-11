@@ -528,20 +528,20 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
         ops::rope(rope_positions, kCfg.rotary_dim, kCfg.rope_theta, kn, s);
         if (kvarn) {
             if (final_chunk) {
-                const std::size_t kv_bytes = static_cast<std::size_t>(kCfg.kv_size) * T *
-                                             dtype_size(DType::BF16);
-                CUDA_CHECK(cudaMemcpyAsync(kept_k.data, kn.data, kv_bytes, cudaMemcpyDeviceToDevice,
-                                           s));
-                CUDA_CHECK(cudaMemcpyAsync(kept_v.data, v.data, kv_bytes, cudaMemcpyDeviceToDevice,
-                                           s));
+                const std::size_t kv_bytes =
+                    static_cast<std::size_t>(kCfg.kv_size) * T * dtype_size(DType::BF16);
+                CUDA_CHECK(
+                    cudaMemcpyAsync(kept_k.data, kn.data, kv_bytes, cudaMemcpyDeviceToDevice, s));
+                CUDA_CHECK(
+                    cudaMemcpyAsync(kept_v.data, v.data, kv_bytes, cudaMemcpyDeviceToDevice, s));
             } else {
                 // Commit-only: this chunk contributes no attention output.
                 Tensor empty;
                 ops::kvarn_gqa_attention(empty, kn.view({kCfg.head_dim, kCfg.n_kv, T, 1}),
                                          v.view({kCfg.head_dim, kCfg.n_kv, T, 1}),
-                                         positions.view({T, 1}), Tensor{},
-                                         io_.backend_kv_table_row, kAttnScale,
-                                         batch_mtp_kv_->kvarn_batch_layer_view(0), work_, empty, s);
+                                         positions.view({T, 1}), Tensor{}, io_.backend_kv_table_row,
+                                         kAttnScale, batch_mtp_kv_->kvarn_batch_layer_view(0),
+                                         work_, empty, s);
             }
         } else {
             ops::gqa_kv_append(kn, v, positions, mtp_kv_.layer_view(0), s);
@@ -793,6 +793,10 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
         Tensor flat_tokens = target_tokens.view({columns});
         ops::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, flat_hidden, stream);
         ops::linear(flat_hidden, *lm_head_, flat_logits, stream);
+        if (sampling_config_ != nullptr) {
+            ops::apply_token_bitmask(flat_logits, kCfg.token_domain, sampling_config_, width,
+                                     stream);
+        }
         ops::argmax(flat_logits, flat_tokens, kCfg.token_domain, stream);
     }
     work_.reset();
@@ -906,10 +910,9 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
         Tensor position_batch = cache_positions.view({width, active_sequence_batch_});
         const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
         if (batch_text_kv_->kvarn()) {
-            ops::kvarn_gqa_attention(q_batch, k_batch, v_batch, position_batch, valid,
-                                     kv_table_rows, kAttnScale,
-                                     batch_text_kv_->kvarn_batch_layer_view(fidx), work_, a_batch,
-                                     s);
+            ops::kvarn_gqa_attention(
+                q_batch, k_batch, v_batch, position_batch, valid, kv_table_rows, kAttnScale,
+                batch_text_kv_->kvarn_batch_layer_view(fidx), work_, a_batch, s);
         } else {
             ops::gqa_attention(q_batch, k_batch, v_batch, position_batch, valid, kv_table_rows,
                                kAttnScale, batch_text_kv_->batch_layer_view(fidx),
@@ -1112,14 +1115,22 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
     if (instrument) {
         (void)cudaEventSynchronize(inst_ev.back());
         double full_ms = 0.0, gdn_ms = 0.0, mlp_ms = 0.0;
-        double worst = 0.0; int worst_layer = -1;
+        double worst    = 0.0;
+        int worst_layer = -1;
         for (int layer = 0; layer < kCfg.n_layers; ++layer) {
             float a = 0.0f, m = 0.0f;
             (void)cudaEventElapsedTime(&a, inst_ev[2 * layer], inst_ev[2 * layer + 1]);
             (void)cudaEventElapsedTime(&m, inst_ev[2 * layer + 1], inst_ev[2 * layer + 2]);
-            if (ModelConfig::is_full(layer)) { full_ms += a; } else { gdn_ms += a; }
+            if (ModelConfig::is_full(layer)) {
+                full_ms += a;
+            } else {
+                gdn_ms += a;
+            }
             mlp_ms += m;
-            if (a > worst) { worst = a; worst_layer = layer; }
+            if (a > worst) {
+                worst       = a;
+                worst_layer = layer;
+            }
         }
         std::cerr << "[layer-perf] full_attn=" << full_ms << "ms gdn=" << gdn_ms
                   << "ms mlp=" << mlp_ms << "ms worst_layer=" << worst_layer
@@ -1142,7 +1153,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
     const auto inst_host_t0 = std::chrono::steady_clock::now();
     cudaEvent_t inst_ev0    = nullptr;
     cudaEvent_t inst_ev1    = nullptr;
-    const bool instrument = profile_prefill_enabled();
+    const bool instrument   = profile_prefill_enabled();
     if (instrument) {
         (void)cudaEventCreate(&inst_ev0);
         (void)cudaEventCreate(&inst_ev1);
@@ -1150,7 +1161,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
     if (ids.size() > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::overflow_error("TextContext::prefill token count exceeds int32");
     }
-    cudaStream_t s           = ctx_.stream;
+    cudaStream_t s = ctx_.stream;
     if (instrument) { (void)cudaEventRecord(inst_ev0, s); }
     const int T              = static_cast<int>(ids.size());
     const int chunk          = static_cast<int>(prefill_chunk_);

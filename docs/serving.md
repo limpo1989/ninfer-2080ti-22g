@@ -291,9 +291,23 @@ Responses function definitions are flat rather than Chat Completions' nested `fu
 NInfer renders these definitions in the Qwen prompt and parses model output into separate
 `function_call` output Items. Each output has a protocol Item `id` (`fc_...`) and a distinct
 `call_id` (`call_...`). The client executes the function and sends a `function_call_output` Item in
-a later request. NInfer does not execute functions or enforce JSON Schema through constrained
-decoding, so `strict:true`, `tool_choice:required`, named tool choice, hosted tools, MCP tools, and
-custom free-form tools are rejected.
+a later request.
+
+The Qwen frontend compiles function tools into an XGrammar structural grammar. With ordinary decode
+or MTP, `tool_choice:auto` leaves reasoning and ordinary assistant text free, but the complete
+`<tool_call>` marker switches generation into the Qwen XML grammar. Function names, parameter
+boundaries, closing tags, and parallel-call separation are then constrained during sampling. A
+non-strict function permits arbitrary syntactically valid parameter names and values;
+`strict:true` additionally applies its parameter JSON Schema. MTP constructs a separate vocabulary
+mask for every verification draft and bonus position, so rejected syntax cannot be accepted through
+speculation. An incomplete or otherwise malformed tool-shaped terminal result fails with
+`malformed_tool_call` instead of being returned as assistant text. DFlash retains parser-only
+automatic tool handling; it rejects `strict:true`, required, and named tool contracts because that
+backend does not apply vocabulary masks.
+
+Responses still rejects `tool_choice:required`, named tool choice, hosted tools, MCP tools, and
+custom free-form tools. Chat Completions and Anthropic named/required choices use the corresponding
+forced Qwen grammar. NInfer does not execute tools.
 
 ### Response object and usage
 
@@ -727,9 +741,10 @@ exact accepted target prefix so a following compatible turn can still reuse it. 
 context-capacity finishes map to `length`/ `max_tokens`; ordinary model or string stops map to
 `stop`/ `end_turn`.
 
-Function tools are rendered into the model prompt and generated calls are parsed into protocol
-responses. NInfer does not execute tools and does not enforce client JSON Schema through constrained
-decoding.
+Function tools are rendered into the model prompt. Ordinary and MTP generation use a cached
+XGrammar Qwen structural grammar; strict functions also constrain the declared parameter schema.
+NInfer parses the completed structure into protocol responses but does not execute tools. DFlash
+retains parser-only automatic tool handling and rejects strict or forced tool contracts.
 
 Prompt-token usage includes chat-template and expanded media tokens. Generated-token usage comes
 from accepted output token IDs, including a stop token whose decoded text may be withheld.

@@ -11,6 +11,10 @@
 
 namespace ninfer::ops::detail {
 
+void apply_token_bitmask_launch(Tensor& logits, std::int32_t token_domain,
+                                const SamplingConfig* configs, std::int32_t columns_per_request,
+                                cudaStream_t stream);
+
 void sample_batch_launch(const Tensor& logits, Tensor& out, std::int32_t token_domain,
                          const SamplingConfig* configs, const Tensor& logical_positions,
                          std::int32_t purpose, DeviceSpan workspace, cudaStream_t stream);

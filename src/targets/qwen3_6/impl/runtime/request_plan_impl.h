@@ -35,6 +35,7 @@ ops::SamplingConfig translate_sampling(const ResolvedSamplingParameters& source)
     out.frequency_penalty = source.frequency_penalty;
     out.seed              = source.seed;
     out.token_counts      = nullptr;
+    out.token_bitmask     = nullptr;
     return out;
 }
 

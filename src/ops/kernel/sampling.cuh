@@ -11,6 +11,27 @@
 
 namespace ninfer::ops {
 
+__global__ void apply_token_bitmask_kernel(__nv_bfloat16* logits, const SamplingConfig* configs,
+                                           std::int32_t token_domain, std::int32_t physical_rows,
+                                           std::int32_t columns_per_request) {
+    const int request           = static_cast<int>(blockIdx.z);
+    const int column            = static_cast<int>(blockIdx.y);
+    const std::int32_t* bitmask = configs[request].token_bitmask;
+    if (bitmask == nullptr) { return; }
+
+    const int words = (token_domain + 31) / 32;
+    const std::int64_t logits_base =
+        (static_cast<std::int64_t>(request) * columns_per_request + column) * physical_rows;
+    const std::int64_t mask_base = static_cast<std::int64_t>(column) * words;
+    for (int token = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x; token < token_domain;
+         token += static_cast<int>(gridDim.x) * blockDim.x) {
+        const std::uint32_t word = static_cast<std::uint32_t>(bitmask[mask_base + token / 32]);
+        if ((word & (std::uint32_t{1} << static_cast<unsigned int>(token % 32))) == 0) {
+            logits[logits_base + token] = __float2bfloat16(-CUDART_INF_F);
+        }
+    }
+}
+
 __launch_bounds__(kSamplerBlock) __global__
     void sample_row_kernel(const __nv_bfloat16* logits, std::int32_t* out,
                            const SamplingConfig* configs, const std::int32_t* logical_positions,
