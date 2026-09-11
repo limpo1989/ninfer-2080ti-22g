@@ -26,6 +26,9 @@ TOOL_REPLAY_CACHE_MIB=${NINFER_TOOL_REPLAY_CACHE_MIB:-1024}
 STATE_CACHE_DIR=${NINFER_STATE_CACHE_DIR:-$BUNDLE_ROOT/state-cache}
 STATE_CACHE_MAX_MIB=${NINFER_STATE_CACHE_MAX_MIB:-8192}
 STATE_CACHE_RAM_MIB=${NINFER_STATE_CACHE_RAM_MIB:-4096}
+TURBO_POWER_LIMIT_W=280
+FAN_CURVE_SERVICE=${NINFER_FAN_CURVE_SERVICE:-nvidia-fan-curve.service}
+TURBO_MODE=false
 # Optional power override, disabled by default. Example: NINFER_GPU_POWER_LIMIT_W=280
 # An empty value leaves the driver's current limit unchanged (250 W by default on this host).
 GPU_POWER_LIMIT_W=${NINFER_GPU_POWER_LIMIT_W:-}
@@ -57,8 +60,40 @@ server_pids() {
     return 0
 }
 
+gpu_power_limit() {
+    local field=$1
+    nvidia-smi -i 0 --query-gpu="$field" --format=csv,noheader,nounits 2>/dev/null |
+        head -n 1 | tr -d '[:space:]'
+}
+
+restore_default_power_limit() {
+    local default_limit current_limit
+    default_limit=$(gpu_power_limit power.default_limit)
+    current_limit=$(gpu_power_limit power.limit)
+    [[ "$default_limit" =~ ^[0-9]+([.][0-9]+)?$ ]] || {
+        echo "Unable to read GPU 0 default power limit" >&2
+        return 1
+    }
+    if [[ "$current_limit" == "$default_limit" ]]; then
+        return 0
+    fi
+    printf 'Restoring GPU 0 default power limit: %s W\n' "$default_limit"
+    sudo nvidia-smi -i 0 --power-limit="$default_limit"
+}
+
+enable_aggressive_fan_curve() {
+    if ! systemctl is-active --quiet "$FAN_CURVE_SERVICE"; then
+        printf 'Starting aggressive GPU fan curve: %s\n' "$FAN_CURVE_SERVICE"
+        sudo systemctl start "$FAN_CURVE_SERVICE" || return 1
+    fi
+    systemctl is-active --quiet "$FAN_CURVE_SERVICE" || {
+        echo "Aggressive GPU fan curve is not active: $FAN_CURVE_SERVICE" >&2
+        return 1
+    }
+}
+
 stop_server() {
-    local pids
+    local pids power_restore_status=0
     pids=$(server_pids)
     if [[ -n "$pids" ]]; then
         echo "Stopping ninfer-serve: $pids"
@@ -74,12 +109,13 @@ stop_server() {
         fi
     fi
     rm -f "$PID_FILE"
+    restore_default_power_limit || power_restore_status=$?
 
     for _ in $(seq 1 60); do
         local used
         used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null |
             head -n 1 | tr -d ' ')
-        [[ ${used:-0} -lt 1000 ]] && return
+        [[ ${used:-0} -lt 1000 ]] && return "$power_restore_status"
         sleep 1
     done
     echo "GPU memory did not fall below 1000 MiB" >&2
@@ -92,6 +128,13 @@ start_server() {
     local -a sampling_args=()
     if [[ -n ${NINFER_SEED:-} ]]; then
         sampling_args+=(--seed "$NINFER_SEED")
+    fi
+
+    if [[ "$TURBO_MODE" == true ]]; then
+        enable_aggressive_fan_curve || return 1
+        GPU_POWER_LIMIT_W=$TURBO_POWER_LIMIT_W
+        printf 'Turbo mode: %s W power limit | aggressive fan curve active\n' \
+            "$GPU_POWER_LIMIT_W"
     fi
 
     if [[ -n "$GPU_POWER_LIMIT_W" ]]; then
@@ -126,6 +169,7 @@ start_server() {
         if ! kill -0 "$pid" 2>/dev/null; then
             echo "ninfer-serve exited during startup" >&2
             tail -n 30 "$LOG" >&2 || true
+            restore_default_power_limit || true
             return 1
         fi
         if curl -fsS -H "Authorization: Bearer $API_KEY" \
@@ -145,6 +189,8 @@ start_server() {
     done
     echo "Timed out waiting for http://127.0.0.1:$PORT/v1/models" >&2
     tail -n 30 "$LOG" >&2 || true
+    kill "$pid" 2>/dev/null || true
+    restore_default_power_limit || true
     return 1
 }
 
@@ -181,11 +227,18 @@ show_status() {
     fi
 }
 
-NINFER_ACTION=${1:-restart}
-[[ $# -eq 0 ]] || shift
+NINFER_ACTION=restart
+if [[ $# -gt 0 && $1 != "--turbo" ]]; then
+    NINFER_ACTION=$1
+    shift
+fi
 WATCH_ARGS=()
 while [[ $# -gt 0 ]]; do
     case $1 in
+        --turbo)
+            TURBO_MODE=true
+            shift
+            ;;
         --tool-replay-cache-mib)
             [[ $# -ge 2 ]] || { echo "--tool-replay-cache-mib needs a value" >&2; exit 2; }
             TOOL_REPLAY_CACHE_MIB=$2
@@ -209,6 +262,16 @@ while [[ $# -gt 0 ]]; do
         *) WATCH_ARGS+=("$1"); shift ;;
     esac
 done
+
+case $NINFER_ACTION in
+    restart|restart-daemon|--daemon|start) ;;
+    *)
+        if [[ "$TURBO_MODE" == true ]]; then
+            echo "--turbo is only valid with restart, restart-daemon, --daemon, or start" >&2
+            exit 2
+        fi
+        ;;
+esac
 [[ "$TOOL_REPLAY_CACHE_MIB" =~ ^[0-9]+$ ]] || {
     echo "--tool-replay-cache-mib must be a nonnegative integer in MiB" >&2
     exit 2
@@ -233,7 +296,14 @@ case $NINFER_ACTION in
         start_server
         ;;
     start)
-        [[ -z "$(server_pids)" ]] || { show_status; exit 0; }
+        if [[ -n "$(server_pids)" ]]; then
+            if [[ "$TURBO_MODE" == true ]]; then
+                echo "ninfer-serve is already running; use restart --turbo to change mode" >&2
+                exit 2
+            fi
+            show_status
+            exit 0
+        fi
         start_server
         ;;
     stop|--stop)
@@ -250,7 +320,7 @@ case $NINFER_ACTION in
         tail -n 100 -F "$LOG"
         ;;
     *)
-        echo "Usage: $0 [restart|restart-daemon|start|stop|status|watch|logs] [--state-cache-dir DIR] [--state-cache-max-mib N] [--tool-replay-cache-mib N] [--details] [--once] [--color auto|always|never]" >&2
+        echo "Usage: $0 [restart|restart-daemon|start|stop|status|watch|logs] [--turbo] [--state-cache-dir DIR] [--state-cache-max-mib N] [--tool-replay-cache-mib N] [--details] [--once] [--color auto|always|never]" >&2
         exit 2
         ;;
 esac

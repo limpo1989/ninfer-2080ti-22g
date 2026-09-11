@@ -230,6 +230,12 @@ wire response contains typed `output` Items.
 | `include` | omitted or an empty array |
 | `stream_options` | omitted or `{"include_obfuscation":false}` |
 
+For Responses requests, an omitted or `null` top-level `reasoning` field explicitly disables
+thinking. A non-null `reasoning` object opts in: an explicit `effort` selects that mode, while an
+object without `effort` (including Codex's `{"summary":"auto"}` custom-model request) uses the
+loaded template's default effort. This policy does not change Chat Completions or Anthropic
+requests.
+
 Unknown top-level fields fail with `unknown_parameter`. Recognized but unsupported features fail
 with a field-specific 400 error instead of being silently ignored.
 
@@ -246,7 +252,7 @@ String `input` is normalized to one user `message` with an `input_text` part. Ar
 | `input_video` | NInfer extension with HTTP(S) or data-URI `video_url`; requires server `--vision` |
 | `reasoning` | replay Item with `reasoning_text` content, or `summary_text` summary as a fallback; raw content takes precedence when both are present |
 | `function_call` | completed assistant call with optional `id`, and required `call_id`, `name`, and JSON-object string `arguments` |
-| `function_call_output` | completed tool result with required `call_id` and string `output` |
+| `function_call_output` | completed tool result with required `call_id`; `output` may be a string or a non-empty array of `input_text`/`input_image` parts |
 
 Adjacent function-call Items are grouped into one assistant history turn. A reasoning Item attaches
 to the following assistant message or function call. Input Item IDs are preserved when supplied and
@@ -255,6 +261,9 @@ generated otherwise; duplicate IDs fail.
 System and developer message Items retain their positions in the input array. Top-level
 `instructions` is represented as a leading developer turn for the current request; target-specific
 role lowering occurs only in the Qwen family frontend.
+
+Images in a `function_call_output` use the same HTTP(S)/data-URI source contract and require the
+same server `--vision` capability as user-message images. String outputs remain fully compatible.
 
 `input_file`, `input_audio`, image `file_id`, non-`auto` image detail, encrypted reasoning, message
 `phase`, and other Item/content types are not supported. HTTP media
@@ -643,6 +652,16 @@ positions, encoded-media digest, grid, and consumer spans; changing an earlier i
 therefore resets the prefix instead of reusing placeholder-token KV. Media wholly inside a matched
 prefix skips Vision execution, while new suffix media is encoded normally. The completion log
 reports the reused token count as `cache=`.
+
+Optional RAM/disk state snapshots use the same multimodal identity. Persistent aliases hash token
+IDs and types, MRoPE positions, media SHA-256, modality, grid, patch layout, timestamps, and consumer
+spans. A frontier that divides one Vision item is never indexed, and restore performs the full
+identity comparison again before installing GPU state. Snapshot payloads contain the resulting
+Text/MTP KV, KVarN tails, recurrent state, and hidden state rather than original media bytes. The
+client must therefore resubmit historical media after a restart; preparation establishes its
+identity before lookup, while a matched snapshot skips Vision GPU encoding and model prefill for
+the restored prefix. State caching supports ordinary and MTP text/multimodal execution; DFlash
+remains unsupported.
 
 The shared family runtime distinguishes `full_reset`, `append_frontier`,
 `restore_turn_checkpoint`, and `restore_response_checkpoint`. Both checkpoint kinds include the

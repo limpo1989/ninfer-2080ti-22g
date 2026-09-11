@@ -277,8 +277,8 @@ std::string parse_reasoning_item(const Json& item, Json& canonical) {
             if (part.is_object() && part.contains("type") &&
                 part.at("type").get<std::string>() == "summary_text" && part.contains("text") &&
                 part.at("text").is_string()) {
-                summary_content.push_back(Json{{"type", "reasoning_text"},
-                                               {"text", part.at("text").get<std::string>()}});
+                summary_content.push_back(
+                    Json{{"type", "reasoning_text"}, {"text", part.at("text").get<std::string>()}});
             }
         }
     }
@@ -348,8 +348,9 @@ ChatTurn parse_function_call_output_item(const Json& item, Json& canonical) {
         item.at("call_id").get<std::string>().empty()) {
         bad_request("function_call_output must contain a non-empty call_id", "input");
     }
-    if (!item.contains("output") || !item.at("output").is_string()) {
-        bad_request("function_call_output output must be a string", "input");
+    if (!item.contains("output") ||
+        (!item.at("output").is_string() && !item.at("output").is_array())) {
+        bad_request("function_call_output output must be a string or content array", "input");
     }
     if (item.contains("status") && !item.at("status").is_null() &&
         (!item.at("status").is_string() || item.at("status").get<std::string>() != "completed")) {
@@ -358,16 +359,56 @@ ChatTurn parse_function_call_output_item(const Json& item, Json& canonical) {
     ChatTurn turn;
     turn.role         = ChatRole::Tool;
     turn.tool_call_id = item.at("call_id").get<std::string>();
+    Json output;
+    if (item.at("output").is_string()) {
     ContentPart content;
     content.kind     = ContentKind::Text;
     content.type_raw = "input_text";
     content.text     = item.at("output").get<std::string>();
     turn.content.push_back(std::move(content));
+        output = item.at("output");
+    } else {
+        if (item.at("output").empty()) {
+            bad_request("function_call_output output content array must not be empty", "input");
+        }
+        output = Json::array();
+        for (const Json& value : item.at("output")) {
+            if (!value.is_object() || !value.contains("type") || !value.at("type").is_string()) {
+                bad_request("function_call_output content parts must have a string type", "input");
+            }
+            const std::string type = value.at("type").get<std::string>();
+            if (type == "input_text") {
+                if (!value.contains("text") || !value.at("text").is_string()) {
+                    bad_request("input_text must contain a string text", "input");
+                }
+                ContentPart content;
+                content.kind     = ContentKind::Text;
+                content.type_raw = type;
+                content.text     = value.at("text").get<std::string>();
+                turn.content.push_back(std::move(content));
+                output.push_back(Json{{"type", "input_text"}, {"text", value.at("text")}});
+            } else if (type == "input_image") {
+                ContentPart content;
+                content.kind     = ContentKind::Image;
+                content.type_raw = type;
+                content.source   = parse_image_source(value);
+                turn.content.push_back(std::move(content));
+                output.push_back(Json{{"type", "input_image"},
+                                      {"image_url", value.at("image_url")},
+                                      {"detail", "auto"}});
+            } else if (type == "input_file") {
+                bad_request("input_file is not supported", "input", "file_inputs_not_supported");
+            } else {
+                bad_request("unsupported function_call_output content type: " + type, "input",
+                            "modality_not_supported");
+            }
+        }
+    }
     canonical = {{"id", item_id(item, "fco", "input")},
                  {"type", "function_call_output"},
                  {"status", "completed"},
                  {"call_id", turn.tool_call_id},
-                 {"output", item.at("output")}};
+                 {"output", std::move(output)}};
     return turn;
 }
 
@@ -546,7 +587,10 @@ void parse_tool_choice(const Json& body, ResponsesRequest& out) {
 }
 
 void parse_reasoning(const Json& body, ResponsesRequest& out) {
-    if (!body.contains("reasoning") || body.at("reasoning").is_null()) { return; }
+    if (!body.contains("reasoning") || body.at("reasoning").is_null()) {
+        out.generation.enable_thinking = false;
+        return;
+    }
     const Json& reasoning = body.at("reasoning");
     if (!reasoning.is_object()) { bad_request("reasoning must be an object", "reasoning"); }
     for (auto it = reasoning.begin(); it != reasoning.end(); ++it) {
@@ -561,13 +605,15 @@ void parse_reasoning(const Json& body, ResponsesRequest& out) {
         }
         const std::string summary = reasoning.at("summary").get<std::string>();
         if (summary != "auto" && summary != "concise" && summary != "detailed") {
-            bad_request("reasoning.summary must be one of auto, concise, or detailed",
-                        "reasoning");
+            bad_request("reasoning.summary must be one of auto, concise, or detailed", "reasoning");
         }
         // Compatibility hint only. NInfer already publishes its visible reasoning through both
         // reasoning_text and reasoning_summary SSE channels; it does not run a second summarizer.
     }
-    if (!reasoning.contains("effort") || reasoning.at("effort").is_null()) { return; }
+    if (!reasoning.contains("effort") || reasoning.at("effort").is_null()) {
+        out.generation.enable_thinking = true;
+        return;
+    }
     if (!reasoning.at("effort").is_string()) {
         bad_request("reasoning.effort must be a string", "reasoning");
     }
@@ -644,9 +690,9 @@ void reject_unknown_top_level(const Json& body) {
 }
 
 void reject_server_managed_features(const Json& body) {
-    for (const char* key : {"context_management", "conversation", "max_tool_calls", "moderation",
-                            "prompt", "prompt_cache_options",
-                            "prompt_cache_retention", "safety_identifier", "user"}) {
+    for (const char* key :
+         {"context_management", "conversation", "max_tool_calls", "moderation", "prompt",
+          "prompt_cache_options", "prompt_cache_retention", "safety_identifier", "user"}) {
         if (body.contains(key) && !body.at(key).is_null()) {
             bad_request(std::string(key) + " is not supported", key, "parameter_not_supported");
         }
@@ -1192,9 +1238,12 @@ std::vector<std::string> ResponsesEventStream::keepalive() {
         sse(impl_->event("response.in_progress", Json{{"response", response}}))};
 
     if (impl_->message_started && !impl_->message_done) {
-        events.push_back(sse(impl_->event("response.output_text.delta",
-            Json{{"item_id", impl_->ids.message}, {"output_index", impl_->message_index},
-                 {"content_index", 0}, {"delta", ""}, {"logprobs", Json::array()}})));
+        events.push_back(sse(
+            impl_->event("response.output_text.delta", Json{{"item_id", impl_->ids.message},
+                                                            {"output_index", impl_->message_index},
+                                                            {"content_index", 0},
+                                                            {"delta", ""},
+                                                            {"logprobs", Json::array()}})));
         return events;
     }
     if (!impl_->runtime.enable_thinking || impl_->reasoning_done) { return events; }
@@ -1203,8 +1252,7 @@ std::vector<std::string> ResponsesEventStream::keepalive() {
     events.insert(events.end(), std::make_move_iterator(added.begin()),
                   std::make_move_iterator(added.end()));
     if (!impl_->reasoning_done) {
-        events.push_back(sse(impl_->event(
-            "response.reasoning_summary_text.delta",
+        events.push_back(sse(impl_->event("response.reasoning_summary_text.delta",
             Json{{"item_id", impl_->ids.reasoning},
                  {"output_index", impl_->reasoning_index},
                  {"summary_index", 0},
@@ -1225,8 +1273,7 @@ std::vector<std::string> ResponsesEventStream::reasoning_delta(const std::string
                                                            {"output_index", impl_->reasoning_index},
                                                            {"content_index", 0},
                                                            {"delta", text}})));
-    events.push_back(sse(
-        impl_->event("response.reasoning_summary_text.delta",
+    events.push_back(sse(impl_->event("response.reasoning_summary_text.delta",
                      Json{{"item_id", impl_->ids.reasoning},
                           {"output_index", impl_->reasoning_index},
                           {"summary_index", 0},

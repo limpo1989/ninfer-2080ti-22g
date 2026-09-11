@@ -12,6 +12,11 @@
 
 namespace ninfer::targets::qwen3_6::detail {
 
+struct PersistentPrefixFingerprint {
+    std::uint32_t frontier = 0;
+    std::uint64_t hash     = 0;
+};
+
 class ResidentPrefixIdentity {
 public:
     void reserve(std::size_t tokens);
@@ -23,6 +28,9 @@ public:
     [[nodiscard]] std::size_t size() const noexcept { return token_types_.size(); }
 
     [[nodiscard]] bool matches(const PreparedPromptData& prompt, std::size_t count) const;
+    [[nodiscard]] std::vector<PersistentPrefixFingerprint>
+    persistent_fingerprints(std::span<const TokenId> tokens,
+                            std::uint32_t minimum_frontier = 0) const;
     [[nodiscard]] std::vector<std::uint8_t> serialize() const;
     void deserialize(std::span<const std::uint8_t> bytes);
 

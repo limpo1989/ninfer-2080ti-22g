@@ -111,14 +111,12 @@ void test_decoder_layout() {
     kvarn_spec.kvarn              = ninfer::KvarnFormat::K4V2G64;
     const q36::DecoderStateLayout kvarn = q36::plan_decoder_state(kvarn_builder, kvarn_spec);
     (void)kvarn_builder.finish(256);
-    expect(kvarn.text_kv.stage.size() == 4 &&
-               kvarn.text_kv.rewrite_checkpoint_stage.size() == 4,
+    expect(kvarn.text_kv.stage.size() == 4 && kvarn.text_kv.rewrite_checkpoint_stage.size() == 4,
            "KVarN Text KV owns current and checkpoint stages per layer");
     expect(kvarn.mtp_kv && kvarn.mtp_kv->stage.size() == 2 &&
                kvarn.mtp_kv->rewrite_checkpoint_stage.size() == 2,
            "KVarN MTP KV owns current and checkpoint stages");
-    expect(kvarn.text_kv.rewrite_checkpoint_stage.front().shape[2] ==
-               ninfer::kPagedKVPageSize,
+    expect(kvarn.text_kv.rewrite_checkpoint_stage.front().shape[2] == ninfer::kPagedKVPageSize,
            "KVarN checkpoint stage retains exactly one tail page");
 }
 
@@ -238,6 +236,7 @@ q36::PreparedPromptData identity_prompt(std::uint8_t digest_byte = 1) {
                          .grid        = {.temporal = 1, .height = 2, .width = 4},
                          .patch_begin = 0,
                          .patch_count = 8,
+                         .timestamps  = {0.25, 0.5},
                          .token_spans = {{.begin = 1, .count = 2}}};
     item.content_digest.fill(digest_byte);
     prompt.vision_items.push_back(std::move(item));
@@ -298,21 +297,87 @@ void test_prefix_identity() {
            "truncated multimodal continuation identity");
 }
 
-void test_persisted_text_identity() {
+void test_persisted_identity() {
     q36::PreparedPromptData prompt;
-    prompt.token_ids = {10, 20, 30}; prompt.token_types = {0, 0, 0};
-    prompt.positions = {0,1,2, 0,1,2, 0,1,2};
+    prompt.token_ids   = {10, 20, 30};
+    prompt.token_types = {0, 0, 0};
+    prompt.positions   = {0, 1, 2, 0, 1, 2, 0, 1, 2};
     q36::detail::ResidentPrefixIdentity original, restored;
     original.assign(prompt);
     auto bytes = original.serialize();
     restored.deserialize(bytes);
-    expect(q36::detail::prefix_matches(prompt, prompt.token_ids, restored, 3), "persisted text identity round trip");
-    auto changed = prompt; changed.positions[1] = 9;
-    expect(!q36::detail::prefix_matches(changed, prompt.token_ids, restored, 3), "restored identity rejects changed positions");
+    expect(q36::detail::prefix_matches(prompt, prompt.token_ids, restored, 3),
+           "persisted text identity round trip");
+    auto changed         = prompt;
+    changed.positions[1] = 9;
+    expect(!q36::detail::prefix_matches(changed, prompt.token_ids, restored, 3),
+           "restored identity rejects changed positions");
     bytes.pop_back();
     bool rejected = false;
-    try { restored.deserialize(bytes); } catch (const std::invalid_argument&) { rejected = true; }
+    try {
+        restored.deserialize(bytes);
+    } catch (const std::invalid_argument&) { rejected = true; }
     expect(rejected, "truncated text identity rejected");
+
+    q36::PreparedPromptData multimodal = identity_prompt();
+    q36::detail::ResidentPrefixIdentity media_original, media_restored;
+    media_original.assign(multimodal);
+    const auto media_bytes = media_original.serialize();
+    media_restored.deserialize(media_bytes);
+    expect(q36::detail::prefix_matches(multimodal, multimodal.token_ids, media_restored,
+                                       multimodal.token_ids.size()),
+           "persisted multimodal identity round trip");
+    auto changed_digest = identity_prompt(2);
+    expect(!q36::detail::prefix_matches(changed_digest, multimodal.token_ids, media_restored,
+                                        multimodal.token_ids.size()),
+           "persisted identity rejects changed media content");
+    auto changed_timestamps                          = identity_prompt();
+    changed_timestamps.vision_items[0].timestamps[0] = 0.75;
+    expect(!q36::detail::prefix_matches(changed_timestamps, multimodal.token_ids, media_restored,
+                                        multimodal.token_ids.size()),
+           "persisted identity rejects changed media timing metadata");
+
+    const auto fingerprints = media_original.persistent_fingerprints(multimodal.token_ids);
+    expect(fingerprints.size() == 3 && fingerprints[0].frontier == 1 &&
+               fingerprints[1].frontier == 3 && fingerprints[2].frontier == 4,
+           "persistent fingerprints exclude a frontier inside a Vision item");
+    q36::detail::ResidentPrefixIdentity changed_identity;
+    changed_identity.assign(changed_digest);
+    const auto changed_fingerprints =
+        changed_identity.persistent_fingerprints(changed_digest.token_ids);
+    expect(changed_fingerprints.size() == fingerprints.size() &&
+               changed_fingerprints[0].hash == fingerprints[0].hash &&
+               changed_fingerprints[1].hash != fingerprints[1].hash &&
+               changed_fingerprints[2].hash != fingerprints[2].hash,
+           "media digest affects only persistent frontiers containing that item");
+
+    auto media_truncated = media_bytes;
+    media_truncated.pop_back();
+    rejected = false;
+    try {
+        media_restored.deserialize(media_truncated);
+    } catch (const std::invalid_argument&) { rejected = true; }
+    expect(rejected, "truncated multimodal identity rejected");
+}
+
+void test_persistent_fingerprint_scale() {
+    constexpr std::size_t tokens = 245760;
+    q36::PreparedPromptData prompt;
+    prompt.token_ids.resize(tokens, 198);
+    prompt.token_types.resize(tokens, 0);
+    prompt.positions.resize(3 * tokens);
+    for (std::size_t axis = 0; axis < 3; ++axis) {
+        for (std::size_t index = 0; index < tokens; ++index) {
+            prompt.positions[axis * tokens + index] = static_cast<std::int32_t>(index);
+        }
+    }
+    q36::detail::ResidentPrefixIdentity identity;
+    identity.assign(prompt);
+    const auto fingerprints =
+        identity.persistent_fingerprints(prompt.token_ids, static_cast<std::uint32_t>(tokens - 64));
+    expect(fingerprints.size() == 64 && fingerprints.front().frontier == tokens - 63 &&
+               fingerprints.back().frontier == tokens,
+           "full-context persistent fingerprint scan");
 }
 
 } // namespace
@@ -324,7 +389,8 @@ int main() {
     test_mtp_alignment();
     test_vision_control();
     test_prefix_identity();
-    test_persisted_text_identity();
+    test_persisted_identity();
+    test_persistent_fingerprint_scale();
     if (failures != 0) {
         std::cerr << failures << " Qwen3.6 runtime mechanism checks failed\n";
         return 1;

@@ -161,6 +161,33 @@ class WatchLauncherTest(unittest.TestCase):
                     NINFER_LOG=str(log), NINFER_PID_FILE=str(root / "server.pid"),
                     NINFER_GPU_POWER_LIMIT_W="")
 
+    def power_fixture(self, root):
+        env = self.fixture(root)
+        fake_bin = root / "bin"
+        nvidia_log = root / "nvidia-smi.log"
+        systemctl_log = root / "systemctl.log"
+        (fake_bin / "nvidia-smi").write_text(
+            "#!/bin/sh\n"
+            "printf '%s\\n' \"$*\" >> \"$NVIDIA_SMI_LOG\"\n"
+            "case \"$*\" in\n"
+            "  *power.default_limit*) printf '250.00\\n' ;;\n"
+            "  *power.limit*) printf '280.00\\n' ;;\n"
+            "  *memory.used*) printf '0\\n' ;;\n"
+            "  *) printf '0\\n' ;;\n"
+            "esac\n")
+        (fake_bin / "nvidia-smi").chmod(0o755)
+        (fake_bin / "sudo").write_text("#!/bin/sh\nexec \"$@\"\n")
+        (fake_bin / "sudo").chmod(0o755)
+        (fake_bin / "systemctl").write_text(
+            "#!/bin/sh\n"
+            "printf '%s\\n' \"$*\" >> \"$SYSTEMCTL_LOG\"\n"
+            "case \"$1\" in\n"
+            "  is-active|start) exit 0 ;;\n"
+            "  *) exit 1 ;;\n"
+            "esac\n")
+        (fake_bin / "systemctl").chmod(0o755)
+        return dict(env, NVIDIA_SMI_LOG=str(nvidia_log), SYSTEMCTL_LOG=str(systemctl_log))
+
     def test_watch_prints_offline_snapshot_instead_of_exiting_silently(self):
         with tempfile.TemporaryDirectory() as directory:
             env = self.fixture(Path(directory))
@@ -223,6 +250,41 @@ class WatchLauncherTest(unittest.TestCase):
                         pass
                 if process_alive(server_pid):
                     os.kill(server_pid, signal.SIGTERM)
+
+    def test_turbo_restart_applies_power_and_checks_fan_curve(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            env = self.power_fixture(root)
+            server = Path(env["NINFER_BIN"])
+            server.write_text(
+                f"#!{sys.executable}\nimport signal, sys, time\n"
+                "signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))\n"
+                "while True: time.sleep(1)\n")
+            server.chmod(0o755)
+            server_pid = None
+            try:
+                result = subprocess.run(["bash", str(self.script), "--turbo", "--once"],
+                                        env=env, capture_output=True, text=True, timeout=8)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("Turbo mode: 280 W", result.stdout)
+                self.assertIn("--power-limit=280", Path(env["NVIDIA_SMI_LOG"]).read_text())
+                self.assertIn("is-active --quiet nvidia-fan-curve.service",
+                              Path(env["SYSTEMCTL_LOG"]).read_text())
+                server_pid = int(Path(env["NINFER_PID_FILE"]).read_text())
+                self.assertTrue(process_alive(server_pid))
+            finally:
+                if process_alive(server_pid):
+                    os.kill(server_pid, signal.SIGTERM)
+
+    def test_stop_restores_driver_default_power_limit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            env = self.power_fixture(root)
+            result = subprocess.run(["bash", str(self.script), "stop"], env=env,
+                                    capture_output=True, text=True, timeout=5)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("Restoring GPU 0 default power limit: 250.00 W", result.stdout)
+            self.assertIn("--power-limit=250.00", Path(env["NVIDIA_SMI_LOG"]).read_text())
 
 
 if __name__ == "__main__":

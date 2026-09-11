@@ -439,6 +439,27 @@ capacity, and `default-max-tokens=131072`. On the 22,528 MiB card this uses abou
 startup while retaining about 220 MiB of planner slack. Paths and sizing remain overridable through
 the `NINFER_MODEL`, `NINFER_BIN`, `NINFER_MAX_CONTEXT`, `NINFER_KV_CAPACITY`, and
 `NINFER_DEFAULT_MAX_TOKENS` environment variables.
+
+### Vision cost on the RTX 2080 Ti 22GB
+
+Vision loads an additional 0.28 GiB of weights plus a large fixed encoder workspace and
+request-transient buffer. The following startup measurements use the Qwen3.8-27B groupwise-int
+artifact, KVarN, MTP3 with the optimized draft head, a 1,024-token prefill chunk, concurrency 2,
+CUDA Graphs, and equal explicit `--max-context`/`--kv-capacity` values:
+
+| Configuration | Context | Weights | Runtime reservation | Planner margin | RAM/disk state snapshots |
+|---|---:|---:|---:|---:|---|
+| Text deployment default | 245,760 | 16.67 GiB | 4.45 GiB | 212.19 MiB | Enabled |
+| Vision recommended maximum | 81,920 | 16.95 GiB | 4.36 GiB | 24.54 MiB | Enabled |
+| Vision measured edge | 83,584 | 16.95 GiB | 4.38 GiB | 0.59 MiB | Enabled |
+
+Use 81,920 rather than the 83,584-token measured edge for a repeatable Vision deployment; the
+edge leaves effectively no planner tolerance for small driver-allocation changes. Image/video
+expansion and text share this total context, while merged Vision tokens have an additional 32,768
+token envelope. Consequently this 22GB configuration cannot combine Vision with a 128K output
+budget. Vision remains opt-in via `--vision`; the default launcher preserves the 245,760-token text
+profile and its persistent state cache.
+
 The 131,072-token default preserves the server's maximum single-request capability. Clients should
 still send the smallest accurate per-request `max_tokens`: 4K–16K for ordinary tool work, 16K–32K
 for typical long answers, and 128K only when that much output is genuinely required. Admission
@@ -451,16 +472,16 @@ The launcher also accepts `--tool-replay-cache-mib N`, for example
 `./deploy/restart-ninfer.sh restart --tool-replay-cache-mib 2048`, or the
 `NINFER_TOOL_REPLAY_CACHE_MIB` environment variable (default `1024`). The command-line value takes
 precedence, and the selected budget appears in the watch header. The Responses object/context store
-has its own separate limits. The launcher enables text retained-state caching with 4 GiB RAM
+has its own separate limits. The launcher enables retained-state caching with 4 GiB RAM
 and 8 GiB disk under `$BUNDLE_ROOT/state-cache`. Override with `NINFER_STATE_CACHE_DIR`,
 `NINFER_STATE_CACHE_RAM_MIB`, and `NINFER_STATE_CACHE_MAX_MIB`, or the corresponding
 `--state-cache-dir`, `--state-cache-ram-mib`, and `--state-cache-max-mib` flags. A zero disk budget
 disables this feature. Direct `ninfer-serve` launches leave it disabled unless a directory and
 positive disk budget are supplied.
 
-Completed text requests with at least 256 retained tokens can capture immutable continuation
-images (Main/MTP KV, current and checkpoint KVarN stages, current/checkpoint GDN state, hidden
-state and prefix identity).
+Completed text or multimodal requests with at least 256 retained tokens can capture immutable
+continuation images (Main/MTP KV, current and checkpoint KVarN stages, current/checkpoint GDN
+state, hidden state and prefix identity).
 The final result is published before capture begins, so snapshot copying no longer extends that
 request's reported Wall time. An identical state already present in RAM or on disk is detected
 before any GPU-to-host copy.
@@ -469,8 +490,16 @@ reads, checksums, writes, fsync and atomic publication run on a separate I/O wor
 pending writes; pressure evicts clean images or skips new captures instead of blocking for disk.
 Images are persisted in the background after completion, even if their GPU state remains resident,
 so a later restart can reuse them. An interrupted write is never a valid cache hit. Saved state
-uses existing numeric formats without recompression. The first version supports text ordinary/MTP
-execution; Vision and DFlash configurations reject enabling state caching.
+uses existing numeric formats without recompression. Ordinary and MTP execution support both text
+and multimodal snapshots; DFlash configurations reject enabling state caching. A multimodal key
+includes token IDs and types, three-axis MRoPE positions, media SHA-256, modality, grid, patch
+layout, timestamps, and consumer spans. No alias is published at a frontier that divides one Vision
+item, and restore repeats the complete identity comparison before mutating GPU state.
+
+Snapshots retain post-Vision model state rather than original media bytes. After a restart the
+client must submit the same image or video again so NInfer can acquire it, derive its immutable
+identity, and locate the snapshot. A media-preprocessing cache hit avoids repeated decode/resize
+work; a state-cache hit then skips Vision GPU encoding and model prefill for the matched prefix.
 
 Cache directories are separated by artifact and executable file identity, storage configuration
 and template. Rebuilding the executable or replacing weights invalidates old namespaces; budgets
@@ -508,11 +537,21 @@ CPU use from 100.0% to 0.35%. Median completion-to-return latency was 104 micros
 blocking synchronization, versus 4 microseconds with spin and 952 microseconds with 1 ms polling.
 This measures host waiting overhead, not end-to-end model throughput.
 
-The optional GPU power override is disabled by default. To explicitly request 280 W at startup,
-use `NINFER_GPU_POWER_LIMIT_W=280 ./deploy/restart-ninfer.sh restart-daemon`; applying it requires
-sudo. An unset or empty variable leaves the current driver limit unchanged. To restore this
-host's default after an opt-in run, use `sudo nvidia-smi -i 0 -pl 250`. Current deployment and the
-final performance measurements use 250 W.
+Turbo mode is disabled by default. Add `--turbo` to a starting action to request the card's tested
+280 W maximum and ensure the aggressive `nvidia-fan-curve.service` is active:
+
+```bash
+./deploy/restart-ninfer.sh restart-daemon --turbo
+# Or restart and enter the live dashboard:
+./deploy/restart-ninfer.sh --turbo
+```
+
+Applying the power limit and starting the fan service require sudo. `stop` dynamically reads and
+restores the driver's default power limit (250 W on the tested card); every `restart` therefore
+restores the default before selecting the next mode. A failed turbo startup also rolls back to the
+default limit. `NINFER_GPU_POWER_LIMIT_W` remains available as an advanced manual startup override,
+but it does not replace `--turbo`'s fan-service check. Current default deployment and the final
+performance measurements use 250 W.
 
 Driver 595.99.02 exposes manual fan control through NVML. The tested fan curve keeps the driver's
 84 C target (so temperature control does not lower clocks), runs at 45% through 40 C, and ramps to

@@ -152,6 +152,40 @@ int test_reasoning_effort() {
     const Json base = {{"model", "m"}, {"input", "hello"}, {"max_output_tokens", 32}};
     int failures    = 0;
 
+    const GenerationRequest omitted = parse_responses_request(base, limits()).generation;
+    failures += check(
+        !resolve_prompt_semantics(omitted, ServeOptions{}, effort_capabilities()).enable_thinking &&
+            omitted.enable_thinking == false,
+        "omitted Responses reasoning did not disable thinking");
+
+    Json null_reasoning         = base;
+    null_reasoning["reasoning"] = nullptr;
+    failures += check(
+        !resolve_prompt_semantics(parse_responses_request(null_reasoning, limits()).generation,
+                                  ServeOptions{}, effort_capabilities())
+             .enable_thinking,
+        "null Responses reasoning did not disable thinking");
+
+    Json codex_custom         = base;
+    codex_custom["reasoning"] = Json{{"summary", "auto"}};
+    const GenerationRequest codex_request =
+        parse_responses_request(codex_custom, limits()).generation;
+    ServeOptions thinking_off_server;
+    thinking_off_server.enable_thinking = false;
+    const ResolvedPromptSemantics codex_semantics =
+        resolve_prompt_semantics(codex_request, thinking_off_server, effort_capabilities());
+    failures += check(codex_semantics.enable_thinking && !codex_semantics.reasoning_effort &&
+                          codex_request.enable_thinking == true,
+                      "Codex summary-only reasoning did not preserve default thinking");
+
+    Json empty_reasoning         = base;
+    empty_reasoning["reasoning"] = Json::object();
+    failures += check(
+        resolve_prompt_semantics(parse_responses_request(empty_reasoning, limits()).generation,
+                                 thinking_off_server, effort_capabilities())
+            .enable_thinking,
+        "empty Responses reasoning object did not opt into thinking");
+
     for (const auto& [wire, expected] :
          std::array<std::pair<const char*, RequestedReasoningEffort>, 7>{
              {{"none", RequestedReasoningEffort::None},
@@ -193,15 +227,15 @@ int test_reasoning_effort() {
     auto unavailable = effort_capabilities();
     unavailable.reasoning_effort.xhigh = false;
     failures += check(api_code([&] {
-                          (void)resolve_prompt_semantics(high_request, ServeOptions{},
-                                                         unavailable);
+                          (void)resolve_prompt_semantics(high_request, ServeOptions{}, unavailable);
                       }) == "reasoning_effort_not_supported",
                       "Responses high effort bypassed template capability validation");
 
     for (const char* summary : {"auto", "concise", "detailed"}) {
         Json compatible         = base;
         compatible["reasoning"] = Json{{"effort", "xhigh"}, {"summary", summary}};
-        failures += check(parse_responses_request(compatible, limits()).generation.reasoning_effort ==
+        failures +=
+            check(parse_responses_request(compatible, limits()).generation.reasoning_effort ==
                               RequestedReasoningEffort::XHigh,
                           std::string("Responses rejected compatible reasoning summary ") + summary);
     }
@@ -333,6 +367,89 @@ int test_typed_items_and_tools() {
     const Json nested = Json::parse(request.generation.tools[0].definition_json);
     failures += check(nested.at("function").at("name") == "weather",
                       "Qwen prompt receives normalized nested function definition");
+    return failures;
+}
+
+int test_function_call_output_content() {
+    const Json body = {
+        {"model", "m"},
+        {"input",
+         Json::array(
+             {Json{{"type", "function_call_output"},
+                   {"call_id", "call_text"},
+                   {"output", "plain result"}},
+              Json{{"id", "fco_media"},
+                   {"type", "function_call_output"},
+                   {"call_id", "call_media"},
+                   {"output", Json::array({Json{{"type", "input_text"}, {"text", "screenshot"}},
+                                           Json{{"type", "input_image"},
+                                                {"image_url", "data:image/png;base64,AA=="}}})}}})},
+        {"max_output_tokens", 32}};
+
+    const ResponsesRequest request = parse_responses_request(body, limits());
+    int failures                   = 0;
+    failures += check(request.input_turns.size() == 2 &&
+                          request.input_turns[0].role == ninfer::ChatRole::Tool &&
+                          request.input_turns[0].content.size() == 1 &&
+                          request.input_turns[0].content[0].kind == ContentKind::Text &&
+                          request.input_turns[0].content[0].text == "plain result",
+                      "string function output compatibility changed");
+    failures +=
+        check(request.input_turns[1].role == ninfer::ChatRole::Tool &&
+                  request.input_turns[1].tool_call_id == "call_media" &&
+                  request.input_turns[1].content.size() == 2 &&
+                  request.input_turns[1].content[0].kind == ContentKind::Text &&
+                  request.input_turns[1].content[0].text == "screenshot" &&
+                  request.input_turns[1].content[1].kind == ContentKind::Image &&
+                  request.input_turns[1].content[1].source.value == "data:image/png;base64,AA==",
+              "multimodal function output was not translated to a tool turn");
+    failures += check(request.input_items[1].at("id") == "fco_media" &&
+                          request.input_items[1].at("output").is_array() &&
+                          request.input_items[1].at("output")[0].at("type") == "input_text" &&
+                          request.input_items[1].at("output")[1].at("type") == "input_image" &&
+                          request.input_items[1].at("output")[1].at("detail") == "auto",
+                      "multimodal function output was not canonicalized for replay");
+
+    ResponsesRequest composed = request;
+    compose_responses_generation_messages(composed, {});
+    const ServeOptions server;
+    const ninfer::PromptInput prompt = to_prompt_input(
+        composed.generation,
+        resolve_prompt_semantics(composed.generation, server, effort_capabilities()),
+        [](const ContentPart& part) {
+            ninfer::OwnedMedia media;
+            media.kind = part.kind == ContentKind::Image ? ninfer::MediaKind::Image
+                                                         : ninfer::MediaKind::Video;
+            media.bytes.push_back(0);
+            return media;
+        });
+    failures += check(prompt.messages.size() == 2 && prompt.messages[1].parts.size() == 2 &&
+                          prompt.messages[1].parts[0].kind == ninfer::MessagePartKind::Text &&
+                          prompt.messages[1].parts[1].kind == ninfer::MessagePartKind::Media &&
+                          prompt.messages[1].parts[1].media.kind == ninfer::MediaKind::Image,
+                      "multimodal function output did not reach structured prompt media");
+
+    Json invalid     = body;
+    invalid["input"] = Json::array({Json{
+        {"type", "function_call_output"}, {"call_id", "call_empty"}, {"output", Json::array()}}});
+    failures += check(throws_api([&] { (void)parse_responses_request(invalid, limits()); }),
+                      "empty function output content array was accepted");
+    invalid["input"][0]["output"] = Json::array({Json{{"type", "input_text"}}});
+    failures += check(throws_api([&] { (void)parse_responses_request(invalid, limits()); }),
+                      "function output input_text without text was accepted");
+    invalid["input"][0]["output"] =
+        Json::array({Json{{"type", "input_image"}, {"image_url", "/tmp/image.png"}}});
+    failures += check(throws_api([&] { (void)parse_responses_request(invalid, limits()); }),
+                      "function output image with a local path was accepted");
+    invalid["input"][0]["output"] =
+        Json::array({Json{{"type", "output_text"}, {"text", "wrong vocabulary"}}});
+    failures += check(api_code([&] { (void)parse_responses_request(invalid, limits()); }) ==
+                          "modality_not_supported",
+                      "unsupported function output content type bypassed strict rejection");
+    invalid["input"][0]["output"] = Json::array({Json{{"type", "input_file"}}});
+    failures += check(api_code([&] { (void)parse_responses_request(invalid, limits()); }) ==
+                          "file_inputs_not_supported",
+                      "function output file did not use the explicit capability rejection");
     return failures;
 }
 
@@ -527,12 +644,11 @@ int test_sse_keepalive_activity() {
             ++empty_activity_deltas;
         }
     }
-    failures += check(reasoning_items == 1,
-                      "keepalive must open at most one reasoning item");
+    failures += check(reasoning_items == 1, "keepalive must open at most one reasoning item");
     failures += check(empty_activity_deltas == 2,
                       "each keepalive must emit one pi-ai-visible empty reasoning delta");
-    failures += check(finish.response.body.at("output").at(0).at("content").at(0).at("text") ==
-                          "thought",
+    failures +=
+        check(finish.response.body.at("output").at(0).at("content").at(0).at("text") == "thought",
                       "keepalive changed terminal reasoning text");
 
     ResponsesRuntimeValues no_thinking;
@@ -541,19 +657,23 @@ int test_sse_keepalive_activity() {
     (void)plain.start();
     const std::vector<std::string> plain_keepalive = plain.keepalive();
     failures += check(plain_keepalive.size() == 1 &&
-                          parse_event(plain_keepalive.front()).at("type") ==
-                              "response.in_progress",
+                          parse_event(plain_keepalive.front()).at("type") == "response.in_progress",
                       "non-thinking keepalive created synthetic output");
     return failures;
 }
 
 int test_reasoning_replay_is_not_duplicated() {
-    Json reasoning = {{"type", "reasoning"}, {"id", "rs_replay"},
+    Json reasoning = {
+        {"type", "reasoning"},
+        {"id", "rs_replay"},
                       {"summary", Json::array({Json{{"type", "summary_text"}, {"text", "summary"}}})},
                       {"content", Json::array({Json{{"type", "reasoning_text"}, {"text", "raw thought"}}})}};
     auto parse = [&](const Json& item) {
-        return parse_responses_request(Json{{"model", "qwen3.6-27b"},
-            {"input", Json::array({item, Json{{"role", "assistant"}, {"content", "answer"}}})}}, limits());
+        return parse_responses_request(
+            Json{
+                {"model", "qwen3.6-27b"},
+                {"input", Json::array({item, Json{{"role", "assistant"}, {"content", "answer"}}})}},
+            limits());
     };
     int failures = check(parse(reasoning).input_turns[0].reasoning_content == "raw thought",
                          "raw reasoning and summary were concatenated during replay");
@@ -567,16 +687,26 @@ int test_reasoning_replay_is_not_duplicated() {
 }
 
 int test_text_and_tool_call_replay_stays_one_turn() {
-    const auto request = parse_responses_request(Json{{"model", "qwen3.6-27b"},
-        {"input", Json::array({Json{{"role", "user"}, {"content", "Look it up"}},
-            Json{{"type", "reasoning"}, {"content", Json::array({Json{{"type", "reasoning_text"},
+    const auto request = parse_responses_request(
+        Json{{"model", "qwen3.6-27b"},
+             {"input",
+              Json::array({Json{{"role", "user"}, {"content", "Look it up"}},
+                           Json{{"type", "reasoning"},
+                                {"content", Json::array({Json{{"type", "reasoning_text"},
                   {"text", "Need the data"}}})}},
             Json{{"role", "assistant"}, {"content", "I will check the record."}},
-            Json{{"type", "function_call"}, {"call_id", "call_a"}, {"name", "lookup"},
+                           Json{{"type", "function_call"},
+                                {"call_id", "call_a"},
+                                {"name", "lookup"},
                  {"arguments", R"({"key":"a"})"}},
-            Json{{"type", "function_call"}, {"call_id", "call_b"}, {"name", "lookup"},
+                           Json{{"type", "function_call"},
+                                {"call_id", "call_b"},
+                                {"name", "lookup"},
                  {"arguments", R"({"key":"b"})"}},
-            Json{{"type", "function_call_output"}, {"call_id", "call_a"}, {"output", "17"}}})}}, limits());
+                           Json{{"type", "function_call_output"},
+                                {"call_id", "call_a"},
+                                {"output", "17"}}})}},
+        limits());
     return check(request.input_turns.size() == 3 &&
                  request.input_turns[1].reasoning_content == "Need the data" &&
                  request.input_turns[1].content[0].text == "I will check the record." &&
@@ -629,20 +759,24 @@ int test_input_tokens_schema() {
     failures += check(Json::parse(make_response_input_tokens_body(9)) ==
                           Json{{"object", "response.input_tokens"}, {"input_tokens", 9}},
                       "input_tokens response shape");
-    failures +=
-        check(api_code([&] {
+    failures += check(api_code([&] {
                   (void)parse_response_input_tokens_request(
                       Json{{"model", "qwen3.6-27b"}, {"input", "hello"}, {"stream", true}},
                       limits());
               }) == "unknown_parameter",
               "input_tokens rejects generation-only options");
     const auto with_tools = parse_response_input_tokens_request(
-        Json{{"model", "qwen3.6-27b"}, {"input", "hello"}, {"instructions", "Use tools."},
-             {"tools", Json::array({Json{{"type", "function"}, {"name", "lookup"},
-                 {"parameters", Json{{"type", "object"}, {"properties", Json::object()}}}}})},
-             {"reasoning", Json{{"effort", "low"}}}}, limits());
-    failures += check(with_tools.generation.tools.size() == 1 &&
-                          with_tools.instructions == "Use tools." &&
+        Json{{"model", "qwen3.6-27b"},
+             {"input", "hello"},
+             {"instructions", "Use tools."},
+             {"tools", Json::array({Json{{"type", "function"},
+                                         {"name", "lookup"},
+                                         {"parameters", Json{{"type", "object"},
+                                                             {"properties", Json::object()}}}}})},
+             {"reasoning", Json{{"effort", "low"}}}},
+        limits());
+    failures +=
+        check(with_tools.generation.tools.size() == 1 && with_tools.instructions == "Use tools." &&
                           with_tools.generation.messages.size() == 2 &&
                           with_tools.generation.messages.front().content.front().text == "Use tools." &&
                           with_tools.generation.reasoning_effort.has_value(),
@@ -659,6 +793,7 @@ int main() {
     failures += test_preserve_thinking_options_and_inheritance();
     failures += test_reasoning_effort();
     failures += test_typed_items_and_tools();
+    failures += test_function_call_output_content();
     failures += test_explicit_rejections();
     failures += test_response_object();
     failures += test_sse_sequence();
