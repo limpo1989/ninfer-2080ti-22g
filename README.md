@@ -499,9 +499,11 @@ The final result is published before capture begins, so snapshot copying does no
 request's reported Wall time. With the default idle delay, a new pending or active request takes
 priority; repeated completions reset the deadline and coalesce each lane to its latest state. Once
 the Engine remains idle, it captures one dirty lane, then checks the queue again before another.
-Graceful shutdown captures any still-valid dirty lanes. A lane reused or evicted before its idle
-capture drops the stale pending snapshot rather than delaying the new request. An identical state
-already present in RAM or on disk is detected before any GPU-to-host copy.
+Graceful shutdown captures any still-valid dirty lanes. Compatible resident continuations keep
+coalescing without a copy. A full reset, external snapshot restore, or capacity eviction that would
+discard a dirty retained lane captures it first; that exceptional copy is included in the incoming
+request's Queue time. An identical state already present in RAM or on disk is detected before any
+GPU-to-host copy.
 
 Capture and upload synchronize on the compute stream and briefly occupy the GPU worker. A request
 arriving after copying has already started can still wait for that copy to finish. Payload

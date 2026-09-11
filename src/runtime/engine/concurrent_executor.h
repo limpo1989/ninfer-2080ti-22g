@@ -378,6 +378,12 @@ private:
         deferred_capture_due_         = Clock::now() + state_cache_idle_;
     }
 
+    void flush_deferred_capture(std::uint32_t lane) noexcept {
+        if (!deferred_capture_dirty_[lane]) return;
+        clear_deferred_capture(lane);
+        instance_.program->save_state(lane);
+    }
+
     [[nodiscard]] bool queue_empty() const {
         std::lock_guard lock(queue_mutex_);
         return pending_.empty();
@@ -387,16 +393,7 @@ private:
         if (!deferred_capture_due_ || now < *deferred_capture_due_) return false;
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (!deferred_capture_dirty_[lane]) continue;
-            deferred_capture_dirty_[lane] = false;
-            const bool more = std::any_of(deferred_capture_dirty_.begin(),
-                                          deferred_capture_dirty_.end(),
-                                          [](bool dirty) { return dirty; });
-            if (more) {
-                deferred_capture_due_ = now;
-            } else {
-                deferred_capture_due_.reset();
-            }
-            instance_.program->save_state(lane);
+            flush_deferred_capture(lane);
             return true;
         }
         deferred_capture_due_.reset();
@@ -406,9 +403,7 @@ private:
     void flush_deferred_captures() noexcept {
         deferred_capture_due_.reset();
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
-            if (!deferred_capture_dirty_[lane]) continue;
-            deferred_capture_dirty_[lane] = false;
-            instance_.program->save_state(lane);
+            flush_deferred_capture(lane);
         }
     }
 
@@ -852,9 +847,16 @@ private:
             throw std::logic_error("selected admission lane has no request plan");
         }
         const auto resident_reuse = request->lane_plans[lane]->summary().reusable_prompt_tokens;
-        const bool use_snapshot = request->snapshot.result.valid() && resident_reuse < request->snapshot.frontier;
+        const bool use_snapshot =
+            request->snapshot.result.valid() && resident_reuse < request->snapshot.frontier;
         if (use_snapshot && !request->snapshot.ready()) return AdmissionProgress::None;
-        clear_deferred_capture(lane);
+        // Compatible resident reuse supersedes the dirty state and can stay coalesced. A reset or
+        // external restore discards it, so publish the pending snapshot before admission.
+        if (resident_reuse == 0 || use_snapshot) {
+            flush_deferred_capture(lane);
+        } else {
+            clear_deferred_capture(lane);
+        }
         if (choice.evict_retained) {
             for (std::uint32_t retained_lane = 0;
                  retained_lane < max_concurrency_ &&
@@ -862,7 +864,7 @@ private:
                  ++retained_lane) {
                 if (retained_lane != lane && slots_[retained_lane] == nullptr &&
                     instance_.program->has_retained_lane(retained_lane)) {
-                    clear_deferred_capture(retained_lane);
+                    flush_deferred_capture(retained_lane);
                     instance_.program->evict_retained_lane(retained_lane);
                     invalidate_lane_plans(retained_lane);
                 }

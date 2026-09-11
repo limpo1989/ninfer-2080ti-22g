@@ -1,5 +1,6 @@
 #include "ninfer/engine.h"
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -8,6 +9,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <unistd.h>
@@ -126,9 +128,89 @@ double deferred_queue(const char* artifact) {
     return second.timings.queue_seconds;
 }
 
+void forced_replacement_preserves_dirty_state(const char* artifact) {
+    TempDirectory cache("ninfer-state-forced-replacement");
+    ninfer::Engine engine(engine_options(artifact, cache.path, 60'000));
+    const std::vector<ninfer::TokenId> original(512, 198);
+    const std::vector<ninfer::TokenId> unrelated(512, 199);
+    const ninfer::GenerationResult first =
+        engine.generate(engine.prepare_tokens(original), request_options());
+
+    (void)engine.generate(engine.prepare_tokens(unrelated), request_options());
+    const ninfer::GenerationResult restored =
+        engine.generate(engine.prepare_tokens(continuation(original, first)), request_options());
+    if (restored.timings.state_cache_source != 1 || restored.reused_prompt_tokens == 0) {
+        throw std::runtime_error(
+            "dirty retained state was lost when an unrelated request replaced its lane");
+    }
+}
+
+void capacity_eviction_preserves_other_dirty_lane(const char* artifact) {
+    TempDirectory cache("ninfer-state-capacity-eviction");
+    ninfer::EngineOptions options = engine_options(artifact, cache.path, 60'000);
+    options.max_concurrency       = 2;
+    ninfer::Engine engine(std::move(options));
+    const std::vector<ninfer::TokenId> first_prompt(512, 198);
+    const std::vector<ninfer::TokenId> second_prompt(512, 199);
+    ninfer::RequestOptions concurrent            = request_options();
+    concurrent.execution.requested_output_tokens = 128;
+    ninfer::GenerationHandle first_handle =
+        engine.submit(engine.prepare_tokens(first_prompt), concurrent);
+    ninfer::GenerationHandle second_handle =
+        engine.submit(engine.prepare_tokens(second_prompt), concurrent);
+    const ninfer::GenerationResult first        = first_handle.wait();
+    const ninfer::GenerationResult second       = second_handle.wait();
+    const ninfer::RuntimeStats concurrent_stats = engine.runtime_stats();
+    if (concurrent_stats.decode_row_rounds <= concurrent_stats.decode_rounds) {
+        throw std::runtime_error("capacity-eviction fixture did not populate two active lanes");
+    }
+
+    ninfer::RequestOptions oversized            = request_options();
+    oversized.execution.requested_output_tokens = 4096;
+    ninfer::GenerationHandle eviction           = engine.submit(
+        engine.prepare_tokens(continuation(first_prompt, first)), std::move(oversized));
+    std::atomic<bool> cancel{false};
+    std::atomic<bool> admitted{false};
+    std::thread canceller([&] {
+        for (int attempt = 0; attempt < 1000; ++attempt) {
+            const ninfer::RuntimeStats stats = engine.runtime_stats();
+            if (stats.running_requests != 0 || stats.prefilling_requests != 0) {
+                admitted.store(true, std::memory_order_release);
+                cancel.store(true, std::memory_order_release);
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        cancel.store(true, std::memory_order_release);
+    });
+    ninfer::GenerationResult cancelled;
+    try {
+        cancelled = eviction.wait(nullptr, ninfer::CancellationView([&] {
+                                      return cancel.load(std::memory_order_acquire);
+                                  }));
+    } catch (...) {
+        cancel.store(true, std::memory_order_release);
+        canceller.join();
+        throw;
+    }
+    canceller.join();
+    if (!admitted.load(std::memory_order_acquire) ||
+        cancelled.finish_reason != ninfer::FinishReason::Cancelled) {
+        throw std::runtime_error("capacity-eviction request did not cancel after admission");
+    }
+
+    const ninfer::GenerationResult restored = engine.generate(
+        engine.prepare_tokens(continuation(second_prompt, second)), request_options());
+    if (restored.timings.state_cache_source != 1 || restored.reused_prompt_tokens == 0) {
+        throw std::runtime_error("capacity eviction lost another lane's dirty retained state");
+    }
+}
+
 int exercise(const char* artifact) {
     const double immediate = immediate_queue(artifact);
     const double deferred  = deferred_queue(artifact);
+    forced_replacement_preserves_dirty_state(artifact);
+    capacity_eviction_preserves_other_dirty_lane(artifact);
     std::cout << "state-cache queue immediate=" << immediate << "s deferred=" << deferred << "s\n";
     if (!(immediate > 0.1)) {
         std::cerr << "immediate capture did not produce a measurable queue baseline\n";

@@ -683,9 +683,12 @@ State capture is deferred until the Engine has no active or pending request for
 marks only that lane's latest state dirty, so rapid tool loops avoid a GPU-to-host copy between
 turns. Pending inference always takes priority. After the deadline the executor captures one dirty
 lane and rechecks the queue before capturing another; graceful shutdown flushes still-valid dirty
-lanes. Reusing or evicting a dirty lane discards its stale pending capture. Set the delay to zero to
-restore the immediate legacy behavior. A request arriving after a copy has begun cannot preempt the
-CUDA transfer and may still wait for its remaining duration.
+lanes. A compatible resident continuation supersedes the dirty state without copying it. Before a
+full reset, external snapshot restore, or capacity eviction discards a dirty lane, the executor
+captures that state synchronously; this exceptional preservation cost is included in the incoming
+request's Queue time. Set the delay to zero to restore the immediate legacy behavior. A request
+arriving after a copy has begun cannot preempt the CUDA transfer and may still wait for its
+remaining duration.
 
 The shared family runtime distinguishes `full_reset`, `append_frontier`,
 `restore_turn_checkpoint`, and `restore_response_checkpoint`. Both checkpoint kinds include the
