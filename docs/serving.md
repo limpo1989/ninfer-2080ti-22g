@@ -502,6 +502,7 @@ curl http://127.0.0.1:8080/v1/models \
 | `--state-cache-dir DIR` | retained GPU-state snapshot directory; empty disables it | unset |
 | `--state-cache-max-mib N` | retained-state disk budget; `0` disables it | `0` |
 | `--state-cache-ram-mib N` | RAM budget for state images, including pending I/O | `4096` |
+| `--state-cache-idle-ms N` | complete-idle delay before GPU-to-host capture; `0` captures immediately | `1000` |
 | `--kv-dtype bf16\|int8\|kvarn\|kvarn-k4v4` | KV-cache storage | `bf16` |
 | `--spec mtp\|dflash` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; DFlash `1..15` | unset |
@@ -662,6 +663,15 @@ client must therefore resubmit historical media after a restart; preparation est
 identity before lookup, while a matched snapshot skips Vision GPU encoding and model prefill for
 the restored prefix. State caching supports ordinary and MTP text/multimodal execution; DFlash
 remains unsupported.
+
+State capture is deferred until the Engine has no active or pending request for
+`--state-cache-idle-ms` (1,000 ms by default). Every completion resets the shared idle deadline and
+marks only that lane's latest state dirty, so rapid tool loops avoid a GPU-to-host copy between
+turns. Pending inference always takes priority. After the deadline the executor captures one dirty
+lane and rechecks the queue before capturing another; graceful shutdown flushes still-valid dirty
+lanes. Reusing or evicting a dirty lane discards its stale pending capture. Set the delay to zero to
+restore the immediate legacy behavior. A request arriving after a copy has begun cannot preempt the
+CUDA transfer and may still wait for its remaining duration.
 
 The shared family runtime distinguishes `full_reset`, `append_frontier`,
 `restore_turn_checkpoint`, and `restore_response_checkpoint`. Both checkpoint kinds include the

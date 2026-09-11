@@ -48,6 +48,7 @@ int main() {
     options.kv_capacity                    = ninfer::KvCapacityPolicy::explicit_capacity(524288);
     options.prefill_chunk                  = 1024;
     options.log_stats_interval_ms          = 2500;
+    options.state_cache_idle_ms            = 750;
     options.kv_cache                       = ninfer::KvCacheStorage::Int8Group64;
     options.speculative.backend            = ninfer::SpeculativeBackend::Mtp;
     options.speculative.draft_tokens       = 3;
@@ -129,6 +130,8 @@ int main() {
                       "KV capacity resolution metadata missing");
     failures +=
         check(server.at("engine").at("log_stats_interval_ms") == 2500, "stats interval missing");
+    failures += check(server.at("engine").at("state_cache_idle_ms") == 750,
+                      "state cache idle delay missing");
     failures += check(server.at("server").at("request_log_jsonl") == "requests.jsonl",
                       "request log path missing");
     failures += check(server.at("engine").at("kv_cache") == "int8-group64", "KV type missing");

@@ -54,6 +54,8 @@ int main() {
                       "tool replay cache must default to 1 GiB");
     failures += check(defaults.state_cache_dir.empty() && defaults.state_cache_max_bytes == 0,
                       "state cache must be disabled by default");
+    failures += check(defaults.state_cache_idle_ms == 1000,
+                      "state cache idle delay default mismatch");
     failures += check(!defaults.model_id_override.has_value(),
                       "model id override is unexpectedly configured by default");
     failures += check(
@@ -156,10 +158,12 @@ int main() {
     failures += check(parse({"ninfer-serve", "model.ninfer", "--tool-replay-cache-mib", "0"})
                           .tool_replay_cache_bytes == 0,
                       "zero must disable the tool replay cache");
-    const ServeOptions state_cache = parse({"ninfer-serve", "model.ninfer", "--state-cache-dir",
-                                            "/tmp/ninfer-state", "--state-cache-max-mib", "32768"});
+    const ServeOptions state_cache =
+        parse({"ninfer-serve", "model.ninfer", "--state-cache-dir", "/tmp/ninfer-state",
+               "--state-cache-max-mib", "32768", "--state-cache-idle-ms", "0"});
     failures += check(state_cache.state_cache_dir == "/tmp/ninfer-state" &&
-                          state_cache.state_cache_max_bytes == (32768ULL << 20),
+                          state_cache.state_cache_max_bytes == (32768ULL << 20) &&
+                          state_cache.state_cache_idle_ms == 0,
                       "state cache options did not reach serving options");
     for (const char* invalid : {"-1", "bad", "18446744073709551615"}) {
         bool rejected = false;
@@ -217,6 +221,9 @@ int main() {
     failures +=
         check(serve_usage_text("ninfer-serve").find("--log-stats-interval-ms") != std::string::npos,
               "serve help omits --log-stats-interval-ms");
+    failures +=
+        check(serve_usage_text("ninfer-serve").find("--state-cache-idle-ms") != std::string::npos,
+              "serve help omits --state-cache-idle-ms");
     failures += check(serve_usage_text("ninfer-serve").find("--media-preprocess-threads") !=
                           std::string::npos,
                       "serve help omits media preparation controls");

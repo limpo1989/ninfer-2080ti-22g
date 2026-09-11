@@ -14,6 +14,7 @@ BIN=${NINFER_BIN:-$SOURCE_ROOT/build/apps/ninfer-serve}
 MODEL=${NINFER_MODEL:-$BUNDLE_ROOT/models/qwen3_8_27b.ninfer}
 LOG=${NINFER_LOG:-$BUNDLE_ROOT/serve.log}
 PID_FILE=${NINFER_PID_FILE:-$BUNDLE_ROOT/ninfer-serve.pid}
+MODE_FILE=${NINFER_MODE_FILE:-$PID_FILE.mode}
 PORT=${NINFER_PORT:-8321}
 # Fixed shared key for this LAN deployment; reused across restarts.
 API_KEY='sk-may-the-tokens-be-with-you'
@@ -26,6 +27,7 @@ TOOL_REPLAY_CACHE_MIB=${NINFER_TOOL_REPLAY_CACHE_MIB:-1024}
 STATE_CACHE_DIR=${NINFER_STATE_CACHE_DIR:-$BUNDLE_ROOT/state-cache}
 STATE_CACHE_MAX_MIB=${NINFER_STATE_CACHE_MAX_MIB:-8192}
 STATE_CACHE_RAM_MIB=${NINFER_STATE_CACHE_RAM_MIB:-4096}
+STATE_CACHE_IDLE_MS=${NINFER_STATE_CACHE_IDLE_MS:-1000}
 TURBO_POWER_LIMIT_W=280
 FAN_CURVE_SERVICE=${NINFER_FAN_CURVE_SERVICE:-nvidia-fan-curve.service}
 TURBO_MODE=false
@@ -108,7 +110,7 @@ stop_server() {
             kill -9 $pids 2>/dev/null || true
         fi
     fi
-    rm -f "$PID_FILE"
+    rm -f "$PID_FILE" "$MODE_FILE"
     restore_default_power_limit || power_restore_status=$?
 
     for _ in $(seq 1 60); do
@@ -125,6 +127,7 @@ stop_server() {
 start_server() {
     [[ -x "$BIN" ]] || { echo "Missing executable: $BIN" >&2; return 1; }
     [[ -f "$MODEL" ]] || { echo "Missing model: $MODEL" >&2; return 1; }
+    rm -f "$MODE_FILE"
     local -a sampling_args=()
     if [[ -n ${NINFER_SEED:-} ]]; then
         sampling_args+=(--seed "$NINFER_SEED")
@@ -157,6 +160,7 @@ start_server() {
         --tool-replay-cache-mib "$TOOL_REPLAY_CACHE_MIB" \
         --state-cache-dir "$STATE_CACHE_DIR" --state-cache-max-mib "$STATE_CACHE_MAX_MIB" \
         --state-cache-ram-mib "$STATE_CACHE_RAM_MIB" \
+        --state-cache-idle-ms "$STATE_CACHE_IDLE_MS" \
         --temperature 0.6 --presence-penalty 1.0 \
         "${sampling_args[@]}" \
         >"$LOG" 2>&1 </dev/null &
@@ -169,6 +173,7 @@ start_server() {
         if ! kill -0 "$pid" 2>/dev/null; then
             echo "ninfer-serve exited during startup" >&2
             tail -n 30 "$LOG" >&2 || true
+            rm -f "$MODE_FILE"
             restore_default_power_limit || true
             return 1
         fi
@@ -179,6 +184,11 @@ start_server() {
                 printf ' | API Key: %s' "$API_KEY"
             fi
             printf '\n'
+            if [[ "$TURBO_MODE" == true ]]; then
+                printf 'turbo\n' >"$MODE_FILE"
+            else
+                printf 'standard\n' >"$MODE_FILE"
+            fi
             printf 'Context: %s | shared KV: %s | default max_tokens: %s\n' \
                 "$MAX_CONTEXT" "$KV_CAPACITY" "$DEFAULT_MAX_TOKENS"
             nvidia-smi --query-gpu=memory.used,memory.total,temperature.gpu,fan.speed \
@@ -190,6 +200,7 @@ start_server() {
     echo "Timed out waiting for http://127.0.0.1:$PORT/v1/models" >&2
     tail -n 30 "$LOG" >&2 || true
     kill "$pid" 2>/dev/null || true
+    rm -f "$MODE_FILE"
     restore_default_power_limit || true
     return 1
 }
@@ -200,6 +211,9 @@ watch_metrics() {
     local -a watch_args=()
     pids=$(server_pids)
     [[ -z "$pids" ]] || watch_args+=(--pid "${pids%%$'\n'*}")
+    if [[ -n "$pids" && -f "$MODE_FILE" && "$(<"$MODE_FILE")" == turbo ]]; then
+        watch_args+=(--turbo)
+    fi
     python3 "$SOURCE_ROOT/deploy/watch_ninfer.py" --log "$LOG" --max-concurrency 2 \
         --pid-file "$PID_FILE" \
         --server-url "http://0.0.0.0:$PORT/v1" --api-key "$API_KEY" --model "$MODEL" \
@@ -209,6 +223,7 @@ watch_metrics() {
         --tool-replay-cache-mib "$TOOL_REPLAY_CACHE_MIB" \
         --state-cache-dir "$STATE_CACHE_DIR" --state-cache-max-mib "$STATE_CACHE_MAX_MIB" \
         --state-cache-ram-mib "$STATE_CACHE_RAM_MIB" \
+        --state-cache-idle-ms "$STATE_CACHE_IDLE_MS" \
         "${watch_args[@]}" "$@"
 }
 
@@ -259,6 +274,11 @@ while [[ $# -gt 0 ]]; do
             STATE_CACHE_RAM_MIB=$2
             shift 2
             ;;
+        --state-cache-idle-ms)
+            [[ $# -ge 2 ]] || { echo "--state-cache-idle-ms needs a value" >&2; exit 2; }
+            STATE_CACHE_IDLE_MS=$2
+            shift 2
+            ;;
         *) WATCH_ARGS+=("$1"); shift ;;
     esac
 done
@@ -282,6 +302,10 @@ esac
 }
 [[ "$STATE_CACHE_RAM_MIB" =~ ^[0-9]+$ && "$STATE_CACHE_RAM_MIB" -gt 0 ]] || {
     echo "--state-cache-ram-mib must be positive in MiB" >&2
+    exit 2
+}
+[[ "$STATE_CACHE_IDLE_MS" =~ ^[0-9]+$ ]] || {
+    echo "--state-cache-idle-ms must be a nonnegative integer" >&2
     exit 2
 }
 
@@ -320,7 +344,7 @@ case $NINFER_ACTION in
         tail -n 100 -F "$LOG"
         ;;
     *)
-        echo "Usage: $0 [restart|restart-daemon|start|stop|status|watch|logs] [--turbo] [--state-cache-dir DIR] [--state-cache-max-mib N] [--tool-replay-cache-mib N] [--details] [--once] [--color auto|always|never]" >&2
+        echo "Usage: $0 [restart|restart-daemon|start|stop|status|watch|logs] [--turbo] [--state-cache-dir DIR] [--state-cache-max-mib N] [--state-cache-idle-ms N] [--tool-replay-cache-mib N] [--details] [--once] [--color auto|always|never]" >&2
         exit 2
         ;;
 esac

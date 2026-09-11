@@ -75,6 +75,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--tool-replay-cache-mib N] "
            "[--state-cache-dir DIR] [--state-cache-max-mib N] [--state-cache-ram-mib N] "
+           "[--state-cache-idle-ms N] "
            "[--kv-dtype bf16|int8|kvarn|kvarn-k4v4] [--spec mtp|dflash --draft-tokens N] "
            "[--default-max-tokens N] "
            "[--vision] [--no-cuda-graph] [--no-prefix-reuse] "
@@ -97,6 +98,7 @@ std::string serve_usage_text(const char* argv0) {
            "default\n"
            "       --tool-replay-cache-mib defaults to 1024; 0 disables tool-format replay caching\n"
            "       --state-cache-dir plus --state-cache-max-mib enable retained-state disk snapshots\n"
+           "       --state-cache-idle-ms defaults to 1000; 0 captures immediately\n"
            "       --log-stats-interval-ms defaults to 5000; 0 disables periodic throughput logs\n"
            "       --vision enables media and loads the fixed Vision GPU allocations\n"
            "       --kv-capacity auto leaves " +
@@ -239,6 +241,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             if (!mib || mib > std::numeric_limits<std::size_t>::max() / (1ULL << 20))
                 throw std::invalid_argument("--state-cache-ram-mib is out of range");
             options.state_cache_ram_bytes = static_cast<std::size_t>(mib << 20);
+        } else if (arg == "--state-cache-idle-ms") {
+            options.state_cache_idle_ms = static_cast<std::uint32_t>(parse_nonnegative_int(
+                require_value("--state-cache-idle-ms"), "state-cache-idle-ms"));
         } else if (arg == "--device") {
             options.device = parse_nonnegative_int(require_value("--device"), "device");
         } else if (arg == "--kv-dtype") {

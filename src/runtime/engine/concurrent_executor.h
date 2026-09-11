@@ -48,6 +48,9 @@ public:
           max_outstanding_(static_cast<std::size_t>(options.max_concurrency) +
                            options.max_pending_requests),
           pending_timeout_(std::chrono::milliseconds(options.pending_timeout_ms)),
+          state_cache_enabled_(!options.state_cache_dir.empty() &&
+                               options.state_cache_max_bytes != 0),
+          state_cache_idle_(std::chrono::milliseconds(options.state_cache_idle_ms)),
           admission_capacity_(instance.program->admission_capacity()) {
         if (max_concurrency_ == 0 || max_concurrency_ > kMaximumConcurrency ||
             options.max_pending_requests == 0 || pending_timeout_.count() <= 0) {
@@ -357,6 +360,58 @@ private:
         bool evict_retained = false;
     };
 
+    void clear_deferred_capture(std::uint32_t lane) noexcept {
+        deferred_capture_dirty_[lane] = false;
+        if (std::none_of(deferred_capture_dirty_.begin(), deferred_capture_dirty_.end(),
+                         [](bool dirty) { return dirty; })) {
+            deferred_capture_due_.reset();
+        }
+    }
+
+    void schedule_state_capture(std::uint32_t lane) {
+        if (!state_cache_enabled_) return;
+        if (state_cache_idle_.count() == 0) {
+            instance_.program->save_state(lane);
+            return;
+        }
+        deferred_capture_dirty_[lane] = true;
+        deferred_capture_due_         = Clock::now() + state_cache_idle_;
+    }
+
+    [[nodiscard]] bool queue_empty() const {
+        std::lock_guard lock(queue_mutex_);
+        return pending_.empty();
+    }
+
+    [[nodiscard]] bool capture_one_due_state(Clock::time_point now) {
+        if (!deferred_capture_due_ || now < *deferred_capture_due_) return false;
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+            if (!deferred_capture_dirty_[lane]) continue;
+            deferred_capture_dirty_[lane] = false;
+            const bool more = std::any_of(deferred_capture_dirty_.begin(),
+                                          deferred_capture_dirty_.end(),
+                                          [](bool dirty) { return dirty; });
+            if (more) {
+                deferred_capture_due_ = now;
+            } else {
+                deferred_capture_due_.reset();
+            }
+            instance_.program->save_state(lane);
+            return true;
+        }
+        deferred_capture_due_.reset();
+        return false;
+    }
+
+    void flush_deferred_captures() noexcept {
+        deferred_capture_due_.reset();
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+            if (!deferred_capture_dirty_[lane]) continue;
+            deferred_capture_dirty_[lane] = false;
+            instance_.program->save_state(lane);
+        }
+    }
+
     void append_output(const std::shared_ptr<Request>& request,
                        targets::qwen3_6::PublishedOutput output) {
         if (output.empty()) { return; }
@@ -470,7 +525,7 @@ private:
         request->cv.notify_one();
         if (request->lane && reason != FinishReason::Cancelled &&
             request->options.execution.allow_prefix_reuse) {
-            instance_.program->save_state(*request->lane);
+            schedule_state_capture(*request->lane);
         }
     }
 
@@ -799,6 +854,7 @@ private:
         const auto resident_reuse = request->lane_plans[lane]->summary().reusable_prompt_tokens;
         const bool use_snapshot = request->snapshot.result.valid() && resident_reuse < request->snapshot.frontier;
         if (use_snapshot && !request->snapshot.ready()) return AdmissionProgress::None;
+        clear_deferred_capture(lane);
         if (choice.evict_retained) {
             for (std::uint32_t retained_lane = 0;
                  retained_lane < max_concurrency_ &&
@@ -806,6 +862,7 @@ private:
                  ++retained_lane) {
                 if (retained_lane != lane && slots_[retained_lane] == nullptr &&
                     instance_.program->has_retained_lane(retained_lane)) {
+                    clear_deferred_capture(retained_lane);
                     instance_.program->evict_retained_lane(retained_lane);
                     invalidate_lane_plans(retained_lane);
                 }
@@ -1155,13 +1212,20 @@ private:
                         active = active || slots_[lane] != nullptr;
                     }
                     if (!active) {
-                        queue_cv_.wait(lock, [&] { return stopping_ || !pending_.empty(); });
+                        if (deferred_capture_due_) {
+                            queue_cv_.wait_until(lock, *deferred_capture_due_,
+                                                 [&] { return stopping_ || !pending_.empty(); });
+                        } else {
+                            queue_cv_.wait(lock,
+                                           [&] { return stopping_ || !pending_.empty(); });
+                        }
                     }
                 }
                 if (stopping_) {
                     lock.unlock();
                     fail_all(std::make_exception_ptr(RequestError(
                         RequestErrorKind::Unavailable, "inference engine is shutting down")));
+                    flush_deferred_captures();
                     return;
                 }
             }
@@ -1200,6 +1264,10 @@ private:
                     previous_unit_was_decode = true;
                     continue;
                 }
+                if (!have_pending && queue_empty() && capture_one_due_state(Clock::now())) {
+                    previous_unit_was_decode = false;
+                    continue;
+                }
                 // An asynchronous cache read may be the only outstanding work. Yield without
                 // adding any polling sleep to active GPU rounds; cancellation/deadlines still run.
                 std::unique_lock queue_lock(queue_mutex_);
@@ -1215,6 +1283,8 @@ private:
     const std::uint32_t max_concurrency_;
     const std::size_t max_outstanding_;
     const std::chrono::milliseconds pending_timeout_;
+    const bool state_cache_enabled_;
+    const std::chrono::milliseconds state_cache_idle_;
     const AdmissionResources admission_capacity_;
 
     mutable std::mutex execution_mutex_;
@@ -1227,6 +1297,8 @@ private:
     std::array<std::shared_ptr<Request>, kMaximumConcurrency> slots_{};
     std::optional<std::uint32_t> prefill_lane_;
     std::array<std::uint64_t, kMaximumConcurrency> lane_plan_versions_{};
+    std::array<bool, kMaximumConcurrency> deferred_capture_dirty_{};
+    std::optional<Clock::time_point> deferred_capture_due_;
     std::optional<AdmissionProtection> protection_;
     std::uint64_t next_protection_epoch_ = 1;
     RuntimeStats cumulative_stats_;

@@ -475,17 +475,25 @@ precedence, and the selected budget appears in the watch header. The Responses o
 has its own separate limits. The launcher enables retained-state caching with 4 GiB RAM
 and 8 GiB disk under `$BUNDLE_ROOT/state-cache`. Override with `NINFER_STATE_CACHE_DIR`,
 `NINFER_STATE_CACHE_RAM_MIB`, and `NINFER_STATE_CACHE_MAX_MIB`, or the corresponding
-`--state-cache-dir`, `--state-cache-ram-mib`, and `--state-cache-max-mib` flags. A zero disk budget
-disables this feature. Direct `ninfer-serve` launches leave it disabled unless a directory and
-positive disk budget are supplied.
+`--state-cache-dir`, `--state-cache-ram-mib`, and `--state-cache-max-mib` flags. State capture waits
+for 1,000 ms of complete Engine idleness by default. Override it with
+`NINFER_STATE_CACHE_IDLE_MS` or `--state-cache-idle-ms`; zero restores immediate capture. A zero
+disk budget disables this feature. Direct `ninfer-serve` launches leave it disabled unless a
+directory and positive disk budget are supplied.
 
 Completed text or multimodal requests with at least 256 retained tokens can capture immutable
 continuation images (Main/MTP KV, current and checkpoint KVarN stages, current/checkpoint GDN
 state, hidden state and prefix identity).
-The final result is published before capture begins, so snapshot copying no longer extends that
-request's reported Wall time. An identical state already present in RAM or on disk is detected
-before any GPU-to-host copy.
-Capture and upload synchronize on the compute stream and briefly occupy the GPU worker. Payload
+The final result is published before capture begins, so snapshot copying does not extend that
+request's reported Wall time. With the default idle delay, a new pending or active request takes
+priority; repeated completions reset the deadline and coalesce each lane to its latest state. Once
+the Engine remains idle, it captures one dirty lane, then checks the queue again before another.
+Graceful shutdown captures any still-valid dirty lanes. A lane reused or evicted before its idle
+capture drops the stale pending snapshot rather than delaying the new request. An identical state
+already present in RAM or on disk is detected before any GPU-to-host copy.
+
+Capture and upload synchronize on the compute stream and briefly occupy the GPU worker. A request
+arriving after copying has already started can still wait for that copy to finish. Payload
 reads, checksums, writes, fsync and atomic publication run on a separate I/O worker. RAM includes
 pending writes; pressure evicts clean images or skips new captures instead of blocking for disk.
 Images are persisted in the background after completion, even if their GPU state remains resident,
@@ -511,6 +519,10 @@ Recoverable cache corruption falls back to normal prefill. New physical pages an
 allocated on restore, leaving CUDA Graph addresses stable. The disk cache does not persist public
 Responses IDs: after restart clients must resend their history. Tool-format replay metadata is
 also process-local, so normalized tool history may still reduce the reusable suffix.
+
+The idle policy favors interactive latency over retaining every intermediate tool turn: a crash or
+branch before the latest idle capture may reuse an older snapshot and recompute the suffix. It does
+not change model output, resident prefix reuse, or prefill/decode kernels.
 
 `watch --details` shows `State` and GPU upload time (`Restore`). Disk-read waiting is included in
 Queue; upload occurs after admission and is included in TTFB. Wall ends when the final result is

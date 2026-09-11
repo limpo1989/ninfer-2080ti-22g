@@ -104,6 +104,9 @@ struct EngineOptions {
     std::filesystem::path state_cache_dir;
     std::size_t state_cache_max_bytes = 0;
     std::size_t state_cache_ram_bytes = 4ULL << 30;
+    // Defer GPU-to-host state capture until the executor has remained idle for this duration.
+    // Zero preserves immediate capture at request completion.
+    std::uint32_t state_cache_idle_ms = 1000;
     // Optional Jinja chat template replacing the one inside the artifact.
     // Empty means use the artifact's own frontend/chat_template.jinja.
     std::string chat_template_override;

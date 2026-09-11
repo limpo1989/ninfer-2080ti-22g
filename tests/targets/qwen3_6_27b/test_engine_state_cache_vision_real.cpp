@@ -28,6 +28,7 @@ ninfer::EngineOptions engine_options(const char* artifact, const std::filesystem
     options.state_cache_dir           = cache;
     options.state_cache_max_bytes     = 3 * kGiB;
     options.state_cache_ram_bytes     = 3 * kGiB;
+    options.state_cache_idle_ms       = 0;
     return options;
 }
 

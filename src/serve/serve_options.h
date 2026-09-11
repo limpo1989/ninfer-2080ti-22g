@@ -44,6 +44,7 @@ struct ServeOptions {
     std::filesystem::path state_cache_dir;
     std::size_t state_cache_max_bytes = 0;
     std::size_t state_cache_ram_bytes = 4ULL << 30;
+    std::uint32_t state_cache_idle_ms = 1000;
     int device                             = 0;
     KvCacheStorage kv_cache                = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;

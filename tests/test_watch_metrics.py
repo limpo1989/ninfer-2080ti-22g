@@ -95,12 +95,17 @@ class WatchMetricsTest(unittest.TestCase):
         args = argparse.Namespace(server_url="http://0.0.0.0:8321/v1", api_key="fixture-key",
                                   model="/models/qwen.ninfer", max_context=245760,
                                   kv_capacity=245760, max_output=131072, draft_tokens=3,
-                                  prefill_chunk=1024, max_concurrency=2, tool_replay_cache_mib=1024)
+                                  prefill_chunk=1024, max_concurrency=2,
+                                  tool_replay_cache_mib=1024, state_cache_max_mib=8192,
+                                  state_cache_ram_mib=4096, state_cache_idle_ms=1000,
+                                  turbo=False)
         startup = tuple(launch_lines(args))
         view = frame(WatchState(), GpuSnapshot(metrics="GPU 0%"), 2, 80, 30, False, False, startup)
         self.assertLess(view.index("API http"), view.index("Service stopped"))
         self.assertIn("Key fixture-key", view)
         self.assertIn("Max output 131,072", view)
+        self.assertIn("Turbo OFF", view)
+        self.assertIn("idle 1,000 ms", view)
         self.assertTrue(all(len(line) <= 80 for line in view.splitlines()))
         args.api_key = ""
         self.assertNotIn("Key", "\n".join(launch_lines(args)))
@@ -159,7 +164,7 @@ class WatchLauncherTest(unittest.TestCase):
         return dict(os.environ, PATH=str(fake_bin) + os.pathsep + os.environ["PATH"],
                     NINFER_BIN=str(root / "fake-server"), NINFER_MODEL=str(model),
                     NINFER_LOG=str(log), NINFER_PID_FILE=str(root / "server.pid"),
-                    NINFER_GPU_POWER_LIMIT_W="")
+                    NINFER_GPU_POWER_LIMIT_W="", NINFER_STATE_CACHE_IDLE_MS="1000")
 
     def power_fixture(self, root):
         env = self.fixture(root)
@@ -232,7 +237,10 @@ class WatchLauncherTest(unittest.TestCase):
                 server_pid = int(Path(env["NINFER_PID_FILE"]).read_text())
                 server_args = json.loads(arguments.read_text())
                 self.assertEqual(server_args[server_args.index("--tool-replay-cache-mib") + 1], "2048")
+                self.assertEqual(server_args[server_args.index("--state-cache-idle-ms") + 1],
+                                 "1000")
                 self.assertIn(b"Replay cache 2,048 MiB", output)
+                self.assertIn(b"idle 1,000 ms", output)
                 self.assertNotEqual(os.getpgid(server_pid), process.pid)
                 os.killpg(process.pid, signal.SIGINT)
                 tail, _ = process.communicate(timeout=5)
@@ -267,6 +275,7 @@ class WatchLauncherTest(unittest.TestCase):
                                         env=env, capture_output=True, text=True, timeout=8)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn("Turbo mode: 280 W", result.stdout)
+                self.assertIn("Turbo ON", result.stdout)
                 self.assertIn("--power-limit=280", Path(env["NVIDIA_SMI_LOG"]).read_text())
                 self.assertIn("is-active --quiet nvidia-fan-curve.service",
                               Path(env["SYSTEMCTL_LOG"]).read_text())

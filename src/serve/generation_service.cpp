@@ -271,6 +271,7 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.state_cache_dir          = options_.state_cache_dir;
     engine_options.state_cache_max_bytes    = options_.state_cache_max_bytes;
     engine_options.state_cache_ram_bytes    = options_.state_cache_ram_bytes;
+    engine_options.state_cache_idle_ms      = options_.state_cache_idle_ms;
     engine_options.chat_template_override   = load_chat_template(options_.chat_template_path);
     engine_              = std::make_unique<ninfer::Engine>(std::move(engine_options));
     prompt_capabilities_ = engine_->prompt_capabilities();

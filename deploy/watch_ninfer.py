@@ -85,10 +85,12 @@ def color_config(line: str, color: bool) -> str:
     parts = []
     for part in line.split(" | "):
         for label in ("API", "Key", "Model", "Context", "KV", "Max output", "MTP",
-                      "Concurrency", "Prefill chunk", "Replay cache", "GPU model"):
+                      "Turbo", "Concurrency", "Prefill chunk", "Replay cache", "State cache",
+                      "GPU model"):
             if part.startswith(label + " "):
                 value = part[len(label) + 1:]
-                part = paint(label + " ", "muted", color) + paint(value, "accent" if label == "API" else "", color)
+                tone = "accent" if label == "API" else "good" if label == "Turbo" and value == "ON" else ""
+                part = paint(label + " ", "muted", color) + paint(value, tone, color)
                 break
         else:
             if part == "KVarN":
@@ -349,12 +351,15 @@ def launch_lines(args: argparse.Namespace) -> list[str]:
     if limits:
         lines.append(" | ".join(limits))
     if args.draft_tokens is not None and args.prefill_chunk is not None:
-        lines.append(f"KVarN | MTP {args.draft_tokens} | Concurrency {args.max_concurrency} | "
+        lines.append(f"KVarN | MTP {args.draft_tokens} | Turbo {'ON' if args.turbo else 'OFF'} | "
+                     f"Concurrency {args.max_concurrency} | "
                      f"Prefill chunk {args.prefill_chunk}")
     if args.tool_replay_cache_mib is not None:
         lines.append(f"Replay cache {args.tool_replay_cache_mib:,} MiB")
     if getattr(args, "state_cache_max_mib", 0):
-        lines.append(f"State cache RAM {args.state_cache_ram_mib:,} MiB / disk {args.state_cache_max_mib:,} MiB")
+        lines.append(f"State cache RAM {args.state_cache_ram_mib:,} MiB / "
+                     f"disk {args.state_cache_max_mib:,} MiB / "
+                     f"idle {args.state_cache_idle_ms:,} ms")
     return lines
 
 
@@ -414,10 +419,12 @@ def main() -> int:
     parser.add_argument("--max-output", type=int)
     parser.add_argument("--draft-tokens", type=int)
     parser.add_argument("--prefill-chunk", type=int)
+    parser.add_argument("--turbo", action="store_true")
     parser.add_argument("--tool-replay-cache-mib", type=int)
     parser.add_argument("--state-cache-dir")
     parser.add_argument("--state-cache-max-mib", type=int, default=0)
     parser.add_argument("--state-cache-ram-mib", type=int, default=4096)
+    parser.add_argument("--state-cache-idle-ms", type=int, default=1000)
     parser.add_argument("--details", action="store_true", help="show thinking tokens and reuse details")
     parser.add_argument("--once", action="store_true", help="print a snapshot and exit")
     parser.add_argument("--color", choices=("auto", "always", "never"), default="auto",

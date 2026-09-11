@@ -35,6 +35,7 @@ int main(int argc, char** argv) {
         if (mode != "resident" && mode != "cold") {
             options.state_cache_dir = argv[3]; options.state_cache_max_bytes = 8ULL << 30;
             options.state_cache_ram_bytes = 2ULL << 30;
+            options.state_cache_idle_ms = 0;
         }
         ninfer::Engine engine(options);
         ninfer::serve::ServeOptions server;
