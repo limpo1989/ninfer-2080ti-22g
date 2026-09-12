@@ -12,7 +12,7 @@ import unittest
 from unittest.mock import patch
 
 from deploy.watch_ninfer import (GpuSnapshot, LogReader, ProcessCpu, RULE, WatchState, frame, gpu_status, launch_lines,
-                                 parse_request, process_alive, row_lines, service_pid)
+                                 parse_request, prefill_status, process_alive, row_lines, service_pid)
 
 
 DONE = ("[2026-09-10 12:00:00.001] [info] ninfer-serve: [req 7] done finish=output_limit "
@@ -67,6 +67,34 @@ class WatchMetricsTest(unittest.TestCase):
         narrow = frame(state, GpuSnapshot(metrics="GPU 0%"), 2, 80, 24, True, True)
         self.assertTrue(all(len(line) <= 80 for line in narrow.splitlines()))
         self.assertIn("Input/New=25000/500", narrow)
+
+    def test_live_prefill_progress_has_rolling_rate_and_eta(self):
+        state = WatchState()
+        state.feed("throughput interval=5.000s prefill=204.8tok/s decode=0.0tok/s "
+                   "running=1 prefilling=1 decode_ready=0 waiting=0 prefill_id=4 "
+                   "prefill_prompt=10000 prefill_reused=2000 prefill_done=1024 "
+                   "avg_decode_batch=n/a")
+        state.feed("throughput interval=5.000s prefill=204.8tok/s decode=0.0tok/s "
+                   "running=1 prefilling=1 decode_ready=0 waiting=0 prefill_id=4 "
+                   "prefill_prompt=10000 prefill_reused=2000 prefill_done=2048 "
+                   "avg_decode_batch=n/a")
+        progress = prefill_status(state)
+        self.assertIn("25.6%", progress)
+        self.assertIn("New 2,048/8,000", progress)
+        self.assertIn("Reused 2,000", progress)
+        self.assertIn("Rolling 204.8 tok/s", progress)
+        self.assertIn("ETA 29s", progress)
+        view = frame(state, GpuSnapshot(metrics="GPU 90%"), 2, 160, 30, False, True)
+        self.assertIn(progress, view)
+        state.feed("throughput interval=5.000s prefill=0.0tok/s decode=10.0tok/s "
+                   "running=1 prefilling=0 decode_ready=1 waiting=0 avg_decode_batch=1.00")
+        self.assertEqual(prefill_status(state), "")
+
+    def test_live_prefill_falls_back_for_an_old_service_log(self):
+        state = WatchState()
+        state.feed("throughput interval=5.000s prefill=204.8tok/s decode=0.0tok/s "
+                   "running=1 prefilling=1 decode_ready=0 waiting=0 avg_decode_batch=n/a")
+        self.assertEqual(prefill_status(state), "Prefill active | Interval 204.8 tok/s")
 
     def test_log_follower_handles_partial_lines_truncation_and_rotation(self):
         with tempfile.TemporaryDirectory() as directory:

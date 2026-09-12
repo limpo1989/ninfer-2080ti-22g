@@ -101,20 +101,23 @@ K3 有两套实现 profile（均非语义要求），由 query column 数选择�
 的存储顺序读取。split-local partial 写入 workspace，由 reduce kernel 归并。split 数量由 wrapper
 一次性按 `W`、`B` 定出并据此给 partials 定容；launcher 不得按 column chunk 重新推导 split 数量。
 
-**prefill profile**（`Wq >= 128`）：一个 CTA 负责一个 `(kv_head, query tile, row)`，query tile 是
-`kKvarnPrefillRows / GroupSize` 个相邻 query column（27B 为 4，35B 为 3），因此每个 CTA 携带
-`kKvarnPrefillRows = 24` 行。record 段对一次调用的所有 query column 是同一段历史（record 只覆盖调用
-前已提交的整页），所以一个 record 在 CTA 内只解码一次、服务整个 tile：解码工作量按 tile 大小摊薄。
-这类调用天然只有一个 split，故该 kernel 自己做归一化并直接写 `out`，不经过 partial workspace 与
-reduce kernel。
+**SM75 prefill profile**（`Wq >= 128`）把历史拆成两个数学上独立的 attention state：
 
-prefill profile 的 shape 是照 SM75 定的：24 行的预算把 shared memory 压在 32 KiB 以下，配合
-`__launch_bounds__(256, 2)`（128 寄存器、无 spill），让两个 CTA 同时驻留一个 SM 的 64 KiB shared
-memory；query tile 以 `[channel][row]` 存 `__half`，probability 以 `[key][row]` 存 FP32，于是内层
-循环用 128-bit shared load 一次取 8 个 query 或 4 个 weight。
+- compressed prefix：一个 CTA 负责 `(q_head, 32 query rows, row)`。Q 和解码后的 K 以 FP16 输入
+  `mma.sync.m16n8k8` 计算 score；PV 保持 FP32 标量累加，避免 256 通道 Tensor Core PV accumulator
+  造成寄存器 spill；
+- dense current：sink、未满 tail 与本次 K/V 沿用 24 行 Q-tiled kernel，一个 CTA 负责
+  `(kv_head, query tile, row)`；
+- merge：两侧分别发布 `(max, sum, normalized output)`，最后用共同最大值重标定权重并做稳定 LSE
+  合并。
 
-两套 profile 的数学相同：record 段的 score 在旋转域中求值；accumulator 在离开 record 段前旋转回原始
-域——旋转是线性的，与归约的加权求和可交换，所以它与 BF16 段的 partial 可以直接相加。
+record 段对调用内所有 query 都相同，32 行 tile 把 record 解码和元数据读取摊薄；dense 侧仍保留原始
+域的因果 mask。没有 compressed record 的首个 chunk 会让 prefix CTA 直接发布空 state，merge 保留
+dense 输出，因此不会为无 prefix 的 Q 做无意义旋转。该实现使用约 36.1 KiB shared memory、无 local
+stack spill；实测 48 行 profile 会产生 192 B/thread stack spill，故不进入生产 dispatch。
+
+非 SM75 构建仍使用原来的 24 行 fused Q-tiled prefill kernel。两种实现的语义相同：record score 在
+旋转域中求值，prefix accumulator 在合并前旋回原始域；旋转是线性的，与加权求和可交换。
 
 ---
 
@@ -217,3 +220,21 @@ decode 不受影响（`Wq < 128` 仍走 decode profile），三次运行都逐�
 
 Capacity 侧的实测：在同一份约 2.66 GiB 的 runtime 预算下，`bf16` 的 `--max-context` 上限在 32,768
 附近，`kvarn` 在 131,072 成功、172,032 失败——与 bytes/token 的 4.6x 比值一致。
+
+### SM75 compressed-prefix Tensor Core profile
+
+同一 public Op benchmark、RTX 2080 Ti 22GB、K4V2、27B 几何、`W = Wq = 1024`、`B = 1`；表中是
+完整 K3 调用中位耗时，不是单独的 MMA kernel：
+
+| 已提交上下文 | 24-row scalar | 32-row TC QK + LSE merge | 提速 |
+|---:|---:|---:|---:|
+| 0 | 6.867 ms | 6.733 ms | 2.0% |
+| 2,048 | 18.553 ms | 16.077 ms | 13.3% |
+| 8,192 | 49.812 ms | 44.296 ms | 11.1% |
+| 24,576 | 136.355 ms | 121.387 ms | 11.0% |
+| 65,536 | 355.252 ms | 315.848 ms | 11.1% |
+| 127,488 | 699.483 ms | 617.704 ms | 11.7% |
+
+在 24,576 / 127,488 两个 anchor 上，`Wq=512` 分别快 9.1% / 10.6%，`Wq=2048` 分别快
+8.0% / 14.1%。35B 几何的 `Wq=1024` 在 8,192 / 127,488 上分别快 9.2% / 12.7%。这些数据同时
+包含 prefix、dense、merge、stage commit/append 与 workspace traffic；decode（`Wq < 128`）不变。

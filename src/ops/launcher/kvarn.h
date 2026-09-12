@@ -32,7 +32,9 @@ void kvarn_gqa_attention_launch(const Tensor& q, const Tensor& k, const Tensor& 
                                 const KvarnBatchLayerView& cache, std::int32_t q_heads,
                                 std::int32_t width, std::int32_t query_columns,
                                 std::int32_t batch_size, const Tensor& partial_acc,
-                                const Tensor& partial_max, const Tensor& partial_sum, Tensor& out,
-                                cudaStream_t stream);
+                                const Tensor& partial_max, const Tensor& partial_sum,
+                                const Tensor& prefix_acc, const Tensor& prefix_max,
+                                const Tensor& prefix_sum, const Tensor& dense_max,
+                                const Tensor& dense_sum, Tensor& out, cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

@@ -587,7 +587,7 @@ is also rejected if it resolves to the model artifact.
   --request-log-jsonl profiles/bench/run/server.requests.jsonl
 ```
 
-Every line is one `ninfer_serve_request_log` schema-v11 JSON object. All events carry
+Every line is one `ninfer_serve_request_log` schema-v12 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
 that server instance. Successful request-start records include request-scoped acquisition,
 media-preprocessing wall/work, tokenizer, cache hit/miss/single-flight, and payload-size fields;
@@ -600,7 +600,7 @@ they do not infer request behavior from process-global counter deltas.
 | `request_rejected` | parsed request shape, media-item count, `phase: "prepare"`, and the exact HTTP status/type/code/parameter/message for a synchronous preparation rejection |
 | `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, unrounded phase seconds, and complete speculative-decoding counters |
 | `request_error` | the resolved request configuration and generation error message |
-| `throughput` | interval token deltas and rates, scheduler occupancy, and decode-round batch statistics |
+| `throughput` | interval token deltas and rates, scheduler occupancy, active prefill progress, and decode-round batch statistics |
 
 `request_done.timings_seconds` contains `prepare`, `queue`, `ttft`, `vision`, `prefill`, `decode`,
 and `total` as full-precision JSON numbers. `queue` measures submission to scheduler admission,
@@ -632,6 +632,11 @@ and DFlash this is the accepted committed output, not draft or rejected tokens.
 `running`, `prefilling`, `decode_ready`, and `waiting` fields are the Engine scheduler snapshot at
 the end of the interval. A transition to zero running/waiting requests is logged even without new
 tokens, so live monitors can show the idle state. Subsequent fully idle zero intervals are omitted.
+While prefill is active, `prefill_progress` reports its Engine request ID, total prompt tokens,
+reused prefix tokens, and computed tokens committed at completed chunk boundaries. The deployment
+dashboard renders computed/required progress, a 30-second rolling rate, and ETA. An older running
+server without these schema-v12 fields still produces the current interval rate but cannot provide
+an exact percentage or ETA.
 The console completion record also includes `think`, the reasoning-token count within `gen`.
 The deployment dashboard reads these records to show scheduler occupancy, Input/New, finish reasons,
 and optional thinking/reuse details; request errors and preparation rejections appear alongside

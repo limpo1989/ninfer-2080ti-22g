@@ -212,6 +212,16 @@ private:
             snapshot.waiting_requests = static_cast<std::uint32_t>(pending_.size());
         }
         snapshot.prefilling_requests = prefill_lane_.has_value() ? 1U : 0U;
+        if (prefill_lane_) {
+            const auto& request = slots_[*prefill_lane_];
+            if (request == nullptr || request->decode_ready) {
+                throw std::logic_error("prefill progress has invalid request state");
+            }
+            snapshot.prefill_request_id       = request->id;
+            snapshot.prefill_prompt_tokens    = request->prefill_prompt_tokens;
+            snapshot.prefill_reused_tokens    = request->prefill_reused_tokens;
+            snapshot.prefill_processed_tokens = request->prefill_processed_tokens;
+        }
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] == nullptr) { continue; }
             ++snapshot.running_requests;
@@ -304,7 +314,10 @@ private:
         std::string reasoning;
         std::optional<std::uint32_t> lane;
         std::atomic<bool> cancelled{false};
-        bool decode_ready = false;
+        bool decode_ready                      = false;
+        std::uint32_t prefill_prompt_tokens    = 0;
+        std::uint32_t prefill_reused_tokens    = 0;
+        std::uint32_t prefill_processed_tokens = 0;
 
         std::optional<BasePlan> base_plan;
         std::array<std::optional<Plan>, kMaximumConcurrency> lane_plans{};
@@ -681,6 +694,12 @@ private:
     void resolve_prefill_step(const std::shared_ptr<Request>& request,
                               const PrefillStepResult& step, bool cancel_at_boundary) {
         cumulative_stats_.computed_prefill_tokens += step.processed_prompt_tokens;
+        request->prefill_processed_tokens += step.processed_prompt_tokens;
+        const std::uint32_t compute_tokens =
+            request->prefill_prompt_tokens - request->prefill_reused_tokens;
+        if (request->prefill_processed_tokens > compute_tokens) {
+            throw std::logic_error("prefill progress exceeded the planned token count");
+        }
         consume_service_work(request, 1);
         if (cancel_at_boundary) {
             if (!request->lane) { throw std::logic_error("cancelled prefill has no request lane"); }
@@ -899,6 +918,9 @@ private:
         release_planning_state(request);
 
         const RequestPlanSummary summary = selected_plan.summary();
+        if (summary.reusable_prompt_tokens > summary.prompt_tokens) {
+            throw std::logic_error("request plan reuses beyond the prompt frontier");
+        }
         if (backfill_class == BackfillClass::Temporal) {
             if (!protection_ || protection_->epoch_id != backfill_epoch ||
                 summary.service_work_quanta > protection_->temporal_credit) {
@@ -915,6 +937,8 @@ private:
                                     summary.effective_limit_reason);
             request->generated.reserve(summary.effective_output_tokens);
             request->lane                   = lane;
+            request->prefill_prompt_tokens  = summary.prompt_tokens;
+            request->prefill_reused_tokens  = summary.reusable_prompt_tokens;
             request->admission_resources    = summary.admission;
             request->remaining_service_work = summary.service_work_quanta;
             request->backfill_epoch         = backfill_epoch;

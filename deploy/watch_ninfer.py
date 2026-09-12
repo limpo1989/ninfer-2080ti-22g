@@ -180,13 +180,64 @@ class WatchState:
     def __init__(self) -> None:
         self.rows: deque[Row] = deque(maxlen=100)
         self.running: str = "-"
+        self.prefilling: str = "-"
         self.waiting: str = "-"
+        self.prefill_request_id: int | None = None
+        self.prefill_prompt: int | None = None
+        self.prefill_reused: int | None = None
+        self.prefill_done: int | None = None
+        self.prefill_interval_rate: float | None = None
+        self.prefill_rate_window: deque[tuple[int, float]] = deque()
+
+    def _clear_prefill_progress(self) -> None:
+        self.prefill_request_id = None
+        self.prefill_prompt = None
+        self.prefill_reused = None
+        self.prefill_done = None
+        self.prefill_rate_window.clear()
+
+    def _feed_prefill_progress(self, fields: dict[str, str]) -> None:
+        self.prefill_interval_rate = numeric(fields.get("prefill"), "tok/s")
+        if self.prefilling != "1":
+            self._clear_prefill_progress()
+            return
+        values = [numeric(fields.get(name)) for name in
+                  ("prefill_id", "prefill_prompt", "prefill_reused", "prefill_done")]
+        if any(value is None for value in values):
+            self._clear_prefill_progress()
+            return
+        request_id, prompt, reused, done = (int(value) for value in values)
+        if reused > prompt or done > prompt - reused:
+            self._clear_prefill_progress()
+            return
+        interval = numeric(fields.get("interval"), "s")
+        if request_id != self.prefill_request_id:
+            self.prefill_rate_window.clear()
+            if interval and self.prefill_interval_rate is not None:
+                interval_tokens = min(done, round(self.prefill_interval_rate * interval))
+                self.prefill_rate_window.append((interval_tokens, interval))
+        elif self.prefill_done is not None and done >= self.prefill_done and interval:
+            self.prefill_rate_window.append((done - self.prefill_done, interval))
+        while len(self.prefill_rate_window) > 1 and sum(item[1] for item in self.prefill_rate_window) > 30:
+            self.prefill_rate_window.popleft()
+        self.prefill_request_id = request_id
+        self.prefill_prompt = prompt
+        self.prefill_reused = reused
+        self.prefill_done = done
+
+    def prefill_rolling_rate(self) -> float | None:
+        seconds = sum(item[1] for item in self.prefill_rate_window)
+        if seconds <= 0:
+            return self.prefill_interval_rate
+        return sum(item[0] for item in self.prefill_rate_window) / seconds
 
     def feed(self, line: str) -> Row | None:
         if "throughput interval=" in line:
             fields = dict(FIELDS.findall(line))
             self.running = fields.get("running", "-")
+            self.prefilling = fields.get("prefilling", "-")
             self.waiting = fields.get("waiting", "-")
+            self._feed_prefill_progress(fields)
         row = parse_request(line)
         if row:
             self.rows.append(row)
@@ -368,6 +419,37 @@ def runtime_status(state: WatchState, gpu: GpuSnapshot, capacity: int, alive: bo
     return f"{service} | {cpu} | {gpu.metrics}"
 
 
+def compact_time(seconds: float) -> str:
+    seconds = max(0, round(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, seconds = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m{seconds:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h{minutes:02d}m"
+
+
+def prefill_status(state: WatchState) -> str:
+    if state.prefilling != "1":
+        return ""
+    rate_value = state.prefill_rolling_rate()
+    if state.prefill_prompt is None or state.prefill_reused is None or state.prefill_done is None:
+        return ("Prefill active" if rate_value is None else
+                f"Prefill active | Interval {rate_value:.1f} tok/s")
+    total = state.prefill_prompt - state.prefill_reused
+    done = min(state.prefill_done, total)
+    percent = 100.0 if total == 0 else 100.0 * done / total
+    filled = min(16, max(0, round(percent * 16 / 100)))
+    parts = [f"Prefill [{'=' * filled}{'.' * (16 - filled)}] {percent:.1f}%",
+             f"New {done:,}/{total:,}", f"Reused {state.prefill_reused:,}"]
+    if rate_value is not None:
+        parts.append(f"Rolling {rate_value:.1f} tok/s")
+        if rate_value > 0 and done < total:
+            parts.append(f"ETA {compact_time((total - done) / rate_value)}")
+    return " | ".join(parts)
+
+
 def header(state: WatchState, gpu: GpuSnapshot, capacity: int, width: int, alive: bool,
            startup: tuple[str, ...] = (), color: bool = False, cpu: str = "CPU -") -> list[str]:
     status = runtime_status(state, gpu, capacity, alive, cpu)
@@ -377,6 +459,9 @@ def header(state: WatchState, gpu: GpuSnapshot, capacity: int, width: int, alive
     if gpu.model:
         lines.extend(color_config(part, color) for part in textwrap.wrap("GPU model " + gpu.model, width))
     lines.extend(color_status(part, color) for part in textwrap.wrap(status, width))
+    progress = prefill_status(state)
+    if progress:
+        lines.extend(paint(part, "rate", color) for part in textwrap.wrap(progress, width))
     lines.extend([paint("Ctrl+C exits this view; it does not stop the HTTP service.", "muted", color),
                   paint("Times: seconds | Rates: tokens/s | TTFB includes Queue and Prefill", "muted", color)])
     if width >= len(RULE):

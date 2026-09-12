@@ -428,7 +428,14 @@ std::string format_throughput(const ThroughputReport& report) {
         << "tok/s running=" << report.scheduler.running_requests
         << " prefilling=" << report.scheduler.prefilling_requests
         << " decode_ready=" << report.scheduler.decode_ready_requests
-        << " waiting=" << report.scheduler.waiting_requests << " avg_decode_batch=";
+        << " waiting=" << report.scheduler.waiting_requests;
+    if (report.scheduler.prefilling_requests != 0) {
+        out << " prefill_id=" << report.scheduler.prefill_request_id
+            << " prefill_prompt=" << report.scheduler.prefill_prompt_tokens
+            << " prefill_reused=" << report.scheduler.prefill_reused_tokens
+            << " prefill_done=" << report.scheduler.prefill_processed_tokens;
+    }
+    out << " avg_decode_batch=";
     if (report.decode_rounds == 0) {
         out << "n/a";
     } else {
@@ -600,10 +607,18 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
                                       {"committed_decode", report.committed_decode_tokens}};
     record["throughput_tokens_per_second"] =
         Json{{"prefill", prefill_rate}, {"decode", decode_rate}};
-    record["scheduler"]    = Json{{"running", report.scheduler.running_requests},
-                                  {"prefilling", report.scheduler.prefilling_requests},
-                                  {"decode_ready", report.scheduler.decode_ready_requests},
-                                  {"waiting", report.scheduler.waiting_requests}};
+    record["scheduler"]        = Json{{"running", report.scheduler.running_requests},
+                                      {"prefilling", report.scheduler.prefilling_requests},
+                                      {"decode_ready", report.scheduler.decode_ready_requests},
+                                      {"waiting", report.scheduler.waiting_requests}};
+    record["prefill_progress"] = nullptr;
+    if (report.scheduler.prefilling_requests != 0) {
+        record["prefill_progress"] =
+            Json{{"request_id", report.scheduler.prefill_request_id},
+                 {"prompt_tokens", report.scheduler.prefill_prompt_tokens},
+                 {"reused_tokens", report.scheduler.prefill_reused_tokens},
+                 {"processed_tokens", report.scheduler.prefill_processed_tokens}};
+    }
     record["decode_batch"] = Json{{"rounds", report.decode_rounds},
                                   {"row_rounds", report.decode_row_rounds},
                                   {"average_size", std::move(average_batch)}};

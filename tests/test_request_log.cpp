@@ -337,20 +337,27 @@ int main() {
                       "human request log omits zero queue duration");
 
     ThroughputReport throughput;
-    throughput.interval_seconds                = 2.0;
-    throughput.computed_prefill_tokens         = 100;
-    throughput.committed_decode_tokens         = 40;
-    throughput.decode_rounds                   = 10;
-    throughput.decode_row_rounds               = 18;
-    throughput.scheduler.running_requests      = 2;
-    throughput.scheduler.prefilling_requests   = 1;
-    throughput.scheduler.decode_ready_requests = 1;
-    throughput.scheduler.waiting_requests      = 3;
-    const std::string human_throughput         = format_throughput(throughput);
-    failures += check(human_throughput.find("prefill=50.0tok/s") != std::string::npos &&
-                          human_throughput.find("decode=20.0tok/s") != std::string::npos &&
-                          human_throughput.find("avg_decode_batch=1.80") != std::string::npos,
-                      "human throughput report mismatch");
+    throughput.interval_seconds                   = 2.0;
+    throughput.computed_prefill_tokens            = 100;
+    throughput.committed_decode_tokens            = 40;
+    throughput.decode_rounds                      = 10;
+    throughput.decode_row_rounds                  = 18;
+    throughput.scheduler.running_requests         = 2;
+    throughput.scheduler.prefilling_requests      = 1;
+    throughput.scheduler.decode_ready_requests    = 1;
+    throughput.scheduler.waiting_requests         = 3;
+    throughput.scheduler.prefill_request_id       = 17;
+    throughput.scheduler.prefill_prompt_tokens    = 10000;
+    throughput.scheduler.prefill_reused_tokens    = 2000;
+    throughput.scheduler.prefill_processed_tokens = 4096;
+    const std::string human_throughput            = format_throughput(throughput);
+    failures += check(
+        human_throughput.find("prefill=50.0tok/s") != std::string::npos &&
+            human_throughput.find("decode=20.0tok/s") != std::string::npos &&
+            human_throughput.find("prefill_id=17 prefill_prompt=10000 ") != std::string::npos &&
+            human_throughput.find("prefill_reused=2000 prefill_done=4096") != std::string::npos &&
+            human_throughput.find("avg_decode_batch=1.80") != std::string::npos,
+        "human throughput report mismatch");
     const Json throughput_json =
         Json::parse(format_throughput_json("serve-test", 5000, throughput));
     failures += check(throughput_json.at("event") == "throughput", "throughput event mismatch");
@@ -359,6 +366,16 @@ int main() {
                       "throughput token deltas mismatch");
     failures += check(throughput_json.at("decode_batch").at("average_size") == 1.8,
                       "throughput batch average mismatch");
+    failures += check(throughput_json.at("prefill_progress").at("request_id") == 17 &&
+                          throughput_json.at("prefill_progress").at("prompt_tokens") == 10000 &&
+                          throughput_json.at("prefill_progress").at("reused_tokens") == 2000 &&
+                          throughput_json.at("prefill_progress").at("processed_tokens") == 4096,
+                      "throughput prefill progress mismatch");
+    throughput.scheduler.prefilling_requests = 0;
+    failures += check(Json::parse(format_throughput_json("serve-test", 5001, throughput))
+                          .at("prefill_progress")
+                          .is_null(),
+                      "idle throughput report retained prefill progress");
 
     const std::string console_prefix =
         format_console_log_prefix(std::chrono::system_clock::time_point{}, ConsoleLogLevel::Info);

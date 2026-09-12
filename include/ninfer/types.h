@@ -480,6 +480,13 @@ struct RuntimeStats {
     std::uint32_t prefilling_requests   = 0;
     std::uint32_t decode_ready_requests = 0;
     std::uint32_t waiting_requests      = 0;
+    // The executor admits at most one prefill lane. These fields describe its current request;
+    // all are zero when no prefill is active. `prefill_processed_tokens` advances only at a
+    // chunk boundary, so observers never see work that has not committed.
+    std::uint64_t prefill_request_id       = 0;
+    std::uint32_t prefill_prompt_tokens    = 0;
+    std::uint32_t prefill_reused_tokens    = 0;
+    std::uint32_t prefill_processed_tokens = 0;
 };
 
 struct LoadSummary {
