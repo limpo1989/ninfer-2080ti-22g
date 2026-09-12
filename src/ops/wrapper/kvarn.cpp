@@ -97,11 +97,24 @@ std::size_t kvarn_gqa_attention_workspace_capacity_bytes(std::int32_t q_heads,
     const std::size_t partial =
         round_up(rows * head_dim * sizeof(std::uint16_t)) + 2 * round_up(rows * sizeof(float));
 #if defined(NINFER_SM75)
-    if (query_columns < 128) { return partial; }
-    const auto prefill_rows = static_cast<std::size_t>(q_heads) * query_columns * batch_size;
-    const std::size_t tc    = round_up(prefill_rows * head_dim * sizeof(std::uint16_t)) +
-                           4 * round_up(prefill_rows * sizeof(float));
-    return std::max(partial, tc);
+    const auto tc_bytes = [&](std::int32_t columns, std::int32_t prefix_splits) {
+        const auto dense_rows = static_cast<std::size_t>(q_heads) * columns * batch_size;
+        const auto prefix_rows = dense_rows * prefix_splits;
+        return round_up(prefix_rows * head_dim * sizeof(std::uint16_t)) +
+               2 * round_up(prefix_rows * sizeof(float)) +
+               2 * round_up(dense_rows * sizeof(float));
+    };
+    std::size_t capacity = partial;
+    if (query_columns >= 128) { capacity = std::max(capacity, tc_bytes(query_columns, 1)); }
+    if (query_columns >= 2 && detail::kvarn_attention_tc_splits(q_heads, 2, batch_size) > 0) {
+        // The family sizes a width envelope by its maximum. Split-count transitions can make
+        // an interior small-query shape larger, so include that bounded (2..127) envelope.
+        for (int columns = 2; columns <= std::min(query_columns, 127); ++columns) {
+            capacity = std::max(capacity, tc_bytes(
+                columns, detail::kvarn_attention_tc_splits(q_heads, columns, batch_size)));
+        }
+    }
+    return capacity;
 #else
     return partial;
 #endif
@@ -212,11 +225,16 @@ void kvarn_gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, cons
     Tensor dense_sum;
     if (!commit_only) {
 #if defined(NINFER_SM75)
-        if (query_columns >= 128) {
+        const int prefix_splits =
+            detail::kvarn_attention_tc_splits(q_heads, query_columns, batch_size);
+        if (prefix_splits > 0) {
             prefix_acc =
-                workspace.alloc(DType::BF16, {head_dim, q_heads, query_columns, batch_size});
-            prefix_max = workspace.alloc(DType::FP32, {q_heads, query_columns, batch_size, 1});
-            prefix_sum = workspace.alloc(DType::FP32, {q_heads, query_columns, batch_size, 1});
+                workspace.alloc(DType::BF16, {head_dim, q_heads, query_columns,
+                                               batch_size * prefix_splits});
+            prefix_max = workspace.alloc(DType::FP32, {q_heads, query_columns, batch_size,
+                                                        prefix_splits});
+            prefix_sum = workspace.alloc(DType::FP32, {q_heads, query_columns, batch_size,
+                                                        prefix_splits});
             dense_max  = workspace.alloc(DType::FP32, {q_heads, query_columns, batch_size, 1});
             dense_sum  = workspace.alloc(DType::FP32, {q_heads, query_columns, batch_size, 1});
         } else

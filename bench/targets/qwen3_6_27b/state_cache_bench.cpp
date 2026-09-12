@@ -41,6 +41,7 @@ int main(int argc, char** argv) {
         ninfer::serve::ServeOptions server;
         server.sampling_overrides.temperature = 0.6F; server.sampling_overrides.presence_penalty = 1.0F;
         server.sampling_overrides.seed = 1234;
+        server.preserve_thinking = true;
         const auto semantics = ninfer::serve::resolve_prompt_semantics(request.generation, server, engine.prompt_capabilities());
         auto input = ninfer::serve::to_prompt_input(request.generation, semantics, {});
         auto generation = ninfer::serve::to_request_options(request.generation, server);

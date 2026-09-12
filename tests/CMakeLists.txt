@@ -287,6 +287,15 @@ ninfer_add_fused_linear_test(
   ninfer_linear_add_q5_a16_test
   ops/linear_add/test_q5_a16.cpp
   ops/linear_add/linear_add_test_common.cpp)
+if(CMAKE_CUDA_ARCHITECTURES STREQUAL "75")
+  ninfer_add_op_test(ninfer_quantized_prefill_test
+    SOURCES ops/test_quantized_prefill.cpp
+            ops/linear_add/linear_add_test_common.cpp
+            ops/linear_swiglu/linear_swiglu_test_common.cpp
+    LIBRARIES ninfer_ops)
+  set_tests_properties(ninfer_quantized_prefill_test PROPERTIES
+    ENVIRONMENT "NINFER_QUANTIZED_PREFILL=1")
+endif()
 ninfer_add_fused_linear_test(
   ninfer_linear_add_bf16_a16_test
   ops/linear_add/test_bf16_a16.cpp

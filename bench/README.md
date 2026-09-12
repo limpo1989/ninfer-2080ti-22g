@@ -69,6 +69,41 @@ and `-r 1`, synchronizes after warmup, and brackets only the measured repetition
 `cudaProfilerStart/Stop`. Use it with an Nsight Systems `cudaProfilerApi` capture range so artifact
 load, graph construction, and warmup do not enter topology counts.
 
+## RTX 2080 Ti recorded-request and bounded-prefill benchmarks
+
+`ninfer_responses_bench` replays a recorded text Responses request through the public Engine.
+It uses KVarN, startup concurrency two, temperature 0.6, presence penalty 1.0 and
+the standard `preserve_thinking=false` default. `--preserve-thinking` retains closed-turn reasoning
+for client configurations that request it; this can substantially increase the rendered prompt.
+A positive `--draft-tokens` selects
+MTP; zero selects ordinary decoding. The output argument is a limit, so a response may finish
+before reaching it.
+
+```bash
+cmake --build build -j --target ninfer_responses_bench ninfer_quantized_prefill_bench
+./build/bench/ninfer_responses_bench MODEL.ninfer REQUEST.json 512 3 \
+  --seed 1234 --prefill-chunk 1024 --draft-tokens 3 --reuse-prefix --vary-seed --preserve-thinking
+./build/bench/ninfer_quantized_prefill_bench gdn-input 1024
+./build/bench/ninfer_quantized_prefill_bench attn-input 1024
+./build/bench/ninfer_quantized_prefill_bench q4 1024
+./build/bench/ninfer_quantized_prefill_bench q5 1024
+./build/bench/ninfer_quantized_prefill_bench q5gdn 1024
+```
+
+The Responses report includes the actual prompt, computed/reused prefill tokens, seed, draft
+window, phase times, output count and acceptance by draft position. With reuse enabled,
+`prefill_tok_s` uses only computed tokens. Compare identical rendered inputs and cache states;
+use repeated alternating runs on an otherwise idle GPU and record clocks, temperature and power.
+`--profile-decode` keeps the existing CUDA profiler boundary and requires one repetition.
+
+The SM75 Op benchmark compares the stateless fused Op with its Program-owned bounded execution
+context from `quantized_prefill.h`. Both timed bodies include the complete projection and final
+public epilogue/output stores. Activation scaling/conversion, weight dequantization, vendor GEMM
+and temporary traffic are included. All buffers and the vendor handle are owned by the fixture;
+no model is loaded. The accepted token range begins at 256. Q4 gate/up uses the qualified vendor
+FP16 compute/output mode; Q5 residual and both input-projection families use FP32 products.
+The test uses the same independent FP64 Op oracles as the stateless implementation.
+
 ## Linear Op benchmark
 
 `ninfer_linear_bench` measures only the public pure `linear()` contract. It supports Q4, Q5, Q6,

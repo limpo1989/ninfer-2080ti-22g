@@ -2,6 +2,9 @@
 
 #include "ops/direct_bf16_weight.h"
 #include "ops/input_projection_test_common.h"
+#include "ninfer/ops/quantized_prefill.h"
+#include "core/device.h"
+#include "core/decode_graph.h"
 
 #include <cuda_runtime.h>
 
@@ -68,7 +71,22 @@ int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& gate_value
     Tensor g = gate.tensor();
     Tensor k = key.tensor();
     Tensor v = value.tensor();
-    ops::attn_input_proj(x, query_key.view(), gate_value.view(), q, g, k, v, nullptr);
+    DeviceContext device(0);
+    ops::QuantizedPrefillContext context;
+    const auto bytes=ops::QuantizedPrefillContext::attention_workspace_capacity_bytes(tokens);
+    WorkspaceArena workspace(std::max<std::size_t>(bytes,256));
+    const auto launch = [&] { context.attention_input_proj(x,query_key.view(),gate_value.view(),q,g,k,v,workspace,device.stream); };
+    if (tokens == 257) {
+        DecodeGraphDefinition definition;
+        definition.capture(device.stream,launch);
+        DecodeGraphExecutable graph;
+        graph.instantiate(definition);
+        graph.launch(device.stream);
+        device.synchronize();
+    } else { launch(); device.synchronize(); }
+    if (workspace.used()!=0 || workspace.peak_used()!=bytes) {
+        throw std::runtime_error("input projection workspace extent mismatch");
+    }
     cuda_synchronize();
 
     const std::string suffix = " Q4/Q5 A16 T=" + std::to_string(tokens);
@@ -96,13 +114,16 @@ int run_q4_q5() {
         quantized_weight::make_patterned_weight(QType::Q5G64_F16S, kParent, kHidden, 107U));
 
     int failures = 0;
-    for (const std::int32_t tokens : {1, 2, 16, 17, 21, 48, 128, 129, 1024}) {
+    for (const std::int32_t tokens : {1, 2, 16, 17, 21, 48, 128, 129, 255, 256, 257, 1024}) {
         failures += run_q4_q5_case(query_key, gate_value, tokens);
     }
     failures += run_q4_q5_case(query_key, gate_value, 128, 0x1p30F);
     failures += run_q4_q5_case(query_key, gate_value, 128, 0x1p-30F);
     failures += run_q4_q5_case(query_key, gate_value, 128, 0x1p-16F);
     failures += run_q4_q5_case(query_key, gate_value, 129, 1.0F, true);
+    failures += run_q4_q5_case(query_key,gate_value,256,0x1p30F);
+    failures += run_q4_q5_case(query_key,gate_value,256,0x1p-30F);
+    failures += run_q4_q5_case(query_key,gate_value,257,1.0F,true);
     return failures;
 }
 
@@ -245,7 +266,7 @@ int run_bf16_target() {
         std::cerr << "BF16 attention input workspace interval is not zero-capacity\n";
         ++failures;
     }
-    for (const std::int32_t tokens : {1, 2, 4, 8, 16, 17, 22, 23, 32, 33, 128, 129, 1024}) {
+    for (const std::int32_t tokens : {1, 2, 4, 8, 16, 17, 22, 23, 32, 33, 128, 129, 255, 256, 257, 1024}) {
         failures += run_bf16_target_case(parent, tokens);
     }
     return failures;

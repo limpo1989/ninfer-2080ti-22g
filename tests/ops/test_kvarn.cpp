@@ -9,12 +9,15 @@
 
 #include "ninfer/ops/kvarn.h"
 #include "ops/op_tester.h"
+#include "core/decode_graph.h"
+#include "core/device.h"
 
 #include <cmath>
 #include <limits>
 #include <cstdint>
 #include <iostream>
 #include <span>
+#include <string_view>
 #include <vector>
 
 using namespace ninfer;
@@ -259,6 +262,11 @@ struct SequenceCase {
     std::int32_t prefill;   // first call's width
     std::int32_t steps;     // decode calls after it
     std::int32_t step_width;
+    std::int32_t last_query_columns = 0; // zero means all columns
+    std::vector<int> last_valid_columns{};
+    bool capture_last = false;
+    bool commit_prefill = false; // bounded commit-only history setup for long-prefix cases
+    std::vector<int> oracle_queries{}; // empty checks every query; long shapes sample full outputs
 };
 
 // Mirrors the Op's own storage rule so the oracle can say where each committed position lives.
@@ -268,6 +276,7 @@ std::int32_t stage_slot(std::int32_t position, std::int32_t group) {
 }
 
 int run_sequence_case(const SequenceCase& test_case) {
+    DeviceContext device(0);
     const KvarnRecordLayout layout = kvarn_record_layout(kHeadDim, test_case.format);
     const std::int32_t group       = layout.group;
     const std::int32_t group_size  = test_case.q_heads / test_case.kv_heads;
@@ -325,7 +334,8 @@ int run_sequence_case(const SequenceCase& test_case) {
     const float scale = 1.0F / std::sqrt(static_cast<float>(kHeadDim));
     WorkspaceArena workspace(ops::kvarn_gqa_attention_workspace_capacity_bytes(
         test_case.q_heads, kHeadDim,
-        std::max(test_case.prefill, test_case.step_width), test_case.batch));
+        std::max(test_case.commit_prefill ? 1 : test_case.prefill, test_case.step_width),
+        test_case.batch));
 
     std::int32_t frontier = 0;
     int failures          = 0;
@@ -333,10 +343,20 @@ int run_sequence_case(const SequenceCase& test_case) {
     std::vector<float> final_query;
     std::int32_t final_first = 0;
     std::int32_t final_width = 0;
+    std::int32_t final_query_columns = 0;
 
-    const std::int32_t calls = 1 + test_case.steps;
+    constexpr int setup_chunk = 1024;
+    const int setup_calls = test_case.commit_prefill
+                                ? (test_case.prefill + setup_chunk - 1) / setup_chunk : 1;
+    const std::int32_t calls = setup_calls + test_case.steps;
     for (std::int32_t call = 0; call < calls; ++call) {
-        const std::int32_t width = call == 0 ? test_case.prefill : test_case.step_width;
+        const bool commit_only = test_case.commit_prefill && call < setup_calls;
+        const bool final_call  = call + 1 == calls;
+        const std::int32_t width = call < setup_calls
+            ? (test_case.commit_prefill ? std::min(setup_chunk, test_case.prefill - frontier)
+                                       : test_case.prefill) : test_case.step_width;
+        const int query_columns = commit_only ? 0 :
+            (final_call && test_case.last_query_columns > 0 ? test_case.last_query_columns : width);
 
         std::vector<float> call_k(static_cast<std::size_t>(kHeadDim) * test_case.kv_heads * width *
                                   test_case.batch);
@@ -360,30 +380,48 @@ int run_sequence_case(const SequenceCase& test_case) {
             }
         }
 
-        std::vector<float> query(static_cast<std::size_t>(kHeadDim) * test_case.q_heads * width *
+        std::vector<float> query(static_cast<std::size_t>(kHeadDim) * test_case.q_heads * query_columns *
                                  test_case.batch);
         fill_uniform(query, 0x4000u + static_cast<std::uint32_t>(call), -1.0F, 1.0F);
         round_to_bf16(query);
 
         DeviceBuffer device_k         = to_device_bf16(call_k);
         DeviceBuffer device_v         = to_device_bf16(call_v);
-        DeviceBuffer device_query     = to_device_bf16(query);
+        DeviceBuffer device_query     = query.empty() ? DeviceBuffer{} : to_device_bf16(query);
         DeviceBuffer device_positions = to_device_i32(positions);
         DeviceBuffer device_out(query.size() * sizeof(std::uint16_t));
 
-        Tensor q(device_query.p, DType::BF16,
-                 {kHeadDim, test_case.q_heads, width, test_case.batch});
+        Tensor q = commit_only ? Tensor{} : Tensor(device_query.p, DType::BF16,
+                 {kHeadDim, test_case.q_heads, query_columns, test_case.batch});
         Tensor k(device_k.p, DType::BF16,
                  {kHeadDim, test_case.kv_heads, width, test_case.batch});
         Tensor v(device_v.p, DType::BF16,
                  {kHeadDim, test_case.kv_heads, width, test_case.batch});
         Tensor pos(device_positions.p, DType::I32, {width, test_case.batch, 1, 1});
         Tensor rows(device_rows.p, DType::I32, {test_case.batch, 1, 1, 1});
-        Tensor out(device_out.p, DType::BF16,
-                   {kHeadDim, test_case.q_heads, width, test_case.batch});
+        Tensor out = commit_only ? Tensor{} : Tensor(device_out.p, DType::BF16,
+                   {kHeadDim, test_case.q_heads, query_columns, test_case.batch});
+        DeviceBuffer device_valid;
+        Tensor valid;
+        if (final_call && !test_case.last_valid_columns.empty()) {
+            device_valid = to_device_i32(test_case.last_valid_columns);
+            valid = Tensor(device_valid.p, DType::I32, {test_case.batch});
+        }
 
-        ops::kvarn_gqa_attention(q, k, v, pos, Tensor{}, rows, scale, cache, workspace, out,
-                                 nullptr);
+        const auto launch = [&] {
+            ops::kvarn_gqa_attention(q, k, v, pos, valid, rows, scale, cache, workspace, out,
+                                     device.stream);
+        };
+        if (final_call && test_case.capture_last) {
+            DecodeGraphDefinition definition;
+            definition.capture(device.stream, launch);
+            DecodeGraphExecutable executable;
+            executable.instantiate(definition);
+            executable.launch(device.stream);
+            device.synchronize();
+        } else {
+            launch();
+        }
         cuda_check_last_launch("kvarn_gqa_attention");
         cuda_synchronize();
 
@@ -392,19 +430,17 @@ int run_sequence_case(const SequenceCase& test_case) {
             final_query = query;
             final_first = frontier;
             final_width = width;
+            final_query_columns = query_columns;
         }
         frontier += width;
     }
 
-    // Oracle: rebuild each committed position's logical value from the storage the Op left
-    // behind, then evaluate ideal FP64 attention for the final call's queries.
+    // Decode stored records independently. Unquantized sink/tail values come from the submitted
+    // BF16 inputs: the last append may already have overwritten the old tail's stage slots.
+    // Then evaluate the complete attention formula in FP64, without production staging casts.
     std::vector<std::uint8_t> host_plane(plane_bytes);
     cuda_check(cudaMemcpy(host_plane.data(), device_records.p, plane_bytes, cudaMemcpyDeviceToHost),
                "read records");
-    const std::vector<double> host_stage_k =
-        from_device_bf16(device_stage_k, device_stage_k.bytes / sizeof(std::uint16_t));
-    const std::vector<double> host_stage_v =
-        from_device_bf16(device_stage_v, device_stage_v.bytes / sizeof(std::uint16_t));
 
     const std::int32_t record_page_end = final_first >= 2 * group ? final_first / group : 2;
     std::vector<double> reference(final_query.size());
@@ -422,15 +458,14 @@ int run_sequence_case(const SequenceCase& test_case) {
 
             for (std::int32_t position = 0; position < final_first; ++position) {
                 if (position >= 2 * group && position < record_page_end * group) { continue; }
-                const std::int32_t slot = stage_slot(position, group);
                 for (std::int32_t d = 0; d < kHeadDim; ++d) {
                     const std::size_t index =
                         static_cast<std::size_t>(d) +
                         static_cast<std::size_t>(kHeadDim) *
                             (head + static_cast<std::size_t>(test_case.kv_heads) *
-                                        (slot + static_cast<std::size_t>(stage_tokens) * table_row));
-                    lk[static_cast<std::size_t>(position) * kHeadDim + d] = host_stage_k[index];
-                    lv[static_cast<std::size_t>(position) * kHeadDim + d] = host_stage_v[index];
+                                        position);
+                    lk[static_cast<std::size_t>(position) * kHeadDim + d] = keys[b][index];
+                    lv[static_cast<std::size_t>(position) * kHeadDim + d] = values[b][index];
                 }
             }
             for (std::int32_t page = 2; page < record_page_end; ++page) {
@@ -456,21 +491,38 @@ int run_sequence_case(const SequenceCase& test_case) {
             }
         }
 
-        for (std::int32_t j = 0; j < final_width; ++j) {
-            const std::int32_t position = final_first + j;
+        for (std::int32_t j = 0; j < final_query_columns; ++j) {
+            if (!test_case.oracle_queries.empty() &&
+                std::find(test_case.oracle_queries.begin(), test_case.oracle_queries.end(), j) ==
+                    test_case.oracle_queries.end()) { continue; }
+            const int column = final_width - final_query_columns + j;
+            const std::int32_t position = final_first + column;
+            const int valid = test_case.last_valid_columns.empty()
+                                  ? final_width : test_case.last_valid_columns[b];
             for (std::int32_t q_head = 0; q_head < test_case.q_heads; ++q_head) {
                 const std::int32_t head = q_head / group_size;
                 const auto& lk          = logical_k[static_cast<std::size_t>(head)];
                 const auto& lv          = logical_v[static_cast<std::size_t>(head)];
                 const std::size_t q_base =
                     static_cast<std::size_t>(kHeadDim) *
-                    (q_head + static_cast<std::size_t>(test_case.q_heads) * (j + final_width * b));
+                    (q_head + static_cast<std::size_t>(test_case.q_heads) *
+                                  (j + final_query_columns * b));
+                if (column >= valid) {
+                    for (int d = 0; d < kHeadDim; ++d) {
+                        if (final_out[q_base + d] != 0.0) {
+                            std::cerr << test_case.name << ": inactive query is not exact zero\n";
+                            ++failures;
+                            break;
+                        }
+                    }
+                    continue;
+                }
 
                 std::vector<double> scores(static_cast<std::size_t>(position) + 1);
+                std::vector<double> fresh(static_cast<std::size_t>(kHeadDim));
                 double maximum = -std::numeric_limits<double>::infinity();
                 for (std::int32_t x = 0; x <= position; ++x) {
                     const double* key = nullptr;
-                    std::vector<double> fresh(static_cast<std::size_t>(kHeadDim));
                     if (x < final_first) {
                         key = lk.data() + static_cast<std::size_t>(x) * kHeadDim;
                     } else {
@@ -521,13 +573,61 @@ int run_sequence_case(const SequenceCase& test_case) {
                 record_page_end);
     const ReductionCriterion criterion{/*relative_l2*/ 8.0e-3, /*gross_absolute*/ 3.0e-3,
                                        /*gross_relative_to_max_reference*/ 3.0e-2};
-    failures += verify_reduction(test_case.name, final_out, reference, criterion);
+    if (test_case.oracle_queries.empty()) {
+        failures += verify_reduction(test_case.name, final_out, reference, criterion);
+    } else {
+        std::vector<double> selected_out, selected_reference;
+        for (int b = 0; b < test_case.batch; ++b) {
+            for (int j : test_case.oracle_queries) {
+                const auto begin = static_cast<std::size_t>(kHeadDim) * test_case.q_heads *
+                                       (j + final_query_columns * b);
+                const auto count = static_cast<std::size_t>(kHeadDim) * test_case.q_heads;
+                selected_out.insert(selected_out.end(), final_out.begin() + begin,
+                                    final_out.begin() + begin + count);
+                selected_reference.insert(selected_reference.end(), reference.begin() + begin,
+                                          reference.begin() + begin + count);
+            }
+        }
+        failures += verify_reduction(test_case.name, selected_out, selected_reference, criterion);
+    }
+
+    // Visible persistent sink/tail values must still equal the represented input exactly.
+    const auto stage_k = from_device_bf16(device_stage_k, device_stage_k.bytes / 2);
+    const auto stage_v = from_device_bf16(device_stage_v, device_stage_v.bytes / 2);
+    for (int b = 0; b < test_case.batch; ++b) {
+        const int valid = test_case.last_valid_columns.empty()
+                              ? final_width : test_case.last_valid_columns[b];
+        const int end = final_first + valid;
+        for (int p = 0; p < end; ++p) {
+            if (p >= 2 * group && p < end / group * group) { continue; }
+            for (int h = 0; h < test_case.kv_heads; ++h) {
+                for (int d = 0; d < kHeadDim; ++d) {
+                    const auto input = static_cast<std::size_t>(d) +
+                        static_cast<std::size_t>(kHeadDim) * (h + test_case.kv_heads * p);
+                    const auto stored = static_cast<std::size_t>(d) +
+                        static_cast<std::size_t>(kHeadDim) *
+                            (h + test_case.kv_heads * (stage_slot(p, group) + stage_tokens * b));
+                    if (stage_k[stored] != keys[b][input] || stage_v[stored] != values[b][input]) {
+                        std::cerr << test_case.name << ": persistent sink/tail mismatch\n";
+                        return failures + 1;
+                    }
+                }
+            }
+        }
+    }
     return failures;
 }
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    std::string_view filter;
+    if (argc == 3 && std::string_view(argv[1]) == "--case") {
+        filter = argv[2];
+    } else if (argc != 1) {
+        std::cerr << "usage: ninfer_kvarn_test [--case name-substring]\n";
+        return 2;
+    }
     if (cuda_unavailable()) {
         std::cerr << "kvarn: no CUDA device\n";
         return 77;
@@ -545,7 +645,13 @@ int main() {
         {KvarnFormat::K4V4G64, "kvarn_k4v4_g64", 4, 2, 0.16, 0.17},
         {KvarnFormat::K4V2G64, "kvarn_k4v2_g64", 2, 1, 0.16, 0.62},
     };
-    for (const Case& test_case : cases) { failures += run_case(test_case); }
+    int selected = 0;
+    for (const Case& test_case : cases) {
+        if (std::string_view(test_case.name).find(filter) != std::string_view::npos) {
+            ++selected;
+            failures += run_case(test_case);
+        }
+    }
 
     const SequenceCase sequence_cases[] = {
         // Prefill past the sink, then decode across a page boundary.
@@ -564,19 +670,45 @@ int main() {
         // Chunked prefill: the last call is wide AND sits on a record history, which is the only
         // shape that exercises the Q-tiled prefill kernel's record pass.
         {KvarnFormat::K4V2G64, "kvarn gqa k4v2 chunked prefill", 4, 24, 1, 512, 3, 512},
-        // A chunk width that is not a whole number of query tiles, over records. The oracle can
-        // only reconstruct a page-aligned `first` (it reads the stage tail after the call's own
-        // append has already reused those slots), so the ragged width is the LAST call's.
+        // A chunk width that is not a whole number of query tiles, over records.
         {KvarnFormat::K4V4G64, "kvarn gqa k4v4 chunked prefill ragged", 4, 24, 1, 512, 1, 258},
         // Two rows advancing together over records, with a chunk narrower than a page.
         {KvarnFormat::K4V2G64, "kvarn gqa k4v2 chunked prefill B=2", 4, 24, 2, 384, 1, 190},
         // The 35B geometry over records, where the query tile is three columns rather than four.
         {KvarnFormat::K4V2G64, "kvarn gqa 35b chunked prefill", 2, 16, 1, 320, 2, 320},
+        // Shared-query tiles: padded MMA rows, empty splits, independent valid lengths, and Wq<W.
+        {KvarnFormat::K4V2G64, "kvarn gqa grouped sink graph", 4, 24, 2, 64, 1, 4,
+         0, {4, 0}, true},
+        {KvarnFormat::K4V2G64, "kvarn gqa grouped verify graph", 4, 24, 3, 4096, 1, 16,
+         4, {16, 14, 0}, true, true},
+        {KvarnFormat::K4V4G64, "kvarn gqa grouped boundary", 4, 24, 2, 4094, 1, 8,
+         0, {8, 3}, false, true},
+        {KvarnFormat::K4V2G64, "kvarn gqa grouped short continuation", 4, 24, 2, 4094, 1, 40,
+         0, {40, 35}, false, true},
+        {KvarnFormat::K4V2G64, "kvarn gqa grouped ragged tile", 4, 24, 1, 4096, 1, 127,
+         0, {}, false, true},
+        {KvarnFormat::K4V2G64, "kvarn gqa grouped 35b verify", 2, 16, 2, 4096, 1, 4,
+         0, {4, 2}, true, true},
+        {KvarnFormat::K4V2G64, "kvarn gqa grouped 2-query graph", 4, 24, 3, 4094, 1, 2,
+         0, {2, 1, 0}, true, true},
+        {KvarnFormat::K4V2G64, "kvarn gqa grouped 2-query 128k", 4, 24, 1, 127488, 1, 2,
+         0, {}, false, true},
+        {KvarnFormat::K4V2G64, "kvarn gqa grouped 128k verify", 4, 24, 1, 127488, 1, 4,
+         0, {}, false, true},
+        {KvarnFormat::K4V2G64, "kvarn gqa PV 128k", 4, 24, 1, 127488, 1, 128,
+         0, {}, true, true, {0, 31, 64, 127}},
     };
     for (const SequenceCase& test_case : sequence_cases) {
-        failures += run_sequence_case(test_case);
+        if (std::string_view(test_case.name).find(filter) != std::string_view::npos) {
+            ++selected;
+            failures += run_sequence_case(test_case);
+        }
     }
 
+    if (selected == 0) {
+        std::cerr << "kvarn: no case matches " << filter << '\n';
+        return 2;
+    }
     if (failures != 0) {
         std::cerr << "kvarn: " << failures << " failure(s)\n";
         return 1;

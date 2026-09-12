@@ -169,6 +169,7 @@ set(NINFER_OPS_SOURCES
   ops/linear_add/q5/q5_linear_add_gemm_simt.cu
   ops/linear_add/q5/q5_linear_add_gemv.cu
   ops/linear_add/q5/q5_linear_add_plan.cpp
+  ops/linear/quantized_prefill.cu
   ops/linear_add/w8/w8_linear_add_gemm_mma.cu
   ops/linear_add/w8/w8_linear_add_gemm_simt.cu
   ops/linear_add/w8/w8_linear_add_gemm_splitk.cu
@@ -278,6 +279,11 @@ endif()
 add_library(ninfer_ops STATIC ${NINFER_OPS_SOURCES})
 ninfer_internal_includes(ninfer_ops)
 ninfer_cuda_archive(ninfer_ops)
+if(CMAKE_CUDA_ARCHITECTURES STREQUAL "75")
+  set_source_files_properties(ops/linear/quantized_prefill.cu PROPERTIES
+    INCLUDE_DIRECTORIES "${NINFER_CUBLAS_INCLUDE_DIR}")
+  target_link_libraries(ninfer_ops PRIVATE "${NINFER_CUBLAS_LIBRARY}")
+endif()
 if(CMAKE_CUDA_ARCHITECTURES STREQUAL "120a")
   target_link_libraries(ninfer_ops PUBLIC ninfer_core PRIVATE ninfer_nvfp4_tma)
 else()

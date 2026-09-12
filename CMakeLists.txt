@@ -63,6 +63,11 @@ if(NINFER_BUILD_APPS OR BUILD_TESTING)
 endif()
 
 find_package(CUDAToolkit REQUIRED)
+if(CMAKE_CUDA_ARCHITECTURES STREQUAL "75")
+  find_path(NINFER_CUBLAS_INCLUDE_DIR cublas_v2.h HINTS ${CUDAToolkit_INCLUDE_DIRS} REQUIRED)
+  find_library(NINFER_CUBLAS_LIBRARY NAMES cublas libcublas.so.12
+    HINTS ${CUDAToolkit_LIBRARY_DIR} REQUIRED)
+endif()
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
   libavformat>=60 libavcodec>=60 libavutil>=58 libswscale>=7)

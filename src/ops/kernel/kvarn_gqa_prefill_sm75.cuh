@@ -25,7 +25,7 @@ __device__ __forceinline__ std::int64_t kvarn_prefill_row_index(int q_head, int 
                (query + static_cast<std::int64_t>(query_columns) * row);
 }
 
-template <typename Spec, typename Geometry, int QueryRows>
+template <typename Spec, typename Geometry, int QueryRows, bool TensorPv = false>
 struct KvarnTcPrefixShared {
     static constexpr int D       = Spec::HeadDim;
     static constexpr int Bc      = kKvarnTcKeyTile;
@@ -41,6 +41,7 @@ struct KvarnTcPrefixShared {
         __half key[Bc * D];
         float probability[Bc * QueryRows];
         float transform[D];
+        __half tensor_pv[TensorPv ? QueryRows * Bc + Bc * D : 1];
     } scratch;
 
     float key_scale[D];
@@ -54,11 +55,11 @@ struct KvarnTcPrefixShared {
     float rescale[QueryRows];
 };
 
-template <typename Spec, typename Geometry, int QueryRows>
+template <typename Spec, typename Geometry, int QueryRows, bool TensorPv>
 __device__ __forceinline__ void
-kvarn_stage_key_tile(KvarnTcPrefixShared<Spec, Geometry, QueryRows>& shared,
+kvarn_stage_key_tile(KvarnTcPrefixShared<Spec, Geometry, QueryRows, TensorPv>& shared,
                      const std::uint8_t* __restrict__ record, int key_base, int tid) {
-    using Shared          = KvarnTcPrefixShared<Spec, Geometry, QueryRows>;
+    using Shared          = KvarnTcPrefixShared<Spec, Geometry, QueryRows, TensorPv>;
     constexpr int D       = Shared::D;
     constexpr int Bc      = Shared::Bc;
     constexpr int G       = Spec::Group;
@@ -76,55 +77,74 @@ kvarn_stage_key_tile(KvarnTcPrefixShared<Spec, Geometry, QueryRows>& shared,
     }
 }
 
-template <typename Spec, typename Geometry, int QueryRows>
-__launch_bounds__(Spec::HeadDim, 1) __global__ void kvarn_gqa_tc_prefix_kernel(
+// Heads query heads share one KV head; Tokens consecutive queries share each record decode.
+// Padding belongs only to the MMA tile, never to the public query or partial-output layout.
+template <typename Spec, typename Geometry, int QueryRows, int Heads = 1,
+          int Tokens = QueryRows, bool TensorPv = false>
+__launch_bounds__(Spec::HeadDim, (QueryRows <= 16 ? 2 : 1)) __global__ void kvarn_gqa_tc_prefix_kernel(
     const __nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ prefix,
     const std::int32_t* __restrict__ positions, const std::int32_t* __restrict__ valid_columns,
     const std::int32_t* __restrict__ table_rows, const std::int32_t* __restrict__ block_tables,
     std::int32_t table_stride, std::int32_t width, std::int32_t query_offset,
     std::int32_t query_columns, const std::uint8_t* __restrict__ records, float scale,
     float* __restrict__ prefix_max, float* __restrict__ prefix_sum) {
-    using Shared                = KvarnTcPrefixShared<Spec, Geometry, QueryRows>;
+    using Shared                = KvarnTcPrefixShared<Spec, Geometry, QueryRows, TensorPv>;
     constexpr int D             = Shared::D;
     constexpr int Bc            = Shared::Bc;
     constexpr int Threads       = Shared::Threads;
     constexpr int QueryWarps    = QueryRows / 16;
     constexpr int QKNt          = Bc / 8;
     constexpr int QKKs          = D / 16;
+    constexpr int LogicalRows  = Heads * Tokens;
+    constexpr int HeadTiles    = Geometry::QHeads / Heads;
+    constexpr int PvDimWarps   = (Threads / 32) / QueryWarps;
+    constexpr int PvNt         = D / (PvDimWarps * 8);
+    static_assert(!TensorPv || (QueryRows == 32 && Heads == 1));
     constexpr float Log2E       = 1.4426950408889634074f;
     constexpr unsigned FullMask = 0xffffffffu;
 
     __shared__ Shared shared;
 
     const int query_block = static_cast<int>(blockIdx.x);
-    const int q_head      = static_cast<int>(blockIdx.y);
+    static_assert(LogicalRows <= QueryRows);
+    static_assert(LogicalRows % 4 == 0);
+    static_assert(Heads == 1 || Heads == Geometry::GroupSize);
+    const int head_begin  = static_cast<int>(blockIdx.y) % HeadTiles * Heads;
+    const int split       = static_cast<int>(blockIdx.y) / HeadTiles;
+    const int splits      = static_cast<int>(gridDim.y) / HeadTiles;
     const int row         = static_cast<int>(blockIdx.z);
     const int tid         = static_cast<int>(threadIdx.x);
     const int warp        = tid >> 5;
     const int lane        = tid & 31;
-    const int query_begin = query_block * QueryRows;
-    const int kv_head     = q_head / Geometry::GroupSize;
+    const int query_begin = query_block * Tokens;
+    const int kv_head     = head_begin / Geometry::GroupSize;
+    const int output_row  = row + static_cast<int>(gridDim.z) * split;
     const int columns     = kvarn_row_columns(valid_columns, row, width);
     const int query_tokens =
         max(0, min(query_columns - query_begin, columns - query_offset - query_begin));
 
-    if (q_head >= Geometry::QHeads || query_begin >= query_columns) { return; }
+    if (query_begin >= query_columns) { return; }
 
     const int first = positions[width * row];
     const int record_page_end =
         first >= kKvarnSinkPages * Spec::Group ? first / Spec::Group : kKvarnSinkPages;
-    if (query_tokens <= 0 || record_page_end <= kKvarnSinkPages) {
-        for (int local_row = 0; local_row < QueryRows; ++local_row) {
-            const int query = query_begin + local_row;
+    const int pages_per_split =
+        (record_page_end - kKvarnSinkPages + splits - 1) / splits;
+    const int page_begin = kKvarnSinkPages + split * pages_per_split;
+    const int page_end   = min(record_page_end, page_begin + pages_per_split);
+    if (query_tokens <= 0 || page_begin >= page_end) {
+        for (int local_row = 0; local_row < LogicalRows; ++local_row) {
+            const int query  = query_begin + local_row / Heads;
+            const int q_head = head_begin + local_row % Heads;
             if (query >= query_columns) { continue; }
             const std::int64_t index =
                 static_cast<std::int64_t>(tid) +
                 static_cast<std::int64_t>(D) *
-                    (q_head + Geometry::QHeads * (query + query_columns * row));
+                    (q_head + Geometry::QHeads * (query + query_columns * output_row));
             prefix[index] = __float2bfloat16(0.0f);
             if (tid == 0) {
                 const std::int64_t stat =
-                    kvarn_prefill_row_index<Geometry>(q_head, query, query_columns, row);
+                    kvarn_prefill_row_index<Geometry>(q_head, query, query_columns, output_row);
                 prefix_max[stat] = -CUDART_INF_F;
                 prefix_sum[stat] = 0.0f;
             }
@@ -133,12 +153,14 @@ __launch_bounds__(Spec::HeadDim, 1) __global__ void kvarn_gqa_tc_prefix_kernel(
     }
 
     for (int local_row = 0; local_row < QueryRows; ++local_row) {
-        const int query          = query_begin + local_row;
+        const int query          = query_begin + local_row / Heads;
+        const int q_head         = head_begin + local_row % Heads;
         const std::int64_t index = static_cast<std::int64_t>(tid) +
                                    static_cast<std::int64_t>(D) *
                                        (q_head + Geometry::QHeads * (query + query_columns * row));
         shared.scratch.transform[tid] =
-            local_row < query_tokens ? __bfloat162float(q[index]) : 0.0f;
+            local_row < LogicalRows && local_row / Heads < query_tokens
+                ? __bfloat162float(q[index]) : 0.0f;
         kvarn_hadamard_shared<D>(shared.scratch.transform, tid);
         shared.query[local_row * D + gqa_prefill_swz(local_row, tid)] =
             __float2half(shared.scratch.transform[tid]);
@@ -150,13 +172,22 @@ __launch_bounds__(Spec::HeadDim, 1) __global__ void kvarn_gqa_tc_prefix_kernel(
     }
     __syncthreads();
 
-    float accumulator[QueryRows];
+    float accumulator[TensorPv ? 1 : LogicalRows];
+    float pv_acc[TensorPv ? PvNt : 1][4];
+    if constexpr (TensorPv) {
 #pragma unroll
-    for (int local_row = 0; local_row < QueryRows; ++local_row) { accumulator[local_row] = 0.0f; }
+        for (int n = 0; n < PvNt; ++n) {
+#pragma unroll
+            for (int c = 0; c < 4; ++c) { pv_acc[n][c] = 0.0f; }
+        }
+    } else {
+#pragma unroll
+        for (int local_row = 0; local_row < LogicalRows; ++local_row) { accumulator[local_row] = 0.0f; }
+    }
 
     const int table_row       = table_rows[row];
     const std::int32_t* table = block_tables + static_cast<std::int64_t>(table_row) * table_stride;
-    for (int page = kKvarnSinkPages; page < record_page_end; ++page) {
+    for (int page = page_begin; page < page_end; ++page) {
         const std::uint8_t* record =
             records + kvarn_record_offset<Spec, Geometry::KVHeads>(table[page], kv_head);
         for (int d = tid; d < D; d += Threads) {
@@ -245,8 +276,8 @@ __launch_bounds__(Spec::HeadDim, 1) __global__ void kvarn_gqa_tc_prefix_kernel(
                 const int warp_row0  = warp * 16;
                 const int local_row0 = warp_row0 + gid;
                 const int local_row1 = local_row0 + 8;
-                const bool valid0    = local_row0 < query_tokens;
-                const bool valid1    = local_row1 < query_tokens;
+                const bool valid0 = local_row0 < LogicalRows && local_row0 / Heads < query_tokens;
+                const bool valid1 = local_row1 < LogicalRows && local_row1 / Heads < query_tokens;
                 float bm0            = -CUDART_INF_F;
                 float bm1            = -CUDART_INF_F;
 #pragma unroll
@@ -282,10 +313,21 @@ __launch_bounds__(Spec::HeadDim, 1) __global__ void kvarn_gqa_tc_prefix_kernel(
                     bl0 += p00 + p01;
                     bl1 += p10 + p11;
                     const int key                                            = nt * 8 + 2 * lid;
-                    shared.scratch.probability[key * QueryRows + local_row0] = p00;
-                    shared.scratch.probability[(key + 1) * QueryRows + local_row0] = p01;
-                    shared.scratch.probability[key * QueryRows + local_row1]       = p10;
-                    shared.scratch.probability[(key + 1) * QueryRows + local_row1] = p11;
+                    if constexpr (TensorPv) {
+                        const int row0 = local_row0 * Bc;
+                        const int row1 = local_row1 * Bc;
+                        const int swz0 = (local_row0 & 3) << 3;
+                        const int swz1 = (local_row1 & 3) << 3;
+                        shared.scratch.tensor_pv[row0 + (key ^ swz0)] = __float2half(p00);
+                        shared.scratch.tensor_pv[row0 + ((key + 1) ^ swz0)] = __float2half(p01);
+                        shared.scratch.tensor_pv[row1 + (key ^ swz1)] = __float2half(p10);
+                        shared.scratch.tensor_pv[row1 + ((key + 1) ^ swz1)] = __float2half(p11);
+                    } else {
+                        shared.scratch.probability[key * QueryRows + local_row0] = p00;
+                        shared.scratch.probability[(key + 1) * QueryRows + local_row0] = p01;
+                        shared.scratch.probability[key * QueryRows + local_row1]       = p10;
+                        shared.scratch.probability[(key + 1) * QueryRows + local_row1] = p11;
+                    }
                 }
                 bl0 = warp_sum<4>(bl0, FullMask);
                 bl1 = warp_sum<4>(bl1, FullMask);
@@ -302,8 +344,54 @@ __launch_bounds__(Spec::HeadDim, 1) __global__ void kvarn_gqa_tc_prefix_kernel(
             }
             __syncthreads();
 
+            if constexpr (TensorPv) {
+                // Eight warps cover 2 query groups x 4 dimension groups. Each warp owns
+                // a 16x64 output tile (32 FP32 registers), not the whole 256-dimension row.
+                const int pv_row = (warp / PvDimWarps) * 16;
+                const int pv_dim = (warp % PvDimWarps) * (D / PvDimWarps);
+                const int row0 = pv_row + (lane >> 2);
+                const int row1 = row0 + 8;
+                const float alpha0 = shared.rescale[row0];
+                const float alpha1 = shared.rescale[row1];
 #pragma unroll
-            for (int local_row = 0; local_row < QueryRows; ++local_row) {
+                for (int n = 0; n < PvNt; ++n) {
+                    pv_acc[n][0] *= alpha0;
+                    pv_acc[n][1] *= alpha0;
+                    pv_acc[n][2] *= alpha1;
+                    pv_acc[n][3] *= alpha1;
+                }
+                __half* probability = shared.scratch.tensor_pv;
+                __half* value_tile = probability + QueryRows * Bc;
+                for (int key = 0; key < Bc; ++key) {
+                    const int record_key = half * Bc + key;
+                    const int code = kvarn_unpack<Spec::ValueBits>(
+                        record + Spec::VPayloadOff, static_cast<std::int64_t>(record_key) * D + tid);
+                    const float value = (code * shared.value_scale[record_key] +
+                                         shared.value_zero[record_key]) * shared.value_channel[tid];
+                    value_tile[key * D + gqa_prefill_swz(key, tid)] = __float2half(value);
+                }
+                __syncthreads();
+#pragma unroll
+                for (int k_step = 0; k_step < Bc; k_step += 16) {
+                    unsigned af[4];
+                    const int ar = pv_row + (lane & 7) + (((lane >> 3) & 1) << 3);
+                    const int ac = k_step + ((lane >> 4) << 3);
+                    ldmatrix_x4(af[0], af[1], af[2], af[3],
+                        smem_addr(probability + ar * Bc + (ac ^ ((ar & 3) << 3))));
+#pragma unroll
+                    for (int n = 0; n < PvNt; ++n) {
+                        unsigned bf0, bf1;
+                        const int vr = k_step + (lane & 15);
+                        const int vc = pv_dim + n * 8;
+                        ldmatrix_x2_t(bf0, bf1,
+                            smem_addr(value_tile + vr * D + gqa_prefill_swz(vr, vc)));
+                        mma_f16(pv_acc[n][0], pv_acc[n][1], pv_acc[n][2], pv_acc[n][3],
+                                af[0], af[1], af[2], af[3], bf0, bf1);
+                    }
+                }
+            } else {
+#pragma unroll
+            for (int local_row = 0; local_row < LogicalRows; ++local_row) {
                 accumulator[local_row] *= shared.rescale[local_row];
             }
             const float channel               = shared.value_channel[tid];
@@ -318,7 +406,7 @@ __launch_bounds__(Spec::HeadDim, 1) __global__ void kvarn_gqa_tc_prefix_kernel(
                 const float4* weights =
                     reinterpret_cast<const float4*>(shared.scratch.probability + key * QueryRows);
 #pragma unroll
-                for (int quartet = 0; quartet < QueryRows / 4; ++quartet) {
+                for (int quartet = 0; quartet < LogicalRows / 4; ++quartet) {
                     const float4 p = weights[quartet];
                     accumulator[quartet * 4 + 0] += p.x * value;
                     accumulator[quartet * 4 + 1] += p.y * value;
@@ -326,24 +414,44 @@ __launch_bounds__(Spec::HeadDim, 1) __global__ void kvarn_gqa_tc_prefix_kernel(
                     accumulator[quartet * 4 + 3] += p.w * value;
                 }
             }
+            }
             __syncthreads();
         }
     }
 
-    for (int local_row = 0; local_row < QueryRows; ++local_row) {
+    for (int local_row = 0; local_row < LogicalRows; ++local_row) {
         const float sum               = shared.running_sum[local_row];
-        shared.scratch.transform[tid] = sum > 0.0f ? accumulator[local_row] * __frcp_rn(sum) : 0.0f;
+        if constexpr (TensorPv) {
+            // Fragment owners differ from the final dimension owners. Finish every read of
+            // the previous row before any warp overwrites the shared transform buffer.
+            __syncthreads();
+            const int row0 = (warp / PvDimWarps) * 16 + (lane >> 2);
+            const int pv_dim = (warp % PvDimWarps) * (D / PvDimWarps);
+            if (local_row == row0 || local_row == row0 + 8) {
+#pragma unroll
+                for (int n = 0; n < PvNt; ++n) {
+                    const int dim = pv_dim + n * 8 + 2 * (lane & 3);
+                    const float a = local_row == row0 ? pv_acc[n][0] : pv_acc[n][2];
+                    const float b = local_row == row0 ? pv_acc[n][1] : pv_acc[n][3];
+                    shared.scratch.transform[dim] = sum > 0.0f ? a / sum : 0.0f;
+                    shared.scratch.transform[dim + 1] = sum > 0.0f ? b / sum : 0.0f;
+                }
+            }
+        } else {
+            shared.scratch.transform[tid] = sum > 0.0f ? accumulator[local_row] * __frcp_rn(sum) : 0.0f;
+        }
         kvarn_hadamard_shared<D>(shared.scratch.transform, tid);
-        const int query = query_begin + local_row;
+        const int query  = query_begin + local_row / Heads;
+        const int q_head = head_begin + local_row % Heads;
         if (query < query_columns) {
             const std::int64_t output_index =
                 static_cast<std::int64_t>(tid) +
                 static_cast<std::int64_t>(D) *
-                    (q_head + Geometry::QHeads * (query + query_columns * row));
+                    (q_head + Geometry::QHeads * (query + query_columns * output_row));
             prefix[output_index] = __float2bfloat16(shared.scratch.transform[tid]);
             if (tid == 0) {
                 const std::int64_t stat =
-                    kvarn_prefill_row_index<Geometry>(q_head, query, query_columns, row);
+                    kvarn_prefill_row_index<Geometry>(q_head, query, query_columns, output_row);
                 prefix_max[stat] = sum > 0.0f ? shared.running_max[local_row] : -CUDART_INF_F;
                 prefix_sum[stat] = sum;
             }
@@ -548,6 +656,52 @@ __launch_bounds__(Spec::HeadDim) __global__
     const float numerator =
         __bfloat162float(prefix[element]) * wp + __bfloat162float(out[element]) * wd;
     out[element] = __float2bfloat16(numerator / (wp + wd));
+}
+
+// Prefix splits are independently normalized in the original (inverse-rotated) frame.
+// Merge their LSE weights with the dense sink/tail/current result without re-reading KV.
+template <typename Spec, typename Geometry>
+__launch_bounds__(Spec::HeadDim) __global__
+    void kvarn_merge_query_splits_kernel(const __nv_bfloat16* __restrict__ prefix,
+                                         const float* __restrict__ prefix_max,
+                                         const float* __restrict__ prefix_sum,
+                                         const float* __restrict__ dense_max,
+                                         const float* __restrict__ dense_sum,
+                                         std::int32_t query_columns, std::int32_t splits,
+                                         __nv_bfloat16* __restrict__ out) {
+    constexpr int D       = Spec::HeadDim;
+    constexpr float Log2E = 1.4426950408889634074f;
+    __shared__ float weights[32];
+    __shared__ float dense_weight;
+    __shared__ float denominator;
+    const int d = static_cast<int>(threadIdx.x);
+    const std::int64_t stat = kvarn_prefill_row_index<Geometry>(
+        static_cast<int>(blockIdx.x), static_cast<int>(blockIdx.y), query_columns,
+        static_cast<int>(blockIdx.z));
+    const std::int64_t stride =
+        static_cast<std::int64_t>(Geometry::QHeads) * query_columns * gridDim.z;
+    const std::int64_t element = stat * D + d;
+    if (d < 32) {
+        const std::int64_t partial_stat = stat + d * stride;
+        const float l = d < splits ? prefix_sum[partial_stat] : 0.0f;
+        const float m = l > 0.0f ? prefix_max[partial_stat] : -CUDART_INF_F;
+        const float ld = dense_sum[stat];
+        const float md = ld > 0.0f ? dense_max[stat] : -CUDART_INF_F;
+        const float maximum = warp_max(fmaxf(m, md));
+        const float w = l > 0.0f ? l * exp2_approx((m - maximum) * Log2E) : 0.0f;
+        weights[d] = w;
+        const float total = warp_sum(w);
+        if (d == 0) {
+            dense_weight = ld > 0.0f ? ld * exp2_approx((md - maximum) * Log2E) : 0.0f;
+            denominator  = total + dense_weight;
+        }
+    }
+    __syncthreads();
+    float numerator = __bfloat162float(out[element]) * dense_weight;
+    for (int split = 0; split < splits; ++split) {
+        numerator += __bfloat162float(prefix[element + split * stride * D]) * weights[split];
+    }
+    out[element] = __float2bfloat16(denominator > 0.0f ? numerator / denominator : 0.0f);
 }
 
 } // namespace ninfer::ops

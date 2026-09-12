@@ -1239,6 +1239,7 @@ void ProgramImplCore::prepare_graphs() {
         return schedule::ExecutionCore{device,
                                        model,
                                        work,
+                                       leaf_state,
                                        decoder->linear_attention,
                                        replay_records ? &*replay_records : nullptr,
                                        io,
@@ -1537,7 +1538,7 @@ void ProgramImplCore::enqueue_dflash_context_append(std::span<const std::uint32_
     ops::prepare_ragged_prefix(dflash->pending_features, lane_tensor, device_starts, device_ends,
                                features, positions, device_counts, device.stream);
 
-    schedule::DFlashAppendContext state{{device, model, work, decoder->linear_attention,
+    schedule::DFlashAppendContext state{{device, model, work, leaf_state, decoder->linear_attention,
                                          replay_records ? &*replay_records : nullptr, io,
                                          prefill_hidden, prefill_chunk, proposal_head},
                                         *dflash};
@@ -1568,7 +1569,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
     const auto started                    = Clock::now();
     try {
         schedule::PrefillContext schedule_state{
-            {device, model, work, decoder->linear_attention,
+            {device, model, work, leaf_state, decoder->linear_attention,
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
              proposal_head},
             text_kv_view(sequence),
@@ -1837,7 +1838,7 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         }
 
         schedule::OrdinaryBatchContext schedule_state{
-            {device, model, work, decoder->linear_attention,
+            {device, model, work, leaf_state, decoder->linear_attention,
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
              proposal_head},
             decoder->text_kv,
@@ -1982,7 +1983,7 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                 std::min(capacity, frontier + transactional_extent + draft_window));
         }
 
-        schedule::MtpBatchContext schedule_state{{device, model, work, decoder->linear_attention,
+        schedule::MtpBatchContext schedule_state{{device, model, work, leaf_state, decoder->linear_attention,
                                                   replay_records ? &*replay_records : nullptr, io,
                                                   prefill_hidden, prefill_chunk, proposal_head},
                                                  decoder->text_kv,
@@ -2143,7 +2144,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             materialize_sequence_kv(sequence, frontier + extent + 1U, frontier);
         }
 
-        schedule::DFlashBatchContext schedule_state{{device, model, work, decoder->linear_attention,
+        schedule::DFlashBatchContext schedule_state{{device, model, work, leaf_state, decoder->linear_attention,
                                                      replay_records ? &*replay_records : nullptr,
                                                      io, prefill_hidden, prefill_chunk,
                                                      proposal_head},

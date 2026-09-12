@@ -33,6 +33,7 @@ struct ExecutionCore {
     DeviceContext& device;
     const LoadedModelData& model;
     WorkspaceArena& work;
+    Variant::LeafState& leaf_state;
     LinearAttentionStatePool& linear_attention;
     const GdnReplayRecords* replay_records;
     qwen3_6::RoundState& io;

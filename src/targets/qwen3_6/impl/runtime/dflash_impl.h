@@ -356,7 +356,7 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         ops::speculative_prepare_verify_ids(anchors, drafts, extents, verify_ids,
                                             state.execution.device.stream);
 
-        TextContext card(state.execution.device, state.execution.model, state.execution.work, {},
+        TextContext card(state.execution.device, state.execution.model, state.execution.work, state.execution.leaf_state, {},
                          state.execution.linear_attention, state.execution.io,
                          state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
                          &state.text_cache);

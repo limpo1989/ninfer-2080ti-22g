@@ -68,7 +68,8 @@ linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gate_up_rows,
  *   Caller-owned transient storage reported by linear_swiglu_workspace_capacity_bytes(),
  *   scoped to the call. W8, NVFP4 A16, and row-scaled FP8 A16 require zero bytes; A4/A8 routes use
  *   caller-owned activation storage and may use private projection storage. There is no persistent
- *   state side effect.
+ *   state side effect. The SM75 Program-owned entry in quantized_prefill.h reports its own
+ *   bounded scratch capacity for the same LinearSwiGLU formula and A16 criterion.
  */
 void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, LinearPolicy policy,
                    WorkspaceArena& ws, cudaStream_t stream);

@@ -705,6 +705,23 @@ identity before lookup, while a matched snapshot skips Vision GPU encoding and m
 the restored prefix. State caching supports ordinary and MTP text/multimodal execution; DFlash
 remains unsupported.
 
+Snapshot compatibility is defined by the explicit state ABI, artifact file identity, device and
+execution configuration. Executable paths, inodes and timestamps do not invalidate snapshots.
+The family owns the ABI version and must bump it for persistent tensor layouts/dtypes, KVarN
+codec tables, MTP commit interpretation or prefix/position semantics. Pure kernel or scheduling
+performance changes preserve it. The first switch from executable identity creates a new namespace;
+existing incompatible namespaces are not automatically imported or deleted.
+
+A real SM75 continuation check used two executable copies with different paths/inodes and the
+same artifact/ABI/configuration: disk restore reused 8,051 of 8,076 tokens. The restore audit
+compared all 447,468,544 payload bytes and metadata exactly; continuation output matched the
+resident reference. Audit copies add overhead, so this check is correctness evidence rather than
+a disk-latency benchmark.
+
+Completion logs report `state_source=none` when no tokens were reused, and `resident`, `ram` or
+`disk` for actual reuse. The source label alone is not a cache hit counter; `cache=` records the
+number of reused tokens.
+
 State capture is deferred until the Engine has no active or pending request for
 `--state-cache-idle-ms` (1,000 ms by default). Every completion resets the shared idle deadline and
 marks only that lane's latest state dirty, so rapid tool loops avoid a GPU-to-host copy between

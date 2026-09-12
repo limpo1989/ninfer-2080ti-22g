@@ -10,10 +10,18 @@ behind the cut-offs those tables encode.
 
 ## The problem
 
-Single-stream decode on a 27B `groupwise-int` artifact is a weight-streaming workload: one step
-reads 15.9 GiB of quantized weights, so its floor is set by DRAM. An RTX 2080 Ti sustains
-**≈ 555 GB/s** on a pure streaming read (measured; 616 GB/s spec), which puts the floor for one
-autoregressive step at ≈ 31 ms.
+Ordinary text decode on Qwen3.8-27B `groupwise-int` streams approximately **14.66 GiB** of
+projection weights per step. This follows the registered inventory: 64 FFNs, 48 GDN input/output
+and BF16 control projections, 16 attention input/output projections, and the W8 full vocabulary
+head. It excludes unused Vision/MTP weights and the full embedding table (decode gathers one
+embedding row). Norm and convolution parameters add less than 0.01 GiB. Resident model bytes must
+not be substituted for bytes read by an ordinary text step.
+
+The previously measured **≈ 555 GB/s** streaming bandwidth gives a **28.4 ms weight-read floor**,
+or approximately **35.3 ordinary tokens/s before KV, recurrent state, sampling and other work**.
+This is an optimistic ceiling, not an attainable end-to-end target or an MTP throughput ceiling.
+At long contexts the attention work is material; speculation reads weights for multiple candidates
+and must instead be assessed using committed tokens per round divided by measured round time.
 
 Two families of exact small-`T` kernel were sitting far away from that floor on SM75:
 

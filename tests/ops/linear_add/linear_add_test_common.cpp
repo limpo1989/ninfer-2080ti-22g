@@ -289,7 +289,8 @@ std::vector<float> materialize_weight_rows(const HostWeight& weight,
 
 bool cuda_available() { return !test::cuda_unavailable(); }
 
-int run_shape(std::string_view label, WeightFormat format, const ShapeCase& shape) {
+int run_shape(std::string_view label, WeightFormat format, const ShapeCase& shape,
+              const Candidate& candidate) {
     const std::vector<std::int32_t> tokens = conformance_tokens(shape);
     if (tokens.empty()) { throw std::invalid_argument("linear_add test: no token cases"); }
     const std::int32_t maximum_t = tokens.back();
@@ -331,7 +332,8 @@ int run_shape(std::string_view label, WeightFormat format, const ShapeCase& shap
         const std::string case_label = std::string(label) + " [" + std::to_string(shape.n) + "," +
                                        std::to_string(shape.k) + "] T=" + std::to_string(t);
         try {
-            ops::linear_add(input, weight, residual_out, workspace, nullptr);
+            if (candidate) { candidate(input, weight, residual_out, nullptr); }
+            else { ops::linear_add(input, weight, residual_out, workspace, nullptr); }
             test::cuda_check(cudaDeviceSynchronize(), "synchronize linear_add");
         } catch (const std::exception& error) {
             std::cerr << case_label << ": unexpected exception: " << error.what() << '\n';
@@ -340,7 +342,7 @@ int run_shape(std::string_view label, WeightFormat format, const ShapeCase& shap
         }
         const std::size_t exact_workspace =
             ops::linear_add_workspace_capacity_bytes(qtype, shape.n, shape.k, t, t);
-        if (workspace.used() != 0 || workspace.peak_used() != exact_workspace) {
+        if (workspace.used() != 0 || (!candidate && workspace.peak_used() != exact_workspace)) {
             std::cerr << case_label << ": exact workspace query/execution high-water mismatch\n";
             ++failures;
         }
@@ -357,7 +359,7 @@ int run_shape(std::string_view label, WeightFormat format, const ShapeCase& shap
                 full_reference.data(),
                 checked_elements(static_cast<std::int32_t>(oracle_rows.size()), t, "reference")));
     }
-    if (executed_peak != workspace_bytes) {
+    if (!candidate && executed_peak != workspace_bytes) {
         std::cerr << label << ": interval workspace capacity has no executed high-water witness\n";
         ++failures;
     }

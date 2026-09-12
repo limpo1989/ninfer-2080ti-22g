@@ -238,3 +238,101 @@ Capacity 侧的实测：在同一份约 2.66 GiB 的 runtime 预算下，`bf16` 
 在 24,576 / 127,488 两个 anchor 上，`Wq=512` 分别快 9.1% / 10.6%，`Wq=2048` 分别快
 8.0% / 14.1%。35B 几何的 `Wq=1024` 在 8,192 / 127,488 上分别快 9.2% / 12.7%。这些数据同时
 包含 prefix、dense、merge、stage commit/append 与 workspace traffic；decode（`Wq < 128`）不变。
+
+### SM75 small-query reuse profile
+
+SM75 默认启用 `NINFER_KVARN_TC_QUERY_REUSE=1`；设置为 `0` 可进行同二进制 A/B。
+该路径已通过独立 oracle 和重复真实请求验证，适用于 2..127 个 query columns。
+该路径把同一 KV head 下的 query heads 与相邻 query tokens 放入一个 MMA tile：`Wq=2` 使用
+16-row tile，`3<=Wq<128` 使用 32-row tile、每组最多四个 token。`Wq=1` 保留更快的 scalar 路径。
+PV 只累加逻辑 query rows，不为 MMA 补齐的空行执行无效乘加。历史 record 按 prefix 分段，
+每段独立计算 QK / FP32 PV / softmax，再将逆旋转后的结果与 dense sink/tail/current 区域进行稳定
+LSE 合并。split 数只依赖公开 shape，保持 CUDA Graph 拓扑和 workspace 地址稳定。workspace
+容量覆盖小 query 分段数变化产生的内部峰值，供 family 按最大 width 规划时使用。
+
+该路径已通过 CUDA 12.8.93 / GCC 12.3 编译和 GPU 数值验证，沿用 FP64 attention oracle 的原有准则。
+16-row tile 限制为每线程最多 128 个寄存器以允许两 CTA 驻留；K4V2 编译结果有 16 bytes 栈空间，
+但完整 Op 的实测仍明显快于基线。以下为 RTX 2080 Ti 22GB、250 W、Turbo 关闭、27B 几何、
+K4V2、CUDA Graph 的完整 K3 算子结果。它们不是整模型吞吐，也不代表 `Wq>=128` 的长 prefill 收益。
+
+| Prefix / 每请求 | Wq | B | Scalar | Query reuse | 算子加速比 |
+|---:|---:|---:|---:|---:|---:|
+| 27,885 | 4 | 1 | 1.665 ms | 1.007 ms | 1.65x |
+| 127,488 | 4 | 1 | 7.261 ms | 3.590 ms | 2.02x |
+| 127,488 | 2 | 1 | 3.861 ms | 2.239 ms | 1.72x |
+| 127,488 | 8 | 1 | 14.599 ms | 6.615 ms | 2.21x |
+| 127,488 | 40 | 1 | 71.285 ms | 38.440 ms | 1.85x |
+| 65,536 | 4 | 2 | 7.772 ms | 3.648 ms | 2.13x |
+
+Wq=4、B=1 使用 A/B/B/A 交错顺序，每次 200 次预热、30 次测量；表中为两次中位数的平均值。
+其余形状每次 30 次测量，Wq=2/8/40 的预热次数分别为 500/150/50，B=2 为 150 次。单 query 的
+候选在 128K 上从 1.964 ms 退化到 2.153 ms，因此已从候选调度中排除；不将这个回退留给 MTP draft。
+
+同一个 public Op benchmark 可通过进程环境切换两条路径，示例：
+
+```bash
+NINFER_KVARN_TC_QUERY_REUSE=0 ./build/bench/ninfer_kvarn_attention_bench \
+  --context 27885,127488 --width 4 --graph --warmup 200 --repeat 30
+NINFER_KVARN_TC_QUERY_REUSE=1 ./build/bench/ninfer_kvarn_attention_bench \
+  --context 27885,127488 --width 4 --graph --warmup 200 --repeat 30
+```
+
+`--batch 2` 覆盖两请求的验证几何；`--query-width 4 --width 16` 覆盖 `Wq<W`。历史通过最多
+1024-token 的 commit-only 调用精确构建，避免窄 width 设置造成大量初始化调用或越过指定 prefix。
+每次计时前恢复 stage 输入，恢复操作不计入 Op 延迟；被测调用新生成的 records 不作为该调用的
+历史输入。输出同时报告 width、query width、batch 和 direct/graph 模式。
+
+`ninfer_kvarn_test` 的新增 oracle 场景覆盖 128K prefix、非对齐页边界、ragged query tile、不同有效
+长度与空行、`Wq<W`、两种 head geometry 和 CUDA Graph。oracle 从提交的 BF16 输入取未量化
+sink/tail，从独立 codec 解码已存储的 records，再完整计算 FP64 attention；它不读取已被本次 append
+覆盖的旧 tail slots 来推断输入。另对可见 sink/tail 的持久化结果做精确检查。
+可用 `--case name-substring` 选择受修改影响的场景；2-query 分支另通过了混合有效长度的 Graph
+场景与 128K prefix 场景，避免仅用 4-query 的另一种 MMA tile 证明它。
+
+#### Real-request MTP result
+
+同一 RTX 2080 Ti 22GB、250 W、Turbo 关闭，使用 recorded Responses 请求、MTP3、chunk 1024、
+启动 concurrency 2、temperature 0.6、presence penalty 1.0。测试时停止服务，确认没有其他 GPU
+计算进程或编译负载，并记录每两秒的 GPU 频率、温度和功耗。
+
+在旧基准的 `preserve_thinking=false` 配置下，输入为 27,849 tokens。seed 1234/1235/1236 各重复
+两次，以 A/B/B/A 顺序比较同一新 prefill 版本的 query reuse 开关。按提交 token 总数除以 decode
+总时间统计，吞吐 **19.77 → 21.69 tok/s（+9.7%）**，三个 seed 都有净收益。
+
+显式开启客户端选项 `preserve_thinking=true` 后，同一记录包含 **62,920 tokens**，后续重放完整复用
+62,920 tokens。在相同 prefill 实现上，三个 seed 的 MTP3 decode 合计吞吐为：
+
+| Query reuse | Decode |
+|---|---:|
+| 关闭 | 15.12 tok/s |
+| 开启 | 19.23 tok/s |
+
+这两组配置的输入和缓存行为不同，不混合统计。生成轨迹随数值路径和 seed 改变；直接使用提交量
+与时间，不要求概率输出逐 token 相同，也不以接受率单独判断性能。旧版本全部优化关闭时，同一
+62K reasoning-preserving 配置为 15.90 tok/s；完整优化的版本比较详见 [performance](../performance.md)。
+
+### SM75 Tensor Core PV
+
+长 prefill（Wq>=128）默认启用 `NINFER_KVARN_TC_PV=1`，设置为 `0` 可测量 scalar PV 对照。
+同一 key tile 的 QK 只算一次。八个 warp 分成两个 query 组与四个输出维度组，各自累加 16x64
+输出，保留 FP32 softmax/LSE，P/V 用 FP16 进入 FP32 MMA。最终继续与 dense sink/tail/current
+区域做稳定 LSE 合并。
+
+该 32-row 实现使用 **178 registers/thread、39,040 shared bytes，stack/local 均为零**。
+独立 FP64 oracle 覆盖 chunked prefill、ragged/B=2、27B/35B 两种 head geometry。128K 场景
+执行实际 128 queries，并对 query 0/31/64/127 的全部 heads/dimensions 计算完整 prefix 公式；
+这不是将另一条 GPU 路径的输出作为 oracle。
+
+完整 Op 的代表性 Graph 测量（Wq=W=1024）：
+
+| Prefix | Scalar PV | Tensor Core PV |
+|---|---:|---:|
+| 24,576 | 123.22 ms | 95.95 ms |
+| 127,488 | 624.14 ms | 478.63 ms |
+
+这些是 attention Op 数据。整模型 prefill 还包含投影、GDN、FFN 和其他工作，不能把算子比例
+直接当作整模型增幅。
+
+另一个方案将 QK 从两个 warp 分到八个 warp，通过 shared memory 交换 score 后沿用原 softmax。
+它通过了相同 oracle，降到 173 registers 且没有 spill，但 A/B/B/A 完整 Op 差异不足 1%，
+没有稳定收益，因此已移除。更多活跃 warp 本身不构成性能结论。

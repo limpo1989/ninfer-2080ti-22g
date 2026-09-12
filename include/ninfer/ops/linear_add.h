@@ -63,8 +63,9 @@ namespace ninfer::ops {
  *
  * Workspace:
  *   Caller-owned transient storage reported by linear_add_workspace_capacity_bytes(), scoped to
- *   the call. A16 routes require no storage; quantized-activation routes use the reported capacity.
- *   There is no persistent state side effect.
+ *   the call. These stateless A16 entries require no storage; quantized-activation routes use the
+ *   reported capacity. The SM75 Program-owned entry in quantized_prefill.h reports its separate
+ *   bounded scratch capacity. Neither entry changes persistent model state.
  */
 void linear_add(const Tensor& x, const Weight& w, Tensor& residual, WorkspaceArena& ws,
                 cudaStream_t stream);

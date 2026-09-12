@@ -4,9 +4,15 @@
 
 This repository is a specialized port of [NInfer](https://github.com/Neroued/ninfer) (originally developed by [@Neroued](https://github.com/Neroued)) optimized for NVIDIA Turing architecture (`sm_75`, tuned specifically for the **RTX 2080 Ti 22GB** modded card), while retaining compatibility with Ampere (`sm_86`) and Blackwell (`sm_120a`). It executes text and multimodal (image/video) prompts through a fast local CLI or OpenAI/Anthropic-compatible HTTP servers.
 
-**Resume cached conversations after a restart: 42.29s → 1.91s to the first token** in a controlled
-Qwen3.8-27B continuation test. The [persistent state cache](#persistent-state-cache) retains model
-state in RAM and on disk, preserving expensive prefill work when a conversation leaves VRAM.
+**Current measured default: 568.11 tok/s prefill at 8,083 input tokens, falling to
+266.85 tok/s at 62,960 input tokens; MTP3 decode falls from 25.79 to 17.06 tok/s.**
+Every point is the mean of two complete 256-token generations on one RTX 2080 Ti 22GB at
+250 W with Turbo disabled. Both runs are retained below; see the
+[measurement conditions and remaining bounds](docs/performance.md).
+
+**Cross-process disk restore reused 8,039 / 8,043 tokens (99.95%)** and returned the same
+deterministic request result. The [persistent state cache](#persistent-state-cache) retains model
+state in RAM and on disk, preserving expensive prefill work across compatible rebuilds.
 
 ---
 
@@ -15,32 +21,19 @@ state in RAM and on disk, preserving expensive prefill work when a conversation 
 Long agent histories can take tens of seconds to process again after eviction or a server restart.
 NInfer saves completed conversation state in **VRAM → RAM → DISK** tiers. When the same token
 prefix returns, it restores the saved state and computes the new suffix. Completed disk snapshots
-survive process restarts with compatible model files, executable, and configuration.
+survive process restarts with compatible model files, state ABI, and configuration.
 
-### Measured continuation latency
+### Verified continuation restore
 
-An **8,201-token** continuation built from a recorded DeepSeek Harness request produced:
+An 8,043-token continuation was restored after a service process restart while keeping the state
+ABI, artifact and execution configuration unchanged:
 
-| State available | Time to first token | Tokens requiring prefill | Reused input |
-|---|---:|---:|---:|
-| No reusable state; full recomputation | 42.123s | 8,201 | 0% |
-| **Disk snapshot after process restart** | **1.727s** | **28** | **99.66%** |
-| **RAM snapshot after the GPU slot was overwritten** | **0.890s** | **28** | **99.66%** |
-| GPU-resident reference | 0.815s | 28 | 99.66% |
+| State source | TTFB | Engine prefill | Restore | Reused input |
+|---|---:|---:|---:|---:|
+| **Disk snapshot after process restart** | **1.09s** | 0.08s | 0.09s | **8,039 / 8,043 (99.95%)** |
 
-**Disk recovery cut first-token waiting by 95.9% (24.4×), saving 40.40 seconds per tested
-continuation.** RAM recovery reduced the same wait by 47.3×. Both restored 8,173 input tokens.
-The approximately 426 MiB restored state was verified byte for byte, and all 64 generated tokens
-matched the GPU-resident reference. State retains its existing numeric formats without additional
-quantization or recompression.
-
-Measured on RTX 2080 Ti 22GB, dual E5-2690 v3, NVMe storage, CUDA 12.8, and driver 595.99.02;
-Qwen3.8-27B groupwise-int, KVarN, MTP3, 32,768-token context capacity, concurrency 1,
-prefill chunk 1,024, temperature 0.6, presence penalty 1.0, seed 1234, and a 64-token output limit.
-Each row is one controlled run through Responses translation and the public Engine. Timing begins
-after model initialization and includes request preparation and restoration; model loading and
-startup warmup still take place after restart. Before the disk performance run, the test requested
-file-specific OS page-cache eviction with `POSIX_FADV_DONTNEED`; this is an advisory operation.
+The response status, cached-token count and deterministic arithmetic result were verified after a
+service restart. This test establishes disk restore behavior for the current namespace.
 
 ### Enable and inspect
 
@@ -61,14 +54,13 @@ The same cache flags are available on `ninfer-serve`; direct launches require an
 and positive disk budget. Set `--state-cache-max-mib 0` to disable state caching. For an existing
 service, pass the same overrides when opening watch so its configuration header reflects them.
 
-Disk reads, checksums, and durable writes run on a dedicated I/O worker. Capturing the tested state
-to RAM took 0.46–0.51s after result publication, and GPU upload took about 0.08–0.09s. Capture and
-upload briefly occupy the inference worker. The measured benefit is reduced prefill waiting;
-concurrent tail latency has not yet been measured.
+Disk reads, checksums, and durable writes run on a dedicated I/O worker. The restart check restored
+the disk snapshot in 0.09s; capture and upload briefly occupy the inference worker.
 
 This first version supports **text with ordinary decode or MTP**. Clients resend conversation
 history after restart; public `previous_response_id` records and tool-format replay metadata remain
-process-local. Rebuilding the executable or replacing model files creates a new cache namespace.
+process-local. Rebuilding preserves the cache namespace while the explicit state ABI, model file
+identity and execution configuration remain unchanged.
 Budgets apply to the current namespace, while old namespaces remain available for manual cleanup.
 See the [serving options](docs/serving.md#server-options) and the deployment details below for the
 complete storage behavior and benchmark modes.
@@ -79,13 +71,14 @@ complete storage behavior and benchmark modes.
 
 NInfer uses standalone `.ninfer` container artifacts embedding packed weights and tokenizer resources:
 
-| Model | Weights | NInfer Artifact | Size | 22GB VRAM Residency |
+| Model | Weights | NInfer artifact | Artifact size | RTX 2080 Ti status |
 |---|---|---|---:|---|
-| [Qwen3.6-27B](https://huggingface.co/neroued/Qwen3.6-27B-NInfer) | `groupwise-int` | `qwen3_6_27b.ninfer` | 16.29 GiB | Supported (~5.5 GiB KV headroom) |
-| [Qwen3.8-27B](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) | `groupwise-int` | `qwen3_8_27b.ninfer` | 16.96 GiB | Supported (~5.0 GiB KV headroom) |
-| [Qwen3.6-35B-A3B](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer) | `groupwise-int` | `qwen3_6_35b_a3b.ninfer` | 21.22 GiB | Supported (~0.8 GiB KV headroom) |
+| [Qwen3.6-27B](https://huggingface.co/neroued/Qwen3.6-27B-NInfer) | `groupwise-int` | `qwen3_6_27b.ninfer` | 16.29 GiB | Supported |
+| [Qwen3.8-27B](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) | `groupwise-int` | `qwen3_8_27b.ninfer` | 16.96 GiB | Current measured deployment |
+| [Qwen3.6-35B-A3B](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer) | `groupwise-int` | `qwen3_6_35b_a3b.ninfer` | 21.22 GiB | Supported |
 
-*Note: For Turing (`sm_75`) and Ampere (`sm_86`) do not support `nvfp4`. Use `groupwise-int` (W8A16) artifacts.*
+*Note: `nvfp4` is unsupported on Turing (`sm_75`) and Ampere (`sm_86`). Use `groupwise-int`
+(W8A16) artifacts.*
 
 ---
 
@@ -93,133 +86,74 @@ NInfer uses standalone `.ninfer` container artifacts embedding packed weights an
 
 On an RTX 2080 Ti 22GB (~22,528 MiB addressable), available device memory is allocated between model weights, speculative draft structures, CUDA runtime workspaces, and the paged KV cache pool.
 
-### 1. KV Cache Quantization: `--kv-dtype int8` (Recommended)
+### 1. KV Cache Quantization: `--kv-dtype kvarn` (Long-context default)
 - **BF16 (`--kv-dtype bf16`)**: Consumes **64.0 KiB per token** (64 MiB per 1,000 context tokens on 27B).
 - **INT8 Group-64 (`--kv-dtype int8`)**: Consumes **33.0 KiB per token**, halving KV memory footprint relative to BF16.
 - **KVarN (`--kv-dtype kvarn`, 4-bit key / 2-bit value)**: Consumes **13.9 KiB per token**, ~4.6x smaller than BF16. `--kv-dtype kvarn-k4v4` (4-bit value) costs 17.9 KiB per token.
 
-KVarN keeps each sequence's first 128 positions and its still-filling tail page unquantized in BF16 and compresses every complete 64-token page into one structured record, so the extra fixed cost is independent of `--max-context` and its advantage grows with context length. One additional BF16 tail page per lane preserves exact rewrite-checkpoint state. MTP temporarily shortens its speculative window immediately before record boundaries so rejected drafts can never publish an irreversible compressed page. It is a **capacity** format first: decode is marginally faster than BF16, and prefill is slower, though the Q-tiled prefill kernel closed most of that gap — on a 31K-token prompt KVarN prefill went from 0.59x BF16 to 0.85x (2.9x on the KVarN attention Op itself). The SM75 path now evaluates the compressed prefix with FP16 Tensor Core QK and stable LSE state merging, improving the full KVarN attention Op by another 11–12% at 8K–127K prefixes. `--spec dflash` is not supported under KVarN; `--spec mtp` is.
+KVarN keeps each sequence's first 128 positions and its still-filling tail page unquantized in BF16
+and compresses every complete 64-token page into one structured record. One additional BF16 tail
+page per lane preserves exact rewrite-checkpoint state. The current SM75 route uses Tensor Cores for
+compressed-prefix QK/PV, stable LSE merging, and shared transformed queries for 2..127-query
+verification. `--spec dflash` is not supported under KVarN; `--spec mtp` is.
 
-### 2. Context Limits & Concurrency
+### 2. Current Measured Deployment
 
-| Model | Weight Footprint | KV Pool Headroom | Max Context (`--kv-dtype int8`) | Concurrency (`--max-concurrency`) |
-|---|:---:|:---:|:---:|:---:|
-| **Qwen3.6-27B** | ~16.29 GiB | ~5.0 – 5.5 GiB | Up to 131,072 (128K) | 1 – 4 active requests |
-| **Qwen3.8-27B** | ~16.96 GiB | ~4.5 – 5.0 GiB | Up to 131,072 (128K) | 1 – 4 active requests |
-| **Qwen3.6-35B-A3B** | ~21.22 GiB | ~0.7 – 0.9 GiB | 4,096 – 8,192 (4K–8K) | 1 active request |
+| Model/profile | KV | Context / shared KV | Concurrency | Loaded weights | Runtime reservation | Planner slack |
+|---|---|---:|---:|---:|---:|---:|
+| **Qwen3.8-27B `groupwise-int` text** | KVarN | 245,760 / 245,760 | 2 | 16.67 GiB | 4.55 GiB | 106.37 MiB |
 
-### 3. Execution Configuration Notes
-- **27B Deployments**: Standard configuration uses `--kv-dtype int8` with `--kv-capacity auto` (or `--max-context 32768` / `65536`). Speculative decoding (`--spec mtp --draft-tokens 3 --lm-head-draft`) allocates ~0.8 GiB for draft parameters and CUDA Graph state.
-- **35B-A3B Deployments**: Requires `--kv-dtype int8`, `--max-context 4096` (or `8192`), and `--max-concurrency 1` to stay within the 22GB ceiling.
+These values come from the current bounded-prefill build at startup. The engine also reported
+265.31 MiB free after startup; `nvidia-smi` showed approximately 21,740 MiB used. Artifact file
+size and loaded weight bytes are different quantities. Capacity is not extrapolated to the other
+supported artifacts: use their startup planner result when selecting a deployment profile.
 
 ---
 
 ## Performance (RTX 2080 Ti 22GB)
 
-Earlier reference measurements on NVIDIA GeForce RTX 2080 Ti (`TU102` / `sm_75`, 22 GB VRAM mod) with **Qwen3.8-27B
-Dense** (`groupwise-int`, greedy generation, $T_{\text{new}} = 256$ tokens, `--max-context 4096`,
-one fixed prompt per row). Current Linux measurements and defaults appear under the SM75 fast path below.
+Current end-to-end measurements use Qwen3.8-27B `groupwise-int`, KVarN, MTP3, 1,024-token
+prefill chunks, concurrency two, seed 1234, a 256-token output, a 250 W GPU limit and Turbo
+disabled. Prefix reuse is disabled so every input token is computed. The first three requests use
+`preserve_thinking=false`; the 62,960-token request preserves the recorded reasoning history.
 
-### Committed decode throughput
+| Input tokens | Prefill run 1 | Prefill run 2 | Mean |
+|---:|---:|---:|---:|
+| 8,083 | 577.90 tok/s | 558.32 tok/s | **568.11 tok/s** |
+| 18,783 | 463.17 tok/s | 445.53 tok/s | **454.35 tok/s** |
+| 21,160 | 442.42 tok/s | 425.44 tok/s | **433.93 tok/s** |
+| 62,960 | 270.44 tok/s | 263.26 tok/s | **266.85 tok/s** |
 
-| KV cache | Speculation | Decode throughput | Tokens / round |
-|---|---|:---:|:---:|
-| BF16 | none (autoregressive) | **24.62 tok/s** | 1.00 |
-| BF16 | MTP, draft window 2 | **44.18 tok/s** | 2.34 |
-| BF16 | MTP, draft window 3 | **44.81 tok/s** | 2.73 |
-| INT8 group-64 | none (autoregressive) | **25.50 tok/s** | 1.00 |
-| INT8 group-64 | MTP, draft window 2 | **43.90 tok/s** | 2.28 |
-| INT8 group-64 | MTP, draft window 3 | **41.57 tok/s** | 2.54 |
+| Input tokens | Decode run 1 | Decode run 2 | Mean | MTP acceptance |
+|---:|---:|---:|---:|---:|
+| 8,083 | 26.27 tok/s | 25.31 tok/s | **25.79 tok/s** | 45.69% |
+| 18,783 | 22.33 tok/s | 21.46 tok/s | **21.89 tok/s** | 42.51% |
+| 21,160 | 22.08 tok/s | 21.28 tok/s | **21.68 tok/s** | 44.20% |
+| 62,960 | 17.10 tok/s | 17.02 tok/s | **17.06 tok/s** | 42.77% |
 
-A decode step reads 15.9 GiB of weights, and this card sustains ≈ 555 GB/s on a streaming read,
-so ≈ 31 ms (≈ 32 tok/s) is the autoregressive floor; speculation is what carries the committed
-rate past it. See [`docs/maintainer/turing-decode-gemv.md`](docs/maintainer/turing-decode-gemv.md)
-for the decode-path kernel routes and their measured before/after.
+Every run generated all 256 requested tokens. During the measured regions, average GPU
+utilization was 99.1%–99.9%, peak temperature was 76 C, and host CPU idle never fell below 96%.
+Only the benchmark process used the GPU. The second run at each point reflects the thermally stable
+state and is 2.7%–3.9% slower than the first, so both values are shown instead of reporting a peak.
+Decode is an end-to-end workload result: prompt content and MTP acceptance also affect it, so the
+rows show observed throughput at each length rather than a length-only scaling law.
 
-### Long context
+Replaying the identical 8,043-token cache-check prompt reuses 8,039 input tokens and reaches the first generated
+token in approximately 1.09s after a process restart. Reused tokens are not counted as raw prefill
+throughput. Cold prefill values above are full-request averages; live rolling throughput falls as
+each new chunk attends to a longer prefix.
 
-At 34,342 prompt tokens with `--kv-dtype kvarn` and MTP draft window 2: prefill **168 tok/s**,
-decode **34.40 tok/s**, 3.00 tokens per round, planted needle retrieved verbatim.
+The selected SM75 implementation uses bounded Q4/Q5 cuBLAS prefill for chunks of at least 256
+tokens, Tensor Core KVarN QK/PV, stable LSE merging and shared transformed queries for 2..127-query
+verification. Final outputs and persistent state retain their required formats, and the changed Ops
+pass their independent complete-formula numerical oracles. Diagnostic controls are documented in
+[performance](docs/performance.md) and [KVarN records](docs/maintainer/kvarn-records.md).
 
-### Prefill throughput
-- **Short Prompt ($T = 22$ tokens):** ~71 – 78 tok/s
-- **Medium Prompt ($T = 62$ tokens):** ~134 – 135 tok/s
-- Current long and short prefill routes are described below; the earlier prompt measurements above used a different host and route set.
-
-### SM75 groupwise-int prefill fast path
-
-Turing has neither `cp.async` nor native BF16 Tensor Core instructions. The SM75 long-prefill
-path therefore converts the already-loaded BF16 fragments to FP16, executes native FP16 HMMA with
-FP32 accumulation, and overlaps the next quantized-weight and activation loads through registers.
-This is enabled by default for the Qwen3.8 Q4 SwiGLU and Q5 residual-add C128 routes. SM75 grouped
-Q4/Q5 attention/GDN input projections also use FP16 HMMA. Both BF16 panels are scaled by 256
-before conversion, then partial sums are scaled back by 1/65536. A warp-wide check permits only
-zeros and magnitudes in [2^-22, 255], making conversion exact and keeping nonzero FP16 operands
-normal; other panels fall back to FP32. The GDN chunk output uses native HMMA
-only when the BF16 operands are exactly representable in FP16. Accumulation and persistent state
-retain their original dtypes; FP32 accumulation order can differ and bitwise output identity is
-not promised. The registered operators retain their independent FP32/FP64 oracle thresholds.
-
-Measured on RTX 2080 Ti 22GB, driver 595.99.02, CUDA 12.8.93, with the 7,680-token NIAH prompt,
-INT8 KV, MTP3, and the same aggressive fan curve for every run:
-
-| Configuration | Prefill | Decode | Result |
-|---|---:|---:|---|
-| Original Q4/Q5 paths | 77.51 tok/s | 36.01 tok/s | `ORCHID=4938` |
-| Q4 FP16 HMMA only | 98.62 tok/s | 36.73 tok/s | `ORCHID=4938` |
-| Q5 FP16 HMMA only | 112.82 tok/s | 36.60 tok/s | `ORCHID=4938` |
-| Default Q4 + Q5 fast paths | **201.34 tok/s** | **38.94 tok/s** | `ORCHID=4938` |
-
-The focused Q4 and Q5 independent-oracle tests pass with the default fast paths. Override the
-routes only for diagnosis: `NINFER_SWIGLU_KMODE=0` or `NINFER_Q5ADD_KMODE=0` selects the original
-path, `=2` selects FP16 HMMA without register prefetch, and `=3` selects the default full fast path.
-The experimental W8 `KMODE=3` is not enabled by default and is not part of this optimization.
-
-Short prefills use the fused Q4 C128 route from 17 tokens and the Q5 C128 route from 49 tokens.
-Q4 decode/verify uses the paired GEMV through eight columns. Its next weight tile is held in
-registers, so one shared staging buffer suffices; this also keeps the eight-column batch resident
-at two CTAs per SM. The measured Q4 64-token latency fell
-from 14.48 ms to 3.49 ms; Q5 down-projection at 80 tokens fell from 6.99 ms to 2.94 ms. Set
-`NINFER_SWIGLU_FUSED_PREFILL=0`, `NINFER_Q5ADD_SMALL_HMMA=0`, `NINFER_GROUPED_HMMA=0`, or
-`NINFER_GDN_OUTPUT_HMMA=0` to disable the corresponding optimization for comparison.
-Detailed per-layer profiling is opt-in with `NINFER_PROFILE_PREFILL=1`; ordinary serving metrics
-remain available without per-layer CUDA timing events.
-
-The KVarN decode kernel limits register allocation to support two resident CTAs and requests
-the corresponding shared-memory carveout. On SM75 this reduced its register count from about
-247 to 128 per thread without spills. At a 27,885-token history and four query columns, the
-isolated attention latency decreased from 1.677 ms to 1.425 ms. Q4 paired gate/up latency changed
-from 368 to 348 microseconds at four columns and from 1,261 to 543 microseconds at eight columns.
-These changes retain the existing numerical formats and oracle tolerances.
-
-On the Linux dual E5-2690 v3 host (125 GiB RAM), the public Engine benchmark with the same
-Qwen3.8-27B artifact, KVarN, 8,192 input tokens, 256 decode tokens, MTP3, and two repetitions
-measured:
-
-This is a forced-length greedy token-stream benchmark. Its MTP acceptance was approximately 98%;
-agent conversations with longer histories and stochastic sampling require their own measurements.
-
-| Configuration | Prefill | Decode |
-|---|---:|---:|
-| Earlier Q4/Q5 fast paths, 250 W GPU limit | 185.10 tok/s | 40.07 tok/s |
-| Final defaults with exact operand scaling, default 250 W | 196.88 tok/s | 39.93 tok/s |
-
-At the same default power limit, prefill improved by 6.4%. Decode was effectively unchanged
-(-0.3%, within run-to-run variation); this measurement does not establish a decode speedup.
-
-The benchmark context capacity was 32,768; serving retains 245,760 with a 32,768 default output
-allowance. This host retains the card's default 250 W power limit. The restart script
-does not change it unless explicitly requested; the fan-control systemd unit does not set power.
-The new kernels are enabled directly in source on SM75, so their effect does not depend on
-setting environment variables in the restart script. The delivered path avoids conversion
-rounding in the new input-projection kernels. FP32 accumulation order may still differ.
-
-```bash
-LD_LIBRARY_PATH="$HOME/.local/ninfer-deps/lib:/usr/local/cuda-12.8/lib64" \
-  ./build/bench/ninfer_bench --weights /path/to/qwen3_8_27b.ninfer \
-  -pg 8192,256 -r 2 --warmup 0 --max-ctx 32768 --kv-dtype kvarn \
-  --mtp-draft-tokens 3 --lm-head-draft -o json
-```
+An ordinary decode step streams approximately 14.66 GiB of projection weights. At the measured
+approximately 555 GB/s streaming bandwidth, weight reads alone impose a loose 35.3 tok/s ceiling
+before KV scans, recurrent state, unpacking, synchronization and sampling. The measured long-context
+rate remains materially below that ceiling; see the
+[current bound](docs/performance.md#interpreting-the-remaining-upper-bound).
 
 `ninfer_responses_bench` accepts a recorded Responses request and uses the deployment's context,
 concurrency, KVarN, MTP3, temperature 0.6, and presence penalty 1.0 through the same request
@@ -262,19 +196,9 @@ budget of 1 GiB and no entry-count limit. Set `--tool-replay-cache-mib N` on `ni
 change the budget in MiB, or use zero to disable this cache. It allocates on demand, replaces
 duplicate tool-call IDs, and evicts the oldest records under memory pressure. Tool-call IDs are
 hash-indexed so lookup does not scan the full cache as it grows.
-At the default 250 W limit, Codex CLI 0.153.4 with three sequential shell calls produced warm
-continuation hits of 98.65%, 99.09%, and 99.09% with 0.834–0.956 s time to first token;
-a controlled five-request tool loop with an initial 6,583-token prompt reached 99.55–99.56%
-after the cold start.
-Cold starts, large new tool outputs, edited history, and stripping reasoning at a new user turn
-are excluded from this warm-continuation claim.
-
-A recorded DeepSeek Harness request with 25,063 input tokens reproduced a later tool-continuation
-hit of 70.34% and 55.80 s to first token. Preserving parameter whitespace and original tool markup
-raised that continuation to 99.76% and reduced the wait to 1.21 s. A further continuation retained
-99.89%. The first response's client-observed decode rate changed from 28.40 to 29.09 tok/s;
-the request, seed, output count (916), and MTP acceptance (84.4%) matched. Subsequent output lengths
-changed after the corrected history, so their total wall times are not used as a decode-speed claim.
+The current cross-executable state-restore result above is the README's cache measurement. Tool-loop
+reuse is checked behaviorally because its exact hit percentage depends on the appended tool output,
+edited history and whether a new user turn strips prior reasoning.
 
 `ninfer_token_decode MODEL.ninfer TOKEN_ID...` decodes trace IDs directly from the artifact's
 embedded tokenizer on the CPU. It can distinguish an actual token mismatch from SSE text chunking.
@@ -448,30 +372,19 @@ when it is nonempty. Script changes take effect on the next server restart;
 direct `ninfer-serve` launches still require an explicit `--api-key` to enable authentication.
 
 Its tested defaults are KVarN, MTP3, concurrency 2, a 245,760-token maximum context and shared KV
-capacity, and `default-max-tokens=32768`. On the 22,528 MiB card this uses about 21,610 MiB after
-startup while retaining about 220 MiB of planner slack. Paths and sizing remain overridable through
-the `NINFER_MODEL`, `NINFER_BIN`, `NINFER_MAX_CONTEXT`, `NINFER_KV_CAPACITY`, and
-`NINFER_DEFAULT_MAX_TOKENS` environment variables.
+capacity, and `default-max-tokens=32768`. The current bounded-prefill build uses approximately
+21,740 MiB according to `nvidia-smi`; the engine reports 106.37 MiB of planner slack. Paths and
+sizing remain overridable through the `NINFER_MODEL`, `NINFER_BIN`, `NINFER_MAX_CONTEXT`,
+`NINFER_KV_CAPACITY`, and `NINFER_DEFAULT_MAX_TOKENS` environment variables.
 
 ### Vision cost on the RTX 2080 Ti 22GB
 
-Vision loads an additional 0.28 GiB of weights plus a large fixed encoder workspace and
-request-transient buffer. The following startup measurements use the Qwen3.8-27B groupwise-int
-artifact, KVarN, MTP3 with the optimized draft head, a 1,024-token prefill chunk, concurrency 2,
-CUDA Graphs, and equal explicit `--max-context`/`--kv-capacity` values:
-
-| Configuration | Context | Weights | Runtime reservation | Planner margin | RAM/disk state snapshots |
-|---|---:|---:|---:|---:|---|
-| Text deployment default | 245,760 | 16.67 GiB | 4.45 GiB | 212.19 MiB | Enabled |
-| Vision recommended maximum | 81,920 | 16.95 GiB | 4.36 GiB | 24.54 MiB | Enabled |
-| Vision measured edge | 83,584 | 16.95 GiB | 4.38 GiB | 0.59 MiB | Enabled |
-
-Use 81,920 rather than the 83,584-token measured edge for a repeatable Vision deployment; the
-edge leaves effectively no planner tolerance for small driver-allocation changes. Image/video
-expansion and text share this total context, while merged Vision tokens have an additional 32,768
-token envelope. Consequently this 22GB configuration cannot combine Vision with a 128K output
-budget. Vision remains opt-in via `--vision`; the default launcher preserves the 245,760-token text
-profile and its persistent state cache.
+Vision adds its encoder weights, fixed workspace and request-transient buffers. Its context capacity
+has not been requalified after the bounded-prefill workspace change, so this README does not publish
+a numerical Vision limit. Requalify an explicit context against the current startup planner before
+using Vision on the 22GB card. Image/video expansion and text share the configured context, while
+merged Vision tokens also consume the model's media envelope. Vision remains opt-in; the default
+launcher uses the measured 245,760-token text profile and its persistent state cache.
 
 The 32,768-token default leaves more shared KV capacity available for concurrent work. Clients can
 still request up to the remaining context capacity explicitly: 4K–16K for ordinary tool work,
@@ -524,9 +437,11 @@ client must submit the same image or video again so NInfer can acquire it, deriv
 identity, and locate the snapshot. A media-preprocessing cache hit avoids repeated decode/resize
 work; a state-cache hit then skips Vision GPU encoding and model prefill for the matched prefix.
 
-Cache directories are separated by artifact and executable file identity, storage configuration
-and template. Rebuilding the executable or replacing weights invalidates old namespaces; budgets
-apply to the current namespace. Old incompatible namespaces are retained for manual removal.
+Cache directories are separated by artifact identity, explicit state ABI, storage configuration
+and template. A rebuild preserves cache compatibility when that ABI and configuration are unchanged.
+State layouts, codecs and persistent-state semantics require an ABI bump. The switch from executable
+identity to ABI identity creates one new namespace; older namespaces remain available for manual
+removal. Budgets apply to the current namespace.
 Startup reads descriptors only. Once a request has an admissible free lane, it compares the exact
 GPU-resident prefix first. It starts an asynchronous RAM/disk load only when a stored prefix is
 longer, avoiding disk materialization for an equal or better GPU hit.
@@ -558,11 +473,6 @@ avoiding the default driver's busy wait without a fixed sleep between decode rou
 `NINFER_CUDA_WAIT=spin` before starting the process to compare with busy waiting;
 `blocking` (or an unset value) selects the default. This changes host waiting only, leaving the
 GPU computation and request cancellation boundaries unchanged.
-On the dual E5-2690 v3 / RTX 2080 Ti host with driver 595.99.02, a controlled 20 ms
-asynchronous stream-completion test (40 interleaved samples per mode) reduced the waiting thread's
-CPU use from 100.0% to 0.35%. Median completion-to-return latency was 104 microseconds with
-blocking synchronization, versus 4 microseconds with spin and 952 microseconds with 1 ms polling.
-This measures host waiting overhead, not end-to-end model throughput.
 
 Turbo mode is disabled by default. Add `--turbo` to a starting action to request the card's tested
 280 W maximum and ensure the aggressive `nvidia-fan-curve.service` is active:

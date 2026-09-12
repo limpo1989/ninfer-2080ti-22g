@@ -95,6 +95,11 @@ NInfer 不支持 preemption，因此 request 只有在其 prompt、声明的最�
 和下一轮 batch 的唯一修改者。CPU preparation、request ingress 和 output I/O 可以并行，但不能直接
 推进模型状态。
 
+每个 Program 另拥有该 Variant 的 `LeafState`，并通过 execution context 和 TextContext 向执行叶
+传递引用。27B 的 SM75 大 prefill 矩阵乘上下文在这里拥有 cuBLAS handle；所有显式 GPU 暂存区
+来自 Program 的 workspace capacity planning，并在 Op 调用结束后复用。不同 Program 不共享
+handle、暂存区或权重副本。35B 当前的 LeafState 为空；family 不按目标或设备选择执行算法。
+
 ### 2.7 Bounded ingress and output
 
 Engine 与 HTTP server 都把 generation request lifetime 数量限制为

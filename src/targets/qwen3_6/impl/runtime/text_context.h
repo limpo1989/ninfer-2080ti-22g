@@ -151,7 +151,7 @@ class VisionPrefillSession;
 
 class TextContext {
 public:
-    TextContext(DeviceContext& ctx, const LoadedModelData& weights, WorkspaceArena& work,
+    TextContext(DeviceContext& ctx, const LoadedModelData& weights, WorkspaceArena& work, Variant::LeafState& leaf_state,
                 qwen3_6::PagedKVCacheView kv, LinearAttentionStatePool& state,
                 qwen3_6::RoundState& io, Tensor& prefill_hidden, std::uint32_t prefill_chunk,
                 std::uint32_t text_kv_base,
@@ -285,6 +285,7 @@ private:
     DeviceContext& ctx_;
     const LoadedModelData& weights_;
     WorkspaceArena& work_;
+    Variant::LeafState& leaf_state_;
     qwen3_6::PagedKVCacheView kv_;
     qwen3_6::PagedKVCacheView mtp_kv_;
     const qwen3_6::PagedKVCache* batch_text_kv_ = nullptr;

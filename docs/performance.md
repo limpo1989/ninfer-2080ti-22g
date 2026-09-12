@@ -1,5 +1,151 @@
 # Single-GPU serving performance
 
+## RTX 2080 Ti: measured optimization and remaining bounds
+
+The current SM75 implementation uses bounded Q4/Q5 prefill GEMM, Tensor Core KVarN PV,
+and shared-query KVarN decode. These changes target Qwen3.8-27B `groupwise-int` on one
+RTX 2080 Ti 22GB at **250 W with Turbo disabled**. They change execution and temporary
+arithmetic; persistent model/KVarN formats and the independent numerical criteria are unchanged.
+
+### Current real-request measurements
+
+The current deployment uses Qwen3.8-27B `groupwise-int`, KVarN, MTP3, a 1,024-token prefill
+chunk, startup concurrency two, temperature 0.6, presence penalty 1.0, seed 1234, and a 250 W
+GPU limit with Turbo disabled. Prefix reuse is disabled for cold measurements. Every point contains
+two complete runs and every run generated the full 256-token output. The first three requests use
+`preserve_thinking=false`; the longest preserves the recorded reasoning history.
+
+| Input tokens | Prefill run 1 | Prefill run 2 | Mean |
+|---:|---:|---:|---:|
+| 8,083 | 577.90 tok/s | 558.32 tok/s | **568.11 tok/s** |
+| 18,783 | 463.17 tok/s | 445.53 tok/s | **454.35 tok/s** |
+| 21,160 | 442.42 tok/s | 425.44 tok/s | **433.93 tok/s** |
+| 62,960 | 270.44 tok/s | 263.26 tok/s | **266.85 tok/s** |
+
+| Input tokens | Decode run 1 | Decode run 2 | Mean | MTP acceptance |
+|---:|---:|---:|---:|---:|
+| 8,083 | 26.27 tok/s | 25.31 tok/s | **25.79 tok/s** | 45.69% |
+| 18,783 | 22.33 tok/s | 21.46 tok/s | **21.89 tok/s** | 42.51% |
+| 21,160 | 22.08 tok/s | 21.28 tok/s | **21.68 tok/s** | 44.20% |
+| 62,960 | 17.10 tok/s | 17.02 tok/s | **17.06 tok/s** | 42.77% |
+
+The rates divide computed prefill tokens by prefill time and generated tokens after the first
+token by decode time. During active samples, average GPU utilization was 99.1%–99.9%, peak
+temperature was 76 C, host CPU idle stayed at or above 96%, and no other GPU process ran. A
+separate HTTP check after a process restart restored 8,039 of 8,043 input tokens from the disk
+state cache and returned the deterministic arithmetic answer `851`.
+Decode is an end-to-end workload result: prompt content and MTP acceptance also affect it, so these
+rows are observed throughput at each length rather than a length-only scaling law.
+
+The service was stopped during measurements. No compiler or other GPU inference process ran
+concurrently with the formal comparisons. The runner sampled GPU processes, clocks, temperature,
+power, memory and host load every two seconds; all formal runs passed the interference check and
+retained the 250 W limit. Clocks follow the normal power/temperature policy: forcing equal clocks
+would measure a different operating contract. Toolchain: CUDA 12.8.93, GCC 12.3, cuBLAS 12.1.3.1,
+NVIDIA driver 595.99.02. Model load and graph setup precede the reported request-phase times.
+
+### Why the prefill path changes
+
+The earlier fused kernels repeatedly unpack weights inside small CUDA tiles. A complete-Op
+control, inspired by FastLLM's bounded dequantization dispatch, established that a separate
+bounded FP16 weight slice plus vendor GEMM was faster even after including conversion,
+dequantization, temporary traffic and the public epilogue. The final implementation applies this
+to Q4 gate/up, Q5 down and output projections, and both Q4/Q5 input-projection families.
+
+Final complete-Op measurements at T=1024, repeated in forward/reverse shape order with no
+compilation or other GPU workload (table entries are the midpoint of the two run medians):
+
+| Op / weight shape | Previous | Bounded path | Throughput ratio |
+|---|---:|---:|---:|
+| Q4 gate/up `[34816,5120]` | 18.144 ms | 5.975 ms | 3.04x |
+| Q5 down `[5120,17408]` | 10.528 ms | 4.438 ms | 2.37x |
+| Q5 GDN/attention output `[5120,6144]` | 4.718 ms | 1.710 ms | 2.76x |
+| GDN Q4/Q5 input projection | 30.276 ms | 4.049 ms | 7.48x |
+| Attention Q4/Q5 input projection | 31.708 ms | 3.857 ms | 8.22x |
+
+The input-projection entries include both weight parents and all public output stores. They
+explain why the model gain exceeds the earlier attention-only improvement.
+
+Each Program owns its execution handle through the Variant's `LeafState`. The existing memory
+planner includes all explicit scratch; no global handle, shared mutable scratch, persistent FP16
+weight copy or second model instance is introduced. The weight slice is capped at 128 MiB and is
+reused within the call. A power-of-two scale per activation column protects BF16 range during FP16
+staging and is restored before the final output computation.
+
+Q4 gate/up uses the qualified vendor FP16 compute/output mode. Q5 residual and the GDN/attention
+input projections use FP32 accumulation/products. Their BF16 outputs are checked against the same
+independent complete-formula FP64 oracles as the previous implementations. Qualification includes
+real registered shapes, the 256-token admission boundary, 257-token graph capture, 1024/2048-token
+chunks, large/small/mixed activation magnitudes, full output writes, input guards and exact workspace
+extents. The public source contracts are in `include/ninfer/ops/`; `quantized_prefill.h` describes
+the resource-bearing entries.
+
+The GDN input projection measured about **30.3 ms** at T=1024 before this change, whereas the
+complete chunked GDN recurrence measured about **5.4 ms** (prepare 2.0, state passing 1.5,
+output 1.3 ms). Those measurements identify projection as the first useful GDN target. They do
+not justify attributing an entire GDN layer segment to recurrence or rewriting recurrence first.
+
+KVarN PV now assigns eight warps to two query groups and four output-dimension groups. Each warp
+holds a 16x64 FP32 accumulation tile. The 32-query implementation uses 178 registers/thread,
+39,040 shared bytes, and no stack/local spill. QK is computed once per key tile and FP32 LSE
+merges prefix and dense regions. See [KVarN records](maintainer/kvarn-records.md) for its complete
+Op and long-prefix numerical evidence.
+
+### Decode choices and rejected experiments
+
+The current MTP3 measurements range from 25.79 tok/s at 8,083 input tokens to 17.06 tok/s at
+62,960 input tokens. Acceptance percentage alone is not a throughput metric; context-dependent
+round time and the number of committed tokens both determine the observed rate.
+
+Rejected candidates are removed from production source:
+
+- Q5 small-T native MMA and warp-local split-K8 both passed their oracle but regressed badly.
+- Full FP16 Q5 accumulation failed the existing numerical criterion at T=1024. Bounded FP16
+  inner reductions at K=256/1024 were slower than the FP32 complete-Op control.
+- Distributing KVarN QK over eight warps passed the long-prefix oracle and reduced registers
+  from 178 to 173 without spills. Its additional score exchange and barriers yielded no stable
+  complete-Op gain in A/B/B/A (less than 1%); the two-QK-warp implementation is retained.
+- Single-query KVarN query reuse regressed and is excluded. The shared-query path applies to
+  2..127 queries, including speculative verification and short continuations.
+
+### Interpreting the remaining upper bound
+
+Count bytes and operations actually required by the chosen request phase. The registered ordinary
+text projections stream about **14.66 GiB per step**, including the full W8 vocabulary head.
+This count excludes unused Vision/MTP weights and the full embedding table, of which an ordinary
+step reads one row. At the previously measured 555 GB/s streaming bandwidth, weight scanning alone
+has a **28.4 ms floor, approximately 35.3 ordinary tokens/s**. Norm and convolution weights add less
+than 0.01 GiB. The [decode GEMV reference](maintainer/turing-decode-gemv.md) records the inventory
+and relevant short-context measurements.
+
+This is an optimistic weight-only ceiling under the existing storage, not a demonstrated attainable
+rate. KV scans, recurrent state, unpacking, synchronization and sampling consume additional time.
+The measured long-context rate remains materially below that loose ceiling; MTP has a different
+bound because one weight pass verifies several candidates and drafting adds its own cost. The
+current measurements establish substantial improvements, not global optimality.
+
+Persistent namespaces use the explicit state ABI, artifact identity and execution configuration;
+kernel-only rebuilds preserve that identity. Cache layout, codec or persistent-state semantic
+changes require an ABI bump. The current restart check restored 8,039/8,043 tokens from disk;
+the service logged `state_source=disk`, and a request with no hit logs `state_source=none`.
+
+### Relevant reference implementations
+
+FastLLM supplied the useful bounded-dequantization and shared-query scheduling ideas; its dual-card
+FP8/NVFP4 figures are not single-card Q4/Q5 measurements. The local vLLM SM75/Marlin implementations
+show native `m16n8k8`, staged loads and alternative packed layouts. Those layouts do not directly
+implement this artifact's Q5 row-split representation. FlashQLA's register-held GDN state is relevant,
+but NInfer already has recurrent and chunked state paths. llama.cpp's integer-MMA activation
+quantization introduces another numerical profile and cannot be treated as equivalent to these A16
+routes. No external engine's reported gain is substituted for NInfer's measured result.
+
+Cross-session sharing should be keyed by token-prefix identity and immutable checkpoints, with
+independent mutable GDN/tail state. It requires preserving the existing page ownership, media
+identity and Codex/DeepSeek protocol contracts. It is a separate cache-ownership change; the
+present speedup does not depend on implementing it.
+
+## RTX 5090 measurements
+
 Tested Git revisions:
 
 - Qwen3.8-27B NVFP4 MTP0 context-length serving:

@@ -8,6 +8,10 @@
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
 namespace {
 using SnapshotJson = nlohmann::json;
+// This is the persistent state ABI, including tensor order/dtypes, KVarN codec tables,
+// MTP commit interpretation and prefix/position semantics. Bump it when any of those change.
+// Instruction selection and unobservable intermediate arithmetic do not change this ABI.
+constexpr int kStateSnapshotAbi = 4;
 
 std::string snapshot_alias(std::uint32_t n, std::uint64_t hash) {
     std::ostringstream out;
@@ -89,7 +93,7 @@ std::shared_ptr<runtime::StateSnapshotImage> capture_image(ProgramImplCore& p, s
     }
     const auto main_pages = s.kv->text.mapped_page_count();
     const auto mtp_pages = s.kv->backend ? s.kv->backend->mapped_page_count() : 0U;
-    SnapshotJson j{{"version", 4},
+    SnapshotJson j{{"version", kStateSnapshotAbi},
                    {"execution", s.execution_frontier},
                    {"ledger_frontier", s.ledger_frontier},
                    {"text_valid", s.text_kv_valid},
@@ -137,11 +141,10 @@ void ProgramImplCore::configure_state_cache(const EngineOptions& options) {
         throw std::invalid_argument("state cache supports ordinary decode or MTP");
     }
     static_assert(std::endian::native == std::endian::little);
-    // Conservative cache namespace: an executable rebuild or artifact replacement invalidates
-    // existing images. No raw pointer, physical page ID, or CUDA Graph is persisted.
-    SnapshotJson identity{{"state_format", 4},
+    // ABI, immutable artifact identity and execution configuration define compatibility.
+    // No executable path/inode/timestamp, raw pointer, page ID or CUDA Graph is persisted.
+    SnapshotJson identity{{"state_format", kStateSnapshotAbi},
                           {"artifact", runtime::state_file_identity(options.artifact_path)},
-                          {"executable", runtime::state_file_identity("/proc/self/exe")},
                           {"sm", device.sm()},
                           {"capacity", capacity},
                           {"kv_storage", static_cast<int>(kv_storage)},
@@ -200,7 +203,7 @@ bool ProgramImplCore::restore_state(std::uint32_t lane, const PreparedPromptData
     bool mutated = false;
     try {
         const auto j = SnapshotJson::from_cbor(image.metadata);
-        if (j.at("version") != 4) return false;
+        if (j.at("version") != kStateSnapshotAbi) return false;
         auto ledger = j.at("ledger").get<std::vector<TokenId>>();
         const auto execution = j.at("execution").get<std::uint32_t>();
         const auto text_valid = j.at("text_valid").get<std::uint32_t>();

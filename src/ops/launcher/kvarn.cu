@@ -7,6 +7,7 @@
 #endif
 
 #include <algorithm>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
@@ -45,7 +46,8 @@ constexpr std::int32_t kKvarnChunkColumns      = 64;
 constexpr std::int32_t kKvarnBusyColumns       = 64;
 
 #if defined(NINFER_SM75)
-template <typename Spec, typename Geometry, int PrefixRows>
+template <typename Spec, typename Geometry, int PrefixRows, int Heads = 1,
+          int QueryTile = PrefixRows, bool TensorPv = false>
 void gqa_tc_prefill(const __nv_bfloat16* q, const __nv_bfloat16* k, const __nv_bfloat16* v,
                     const std::int32_t* positions, const std::int32_t* valid_columns,
                     const std::int32_t* table_rows, const std::int32_t* block_tables,
@@ -54,9 +56,10 @@ void gqa_tc_prefill(const __nv_bfloat16* q, const __nv_bfloat16* k, const __nv_b
                     const __nv_bfloat16* stage_k, const __nv_bfloat16* stage_v,
                     const std::uint8_t* records, float scale, const Tensor& prefix_acc,
                     const Tensor& prefix_max, const Tensor& prefix_sum, const Tensor& dense_max,
-                    const Tensor& dense_sum, __nv_bfloat16* out, cudaStream_t stream) {
+                    const Tensor& dense_sum, __nv_bfloat16* out, cudaStream_t stream,
+                    int splits = 1) {
     constexpr int DenseTile = KvarnPrefillTile<Geometry>::value;
-    static_assert(sizeof(KvarnTcPrefixShared<Spec, Geometry, PrefixRows>) <= 48 * 1024);
+    static_assert(sizeof(KvarnTcPrefixShared<Spec, Geometry, PrefixRows, TensorPv>) <= 48 * 1024);
     static_assert(sizeof(KvarnPrefillShared<Spec, Geometry, DenseTile>) <= 48 * 1024);
     auto* prefix          = static_cast<__nv_bfloat16*>(prefix_acc.data);
     auto* prefix_max_data = static_cast<float*>(prefix_max.data);
@@ -64,7 +67,8 @@ void gqa_tc_prefill(const __nv_bfloat16* q, const __nv_bfloat16* k, const __nv_b
     auto* dense_max_data  = static_cast<float*>(dense_max.data);
     auto* dense_sum_data  = static_cast<float*>(dense_sum.data);
 
-    auto* prefix_kernel        = kvarn_gqa_tc_prefix_kernel<Spec, Geometry, PrefixRows>;
+    auto* prefix_kernel =
+        kvarn_gqa_tc_prefix_kernel<Spec, Geometry, PrefixRows, Heads, QueryTile, TensorPv>;
     auto* dense_kernel         = kvarn_gqa_dense_prefill_kernel<Spec, Geometry, DenseTile>;
     static const bool carveout = [prefix_kernel, dense_kernel] {
         cudaFuncSetAttribute(prefix_kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
@@ -73,8 +77,8 @@ void gqa_tc_prefill(const __nv_bfloat16* q, const __nv_bfloat16* k, const __nv_b
     }();
     (void)carveout;
 
-    const dim3 prefix_grid(static_cast<unsigned>((query_columns + PrefixRows - 1) / PrefixRows),
-                           static_cast<unsigned>(Geometry::QHeads),
+    const dim3 prefix_grid(static_cast<unsigned>((query_columns + QueryTile - 1) / QueryTile),
+                           static_cast<unsigned>(Geometry::QHeads / Heads * splits),
                            static_cast<unsigned>(batch_size));
     prefix_kernel<<<prefix_grid, KvarnTcPrefixShared<Spec, Geometry, PrefixRows>::Threads, 0,
                     stream>>>(q, prefix, positions, valid_columns, table_rows, block_tables,
@@ -90,9 +94,15 @@ void gqa_tc_prefill(const __nv_bfloat16* q, const __nv_bfloat16* k, const __nv_b
 
     const dim3 merge_grid(static_cast<unsigned>(Geometry::QHeads),
                           static_cast<unsigned>(query_columns), static_cast<unsigned>(batch_size));
-    kvarn_merge_prefill_kernel<Spec, Geometry><<<merge_grid, Spec::HeadDim, 0, stream>>>(
-        prefix, prefix_max_data, prefix_sum_data, dense_max_data, dense_sum_data, query_columns,
-        out);
+    if constexpr (Heads == 1) {
+        kvarn_merge_prefill_kernel<Spec, Geometry><<<merge_grid, Spec::HeadDim, 0, stream>>>(
+            prefix, prefix_max_data, prefix_sum_data, dense_max_data, dense_sum_data, query_columns,
+            out);
+    } else {
+        kvarn_merge_query_splits_kernel<Spec, Geometry><<<merge_grid, Spec::HeadDim, 0, stream>>>(
+            prefix, prefix_max_data, prefix_sum_data, dense_max_data, dense_sum_data, query_columns,
+            splits, out);
+    }
 }
 #endif
 
@@ -130,17 +140,50 @@ void gqa_one(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& po
     const std::int32_t query_offset = width - query_columns;
 
 #if defined(NINFER_SM75)
-    if (query_columns >= kKvarnPrefillMinColumns) {
+    const int tc_splits = kvarn_attention_tc_splits(Geometry::QHeads, query_columns, batch_size);
+    if (tc_splits > 0) {
         // The compressed prefix is common to all queries in this call. Evaluate it with a
         // 32-row Tensor Core QK tile, evaluate the small dense region independently, then merge
         // their online-softmax states. The 48-row profile spills on SM75 and is slower.
-        gqa_tc_prefill<Spec, Geometry, 32>(
-            q_data, k_data, v_data, positions_data, valid_data, rows_data, tables_data, stride,
-            width, query_offset, query_columns, batch_size,
-            static_cast<const __nv_bfloat16*>(cache.stage_k.data),
-            static_cast<const __nv_bfloat16*>(cache.stage_v.data), record_data, scale, prefix_acc,
-            prefix_max, prefix_sum, dense_max, dense_sum, static_cast<__nv_bfloat16*>(out.data),
-            stream);
+        if (query_columns >= kKvarnPrefillMinColumns) {
+            static const bool tensor_pv = [] {
+                const char* value = std::getenv("NINFER_KVARN_TC_PV");
+                return value == nullptr || (value[0] == '1' && value[1] == '\0');
+            }();
+            if (tensor_pv) {
+                gqa_tc_prefill<Spec, Geometry, 32, 1, 32, true>(
+                    q_data, k_data, v_data, positions_data, valid_data, rows_data, tables_data, stride,
+                    width, query_offset, query_columns, batch_size,
+                    static_cast<const __nv_bfloat16*>(cache.stage_k.data),
+                    static_cast<const __nv_bfloat16*>(cache.stage_v.data), record_data, scale,
+                    prefix_acc, prefix_max, prefix_sum, dense_max, dense_sum,
+                    static_cast<__nv_bfloat16*>(out.data), stream);
+            } else {
+                gqa_tc_prefill<Spec, Geometry, 32>(
+                q_data, k_data, v_data, positions_data, valid_data, rows_data, tables_data, stride,
+                width, query_offset, query_columns, batch_size,
+                static_cast<const __nv_bfloat16*>(cache.stage_k.data),
+                static_cast<const __nv_bfloat16*>(cache.stage_v.data), record_data, scale,
+                prefix_acc, prefix_max, prefix_sum, dense_max, dense_sum,
+                static_cast<__nv_bfloat16*>(out.data), stream);
+            }
+        } else if (query_columns <= 2) {
+            gqa_tc_prefill<Spec, Geometry, 16, Geometry::GroupSize, 2>(
+                q_data, k_data, v_data, positions_data, valid_data, rows_data, tables_data, stride,
+                width, query_offset, query_columns, batch_size,
+                static_cast<const __nv_bfloat16*>(cache.stage_k.data),
+                static_cast<const __nv_bfloat16*>(cache.stage_v.data), record_data, scale,
+                prefix_acc, prefix_max, prefix_sum, dense_max, dense_sum,
+                static_cast<__nv_bfloat16*>(out.data), stream, tc_splits);
+        } else {
+            gqa_tc_prefill<Spec, Geometry, 32, Geometry::GroupSize, 4>(
+                q_data, k_data, v_data, positions_data, valid_data, rows_data, tables_data, stride,
+                width, query_offset, query_columns, batch_size,
+                static_cast<const __nv_bfloat16*>(cache.stage_k.data),
+                static_cast<const __nv_bfloat16*>(cache.stage_v.data), record_data, scale,
+                prefix_acc, prefix_max, prefix_sum, dense_max, dense_sum,
+                static_cast<__nv_bfloat16*>(out.data), stream, tc_splits);
+        }
 
         const dim3 append_grid(static_cast<unsigned>(Geometry::KVHeads),
                                static_cast<unsigned>(width), static_cast<unsigned>(batch_size));
@@ -297,6 +340,32 @@ void kvarn_decompress_launch(const Tensor& records, const Tensor& page_ids, Kvar
 
 std::int32_t kvarn_attention_chunk_columns(std::int32_t width) {
     return width < kKvarnChunkColumns ? width : kKvarnChunkColumns;
+}
+
+std::int32_t kvarn_attention_tc_splits(std::int32_t q_heads, std::int32_t query_columns,
+                                      std::int32_t batch_size) {
+#if defined(NINFER_SM75)
+    if (query_columns >= kKvarnPrefillMinColumns) { return 1; }
+    // A single query cannot amortize the shared tile. The measured scalar route is faster.
+    if (query_columns <= 1) { return 0; }
+    static const bool query_reuse = [] {
+        const char* value = std::getenv("NINFER_KVARN_TC_QUERY_REUSE");
+        return value == nullptr || (value[0] == '1' && value[1] == '\0');
+    }();
+    // Qualified against the FP64 oracle and repeated real-request MTP measurements.
+    if (!query_reuse) { return 0; }
+    const int kv_heads = q_heads == 24 ? 4 : 2;
+    const int tile = query_columns <= 2 ? 2 : 4;
+    const int blocks = kv_heads * ((query_columns + tile - 1) / tile) * batch_size;
+    // Two waves over the 68-SM TU102; short histories naturally produce empty splits.
+    // All page bounds are resolved on device, without a host read of sequence positions.
+    return std::min(kKvarnMaxSplits, (136 + blocks - 1) / blocks);
+#else
+    (void)q_heads;
+    (void)query_columns;
+    (void)batch_size;
+    return 0;
+#endif
 }
 
 std::int32_t kvarn_attention_splits(std::int32_t width, std::int32_t batch_size,

@@ -3,6 +3,8 @@
 #include "core/tensor.h"
 
 #include <cstdint>
+#include <cuda_runtime.h>
+#include <functional>
 #include <span>
 #include <string_view>
 
@@ -24,6 +26,9 @@ struct ShapeCase {
 
 bool cuda_available();
 
-int run_shape(std::string_view label, WeightFormat format, const ShapeCase& shape);
+using Candidate = std::function<void(const Tensor&, const Weight&, Tensor&, cudaStream_t)>;
+// Alternative fixtures share this mathematical oracle; they own their own scratch storage.
+int run_shape(std::string_view label, WeightFormat format, const ShapeCase& shape,
+              const Candidate& candidate = {});
 
 } // namespace ninfer::test::linear_add

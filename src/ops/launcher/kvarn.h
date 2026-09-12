@@ -24,6 +24,11 @@ std::int32_t kvarn_attention_splits(std::int32_t width, std::int32_t batch_size,
 
 std::int32_t kvarn_attention_chunk_columns(std::int32_t width);
 
+// Zero selects the scalar route. Small-query reuse remains opt-in pending whole-model evidence;
+// split count depends only on public shapes, keeping graph addresses/topology fixed.
+std::int32_t kvarn_attention_tc_splits(std::int32_t q_heads, std::int32_t query_columns,
+                                      std::int32_t batch_size);
+
 std::int32_t kvarn_compress_candidates(std::int32_t width);
 
 void kvarn_gqa_attention_launch(const Tensor& q, const Tensor& k, const Tensor& v,

@@ -37,7 +37,8 @@ namespace ninfer::ops {
  *   Writes the full qkv and z outputs; inputs and outputs must not alias.
  *
  * Workspace:
- *   No transient bytes are required.
+ *   This stateless entry requires no transient bytes. The SM75 Program-owned entry in
+ *   quantized_prefill.h reports bounded scratch for the same formula and A16 criterion.
  */
 void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
                     Tensor& qkv, Tensor& z, cudaStream_t stream);

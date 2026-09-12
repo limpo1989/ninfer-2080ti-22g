@@ -1,6 +1,9 @@
 #include "ninfer/ops/gdn_input_proj.h"
 
 #include "ops/input_projection_test_common.h"
+#include "ninfer/ops/quantized_prefill.h"
+#include "core/device.h"
+#include "core/decode_graph.h"
 
 #include <cuda_runtime.h>
 
@@ -53,7 +56,22 @@ int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_we
     Tensor x(device_activation.p, DType::BF16, {kHidden, tokens});
     Tensor output   = qkv.tensor();
     Tensor z_output = z.tensor();
-    ops::gdn_input_proj(x, query_key.view(), value_z_weight.view(), output, z_output, nullptr);
+    DeviceContext device(0);
+    ops::QuantizedPrefillContext context;
+    const auto bytes=ops::QuantizedPrefillContext::gdn_workspace_capacity_bytes(tokens);
+    WorkspaceArena workspace(std::max<std::size_t>(bytes,256));
+    const auto launch = [&] { context.gdn_input_proj(x,query_key.view(),value_z_weight.view(),output,z_output,workspace,device.stream); };
+    if (tokens == 257) {
+        DecodeGraphDefinition definition;
+        definition.capture(device.stream,launch);
+        DecodeGraphExecutable graph;
+        graph.instantiate(definition);
+        graph.launch(device.stream);
+        device.synchronize();
+    } else { launch(); device.synchronize(); }
+    if (workspace.used()!=0 || workspace.peak_used()!=bytes) {
+        throw std::runtime_error("input projection workspace extent mismatch");
+    }
     cuda_synchronize();
 
     const std::string suffix = " Q4/Q5 A16 T=" + std::to_string(tokens);
@@ -80,13 +98,16 @@ int run_q4_q5() {
     DevicePackedWeight value_z_weight(
         quantized_weight::make_patterned_weight(QType::Q5G64_F16S, 12288, kHidden, 419U));
     int failures = 0;
-    for (const std::int32_t tokens : {1, 2, 16, 17, 128, 129, 1024}) {
+    for (const std::int32_t tokens : {1, 2, 16, 17, 128, 129, 255, 256, 257, 1024}) {
         failures += run_q4_q5_case(query_key, value_z_weight, tokens);
     }
     failures += run_q4_q5_case(query_key, value_z_weight, 128, 0x1p30F);
     failures += run_q4_q5_case(query_key, value_z_weight, 128, 0x1p-30F);
     failures += run_q4_q5_case(query_key, value_z_weight, 128, 0x1p-16F);
     failures += run_q4_q5_case(query_key, value_z_weight, 129, 1.0F, true);
+    failures += run_q4_q5_case(query_key,value_z_weight,256,0x1p30F);
+    failures += run_q4_q5_case(query_key,value_z_weight,256,0x1p-30F);
+    failures += run_q4_q5_case(query_key,value_z_weight,257,1.0F,true);
     return failures;
 }
 

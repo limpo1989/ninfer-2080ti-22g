@@ -102,13 +102,15 @@ std::size_t post_mixer_workspace_bytes(QType gate_up_qtype, QType down_qtype,
     (void)layout.alloc(DType::BF16, {TextConfig::intermediate, last});
     {
         auto scope = layout.scope();
-        (void)layout.alloc_bytes(ops::linear_swiglu_workspace_capacity_bytes(
-            gate_up_qtype, 2 * TextConfig::intermediate, TextConfig::hidden, policy, first, last));
+        (void)layout.alloc_bytes(std::max(ops::linear_swiglu_workspace_capacity_bytes(
+            gate_up_qtype, 2 * TextConfig::intermediate, TextConfig::hidden, policy, first, last),
+            Variant::LeafState::workspace_capacity_bytes(gate_up_qtype, 2 * TextConfig::intermediate, TextConfig::hidden, last)));
     }
     {
         auto scope = layout.scope();
-        (void)layout.alloc_bytes(ops::linear_add_workspace_capacity_bytes(
-            down_qtype, TextConfig::hidden, TextConfig::intermediate, policy, first, last));
+        (void)layout.alloc_bytes(std::max(ops::linear_add_workspace_capacity_bytes(
+            down_qtype, TextConfig::hidden, TextConfig::intermediate, policy, first, last),
+            Variant::LeafState::workspace_capacity_bytes(down_qtype, TextConfig::hidden, TextConfig::intermediate, last)));
     }
     return layout.peak_bytes(1);
 }
@@ -155,13 +157,13 @@ std::vector<GraphExecutionProfile> Variant::dflash_graph_profiles(std::uint32_t,
     return {};
 }
 
-void Variant::attention_projection(const Tensor& hidden,
+void Variant::attention_projection(LeafState& state, const Tensor& hidden,
                                    const FullAttentionProjectionWeights& weights, Tensor& query,
                                    Tensor& gate, Tensor& key, Tensor& value, qwen3_6::TextPhase,
                                    WorkspaceArena& workspace, cudaStream_t stream) {
     if (const auto* split = std::get_if<SplitAttentionProjectionPayload>(&weights)) {
-        ops::attn_input_proj(hidden, split->query_key, split->gate_value, query, gate, key, value,
-                             stream);
+        state.attention_input_proj(hidden, split->query_key, split->gate_value, query, gate, key,
+                                   value, workspace, stream);
         return;
     }
     const Weight& fused = std::get<FusedAttentionProjectionPayload>(weights).query_key_gate_value;
@@ -169,9 +171,13 @@ void Variant::attention_projection(const Tensor& hidden,
                          stream);
 }
 
-void Variant::attention_output_projection(const Tensor& attention, const Weight& weight,
+void Variant::attention_output_projection(LeafState& state, const Tensor& attention, const Weight& weight,
                                           Tensor& residual, qwen3_6::TextPhase,
                                           WorkspaceArena& workspace, cudaStream_t stream) {
+    if (LeafState::admits(weight.qtype,weight.n,weight.k,attention.ne[1])) {
+        state.run(attention,weight,residual,workspace,stream);
+        return;
+    }
     ops::linear_add(attention, weight, residual, text_policy(weight), workspace, stream);
 }
 
@@ -202,15 +208,15 @@ void Variant::mtp_q_gate_projection(const Tensor& hidden,
     ops::linear(hidden, weights.output_gate, gate, stream);
 }
 
-void Variant::gdn_input_projection(const Tensor& hidden, const GdnProjectionWeights& weights,
+void Variant::gdn_input_projection(LeafState& state, const Tensor& hidden, const GdnProjectionWeights& weights,
                                    Tensor& qkv, Tensor& output_gate, qwen3_6::TextPhase,
                                    WorkspaceArena& workspace, cudaStream_t stream) {
     Tensor output_gate_flat =
         output_gate.view({TextConfig::value_dim, static_cast<int>(hidden.ne[1])});
     if (const auto* split =
             std::get_if<SplitGdnInputProjectionPayload>(&weights.input_projection)) {
-        ops::gdn_input_proj(hidden, split->query_key, split->value_z, qkv, output_gate_flat,
-                            stream);
+        state.gdn_input_proj(hidden, split->query_key, split->value_z, qkv, output_gate_flat,
+                             workspace, stream);
         return;
     }
     const Weight& fused =
@@ -268,9 +274,13 @@ void Variant::gdn_input_projection_record(const Tensor& hidden, const GdnProject
                                     text_policy(fused), leaf_workspace, stream);
 }
 
-void Variant::gdn_output_projection(const Tensor& hidden, const Weight& weight, Tensor& residual,
+void Variant::gdn_output_projection(LeafState& state, const Tensor& hidden, const Weight& weight, Tensor& residual,
                                     qwen3_6::TextPhase, WorkspaceArena& workspace,
                                     cudaStream_t stream) {
+    if (LeafState::admits(weight.qtype, weight.n, weight.k, hidden.ne[1])) {
+        state.run(hidden, weight, residual, workspace, stream);
+        return;
+    }
     ops::linear_add(hidden, weight, residual, text_policy(weight), workspace, stream);
 }
 
@@ -291,14 +301,22 @@ void Variant::gdn_norm_control_projection(const Tensor& residual, const Tensor& 
                               workspace, hidden, g, beta, stream);
 }
 
-void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
+void Variant::post_mixer(LeafState& state, const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
                          qwen3_6::TextPhase, WorkspaceArena& workspace, cudaStream_t stream) {
     auto scope        = workspace.scope();
     Tensor activation = workspace.alloc(DType::BF16, {TextConfig::intermediate, hidden.ne[1]});
-    ops::linear_swiglu(hidden, weights.gate_up, activation, text_policy(weights.gate_up), workspace,
-                       stream);
-    ops::linear_add(activation, weights.down, residual, text_policy(weights.down), workspace,
-                    stream);
+    if (LeafState::admits(weights.gate_up.qtype, weights.gate_up.n, weights.gate_up.k, hidden.ne[1])) {
+        state.run(hidden, weights.gate_up, activation, workspace, stream);
+    } else {
+        ops::linear_swiglu(hidden, weights.gate_up, activation, text_policy(weights.gate_up),
+                           workspace, stream);
+    }
+    if (LeafState::admits(weights.down.qtype, weights.down.n, weights.down.k, hidden.ne[1])) {
+        state.run(activation, weights.down, residual, workspace, stream);
+    } else {
+        ops::linear_add(activation, weights.down, residual, text_policy(weights.down), workspace,
+                        stream);
+    }
 }
 
 void Variant::mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& weights,
@@ -344,7 +362,7 @@ std::size_t Variant::attention_projection_workspace_capacity_bytes(WeightsProfil
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
-        return 0;
+        return LeafState::attention_workspace_capacity_bytes(last);
     case WeightsProfile::Qwen36Nvfp4:
         return ops::attn_input_proj_workspace_capacity_bytes(
             QType::NVFP4, 14336, TextConfig::hidden, kNvfp4TextPolicy, first, last);
@@ -361,9 +379,11 @@ std::size_t Variant::attention_output_projection_workspace_capacity_bytes(
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
-        return ops::linear_add_workspace_capacity_bytes(QType::Q5G64_F16S, TextConfig::hidden,
-                                                        TextConfig::query_size,
-                                                        ops::LinearPolicy::A16Only, first, last);
+        return std::max(ops::linear_add_workspace_capacity_bytes(QType::Q5G64_F16S,
+                            TextConfig::hidden, TextConfig::query_size,
+                            ops::LinearPolicy::A16Only, first, last),
+                        LeafState::workspace_capacity_bytes(QType::Q5G64_F16S,TextConfig::hidden,
+                            TextConfig::query_size,last));
     case WeightsProfile::Qwen36Nvfp4:
         return ops::linear_add_workspace_capacity_bytes(QType::NVFP4, TextConfig::hidden,
                                                         TextConfig::query_size, kNvfp4TextPolicy,
@@ -384,7 +404,7 @@ std::size_t Variant::gdn_input_projection_workspace_capacity_bytes(WeightsProfil
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
-        return 0;
+        return LeafState::gdn_workspace_capacity_bytes(last);
     case WeightsProfile::Qwen36Nvfp4:
         return ops::gdn_input_proj_workspace_capacity_bytes(QType::NVFP4, 16384, TextConfig::hidden,
                                                             kNvfp4TextPolicy, first, last);
@@ -453,9 +473,10 @@ std::size_t Variant::gdn_output_projection_workspace_capacity_bytes(WeightsProfi
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
-        return ops::linear_add_workspace_capacity_bytes(QType::Q5G64_F16S, TextConfig::hidden,
-                                                        TextConfig::value_dim,
-                                                        ops::LinearPolicy::A16Only, first, last);
+        return std::max(ops::linear_add_workspace_capacity_bytes(QType::Q5G64_F16S, TextConfig::hidden,
+                            TextConfig::value_dim, ops::LinearPolicy::A16Only, first, last),
+                        LeafState::workspace_capacity_bytes(QType::Q5G64_F16S, TextConfig::hidden,
+                            TextConfig::value_dim, last));
     case WeightsProfile::Qwen36Nvfp4:
         return ops::linear_add_workspace_capacity_bytes(
             QType::NVFP4, TextConfig::hidden, TextConfig::value_dim, kNvfp4TextPolicy, first, last);

@@ -239,7 +239,7 @@ void validate_profile(const Profile& profile) {
 } // namespace
 
 int run_profile(std::string_view label, const Profile& profile,
-                std::span<const std::int32_t> token_cases) {
+                std::span<const std::int32_t> token_cases, const Candidate& candidate) {
     validate_profile(profile);
     if (token_cases.empty()) { throw std::invalid_argument("linear_swiglu test: no token cases"); }
     if (!cuda_available()) {
@@ -297,7 +297,8 @@ int run_profile(std::string_view label, const Profile& profile,
         workspace.reset_peak();
         const std::string case_label = std::string(label) + " T=" + std::to_string(tokens);
         try {
-            ops::linear_swiglu(x, weight, destination, policy, workspace, nullptr);
+            if (candidate) { candidate(x, weight, destination, nullptr); }
+            else { ops::linear_swiglu(x, weight, destination, policy, workspace, nullptr); }
             test::cuda_check(cudaDeviceSynchronize(), "synchronize LinearSwiGLU");
         } catch (const std::exception& error) {
             std::cerr << case_label << ": unexpected exception: " << error.what() << '\n';
@@ -306,7 +307,7 @@ int run_profile(std::string_view label, const Profile& profile,
         }
         const std::size_t exact_workspace = ops::linear_swiglu_workspace_capacity_bytes(
             profile.qtype, profile.gate_up_rows, profile.input_rows, policy, tokens, tokens);
-        if (workspace.used() != 0 || workspace.peak_used() != exact_workspace) {
+        if (workspace.used() != 0 || (!candidate && workspace.peak_used() != exact_workspace)) {
             std::cerr << case_label << ": exact workspace query/execution high-water mismatch\n";
             ++failures;
         }

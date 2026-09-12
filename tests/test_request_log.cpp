@@ -273,6 +273,21 @@ int main() {
     outcome.metrics.speculative_fallback_steps  = 2;
     outcome.metrics.speculative_accepted_per_position = {290, 240, 190};
 
+    {
+        auto cache_outcome = outcome;
+        for (int source : {0, 1, 2}) {
+            cache_outcome.metrics.state_cache_source = static_cast<std::uint8_t>(source);
+            cache_outcome.metrics.prefix_cache_hit_tokens = 0;
+            failures += check(format_request_done(context, cache_outcome).find(" state_source=none ") !=
+                                  std::string::npos,
+                              "cache miss was labelled as a restored/resident hit");
+            cache_outcome.metrics.prefix_cache_hit_tokens = 101;
+            const std::string expected = source == 0 ? "resident" : source == 1 ? "ram" : "disk";
+            failures += check(format_request_done(context, cache_outcome).find(" state_source=" + expected + " ") !=
+                                  std::string::npos,
+                              "cache hit lost its actual state source");
+        }
+    }
     const Json done = Json::parse(format_request_done_json("serve-test", 3000, context, outcome));
     failures +=
         check(done.at("result").at("finish_reason") == "output_limit", "finish reason missing");

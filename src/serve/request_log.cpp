@@ -401,7 +401,9 @@ std::string format_request_done(const RequestLogContext& context,
         << " prefill=" << rate(computed_prefill_tokens, metrics.prefill_seconds)
         << " decode=" << rate(decode_tokens, metrics.decode_seconds)
         << " wall=" << seconds_str(metrics.total_seconds)
-        << " state_source=" << (metrics.state_cache_source == 1 ? "ram" : metrics.state_cache_source == 2 ? "disk" : "resident")
+        << " state_source=" << (metrics.prefix_cache_hit_tokens == 0 ? "none" :
+                                metrics.state_cache_source == 1 ? "ram" :
+                                metrics.state_cache_source == 2 ? "disk" : "resident")
         << " restore=" << seconds_str(metrics.state_restore_seconds)
         << " speculative=" << speculative_str(metrics);
     return out.str();

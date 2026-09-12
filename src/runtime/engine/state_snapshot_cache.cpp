@@ -167,6 +167,25 @@ struct StateSnapshotCache::Impl {
             lru.erase(e->lru); it = entries.erase(it);
         }
     }
+    bool reserve_disk(std::size_t incoming_bytes) {
+        if (incoming_bytes > disk_limit) return false;
+        const auto fits = [&] {
+            if (disk_bytes > disk_limit - incoming_bytes) return false;
+            std::error_code ec;
+            const auto space = std::filesystem::space(directory, ec);
+            return !ec && space.available >= incoming_bytes;
+        };
+        for (auto it = lru.rbegin(); it != lru.rend() && !fits(); ++it) {
+            auto& e = entries.at(*it);
+            if (!e->disk || e->dirty) continue;
+            std::error_code ec;
+            if (std::filesystem::remove(directory / (e->descriptor.key + ".snap"), ec)) {
+                disk_bytes -= e->descriptor.file_bytes();
+                e->disk = false;
+            }
+        }
+        return fits();
+    }
     bool reserve_ram(std::size_t bytes) {
         if (bytes > ram_limit) return false;
         for (auto it = lru.rbegin(); it != lru.rend() && ram_bytes > ram_limit - bytes; ++it) {
@@ -182,6 +201,12 @@ struct StateSnapshotCache::Impl {
         const auto metadata = Json::to_cbor(Json{{"compatibility", compatibility}, {"key", image->key},
                                      {"aliases", image->aliases}, {"metadata", Json::binary(image->metadata)}});
         Header h{kMagic, metadata.size(), image->payload.size(), crc(metadata), crc(image->payload)};
+        {
+            std::lock_guard lock(mutex);
+            if (!reserve_disk(sizeof(Header) + metadata.size() + image->payload.size())) {
+                throw std::runtime_error("state cache disk budget or filesystem space exhausted");
+            }
+        }
         std::string temporary = (directory / ".pending-XXXXXX").string();
         int fd = ::mkstemp(temporary.data());
         if (fd < 0) throw std::runtime_error("cannot create state cache temporary file");

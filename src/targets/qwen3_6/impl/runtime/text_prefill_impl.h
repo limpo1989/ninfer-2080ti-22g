@@ -56,7 +56,7 @@ void configure_text_card(TextContext& card, const ExecutionCore& execution,
 PrefillChunkResult prefill_text_chunk(
     PrefillContext& state, std::span<const TokenId> ids, std::uint32_t nominal_length,
     std::optional<std::uint32_t> rewrite_checkpoint_capture_frontier, bool finalize_at_end) {
-    TextContext card(state.execution.device, state.execution.model, state.execution.work,
+    TextContext card(state.execution.device, state.execution.model, state.execution.work, state.execution.leaf_state,
                      state.text_kv, state.execution.linear_attention, state.execution.io,
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
                      state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache);
@@ -84,7 +84,7 @@ prefill_multimodal_chunk(PrefillContext& state, const PreparedPromptData& prompt
     if (state.dflash != nullptr) {
         throw std::logic_error("DFlash staged multimodal prefill is unavailable");
     }
-    TextContext card(state.execution.device, state.execution.model, state.execution.work,
+    TextContext card(state.execution.device, state.execution.model, state.execution.work, state.execution.leaf_state,
                      state.text_kv, state.execution.linear_attention, state.execution.io,
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
                      state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache);

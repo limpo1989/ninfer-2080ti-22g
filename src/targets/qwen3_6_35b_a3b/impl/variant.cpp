@@ -124,14 +124,14 @@ std::vector<GraphExecutionProfile> Variant::dflash_graph_profiles(std::uint32_t 
     return profiles;
 }
 
-void Variant::attention_projection(const Tensor& hidden,
+void Variant::attention_projection(LeafState&, const Tensor& hidden,
                                    const FullAttentionProjectionWeights& weights, Tensor& query,
                                    Tensor& gate, Tensor& key, Tensor& value, qwen3_6::TextPhase,
                                    WorkspaceArena&, cudaStream_t stream) {
     ops::attn_input_proj(hidden, weights.query_key_gate_value, query, gate, key, value, stream);
 }
 
-void Variant::attention_output_projection(const Tensor& attention, const Weight& weight,
+void Variant::attention_output_projection(LeafState&, const Tensor& attention, const Weight& weight,
                                           Tensor& residual, qwen3_6::TextPhase,
                                           WorkspaceArena& workspace, cudaStream_t stream) {
     ops::linear_add(attention, weight, residual, workspace, stream);
@@ -164,7 +164,7 @@ void Variant::mtp_q_gate_projection(const Tensor& hidden,
     ops::attn_input_proj(hidden, weights.query_key_gate_value, query, gate, key, value, stream);
 }
 
-void Variant::gdn_input_projection(const Tensor& hidden, const GdnProjectionWeights& weights,
+void Variant::gdn_input_projection(LeafState&, const Tensor& hidden, const GdnProjectionWeights& weights,
                                    Tensor& qkv, Tensor& output_gate, qwen3_6::TextPhase,
                                    WorkspaceArena&, cudaStream_t stream) {
     Tensor output_gate_flat =
@@ -198,7 +198,7 @@ void Variant::gdn_input_projection_record(const Tensor& hidden, const GdnProject
                                     output_gate_view, leaf_workspace, stream);
 }
 
-void Variant::gdn_output_projection(const Tensor& hidden, const Weight& weight, Tensor& residual,
+void Variant::gdn_output_projection(LeafState&, const Tensor& hidden, const Weight& weight, Tensor& residual,
                                     qwen3_6::TextPhase, WorkspaceArena& workspace,
                                     cudaStream_t stream) {
     ops::linear_add(hidden, weight, residual, workspace, stream);
@@ -212,7 +212,7 @@ void Variant::gdn_norm_control_projection(const Tensor& residual, const Tensor& 
                               weights.dt_bias, workspace, hidden, g, beta, stream);
 }
 
-void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
+void Variant::post_mixer(LeafState&, const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
                          qwen3_6::TextPhase, WorkspaceArena& workspace, cudaStream_t stream) {
     run_sparse_moe(hidden, weights.op, residual, workspace, stream);
 }
