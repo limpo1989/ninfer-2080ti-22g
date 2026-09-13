@@ -9,10 +9,10 @@ from tools.bench.run_serve_corpus import (
 )
 
 
-def test_request_log_v12_identity_is_accepted() -> None:
+def test_request_log_v13_identity_is_accepted() -> None:
     current = {
         "artifact_type": "ninfer_serve_request_log",
-        "schema_version": 12,
+        "schema_version": 13,
         "event": "server_start",
     }
     require_server_log_identity(current, "server_start")

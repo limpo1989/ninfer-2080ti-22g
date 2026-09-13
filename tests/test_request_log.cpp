@@ -365,12 +365,18 @@ int main() {
     throughput.scheduler.prefill_prompt_tokens    = 10000;
     throughput.scheduler.prefill_reused_tokens    = 2000;
     throughput.scheduler.prefill_processed_tokens = 4096;
+    throughput.scheduler.decode_request_id         = 18;
+    throughput.scheduler.decode_prompt_tokens      = 10000;
+    throughput.scheduler.decode_generated_tokens   = 128;
+    throughput.scheduler.decode_output_limit       = 1000;
     const std::string human_throughput            = format_throughput(throughput);
     failures += check(
         human_throughput.find("prefill=50.0tok/s") != std::string::npos &&
             human_throughput.find("decode=20.0tok/s") != std::string::npos &&
             human_throughput.find("prefill_id=17 prefill_prompt=10000 ") != std::string::npos &&
             human_throughput.find("prefill_reused=2000 prefill_done=4096") != std::string::npos &&
+            human_throughput.find("decode_id=18 decode_prompt=10000 decode_done=128 decode_limit=1000") !=
+                std::string::npos &&
             human_throughput.find("avg_decode_batch=1.80") != std::string::npos,
         "human throughput report mismatch");
     const Json throughput_json =
@@ -386,11 +392,21 @@ int main() {
                           throughput_json.at("prefill_progress").at("reused_tokens") == 2000 &&
                           throughput_json.at("prefill_progress").at("processed_tokens") == 4096,
                       "throughput prefill progress mismatch");
+    failures += check(throughput_json.at("decode_progress").at("request_id") == 18 &&
+                          throughput_json.at("decode_progress").at("prompt_tokens") == 10000 &&
+                          throughput_json.at("decode_progress").at("generated_tokens") == 128 &&
+                          throughput_json.at("decode_progress").at("output_limit") == 1000,
+                      "throughput decode progress mismatch");
     throughput.scheduler.prefilling_requests = 0;
     failures += check(Json::parse(format_throughput_json("serve-test", 5001, throughput))
                           .at("prefill_progress")
                           .is_null(),
                       "idle throughput report retained prefill progress");
+    throughput.scheduler.decode_ready_requests = 0;
+    failures += check(Json::parse(format_throughput_json("serve-test", 5002, throughput))
+                          .at("decode_progress")
+                          .is_null(),
+                      "idle throughput report retained decode progress");
 
     const std::string console_prefix =
         format_console_log_prefix(std::chrono::system_clock::time_point{}, ConsoleLogLevel::Info);

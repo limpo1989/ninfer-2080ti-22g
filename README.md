@@ -37,7 +37,7 @@ service restart. This test establishes disk restore behavior for the current nam
 
 ### Enable and inspect
 
-The deployment launcher enables **4 GiB RAM + 8 GiB disk** by default, allocating memory on demand:
+The deployment launcher enables **8 GiB RAM + 50 GiB disk** by default, allocating memory on demand:
 
 ```bash
 # Configure larger budgets; values are in MiB. Choose a disk with sufficient free space.
@@ -398,8 +398,9 @@ The launcher also accepts `--tool-replay-cache-mib N`, for example
 `./deploy/restart-ninfer.sh restart --tool-replay-cache-mib 2048`, or the
 `NINFER_TOOL_REPLAY_CACHE_MIB` environment variable (default `1024`). The command-line value takes
 precedence, and the selected budget appears in the watch header. The Responses object/context store
-has its own separate limits. The launcher enables retained-state caching with 4 GiB RAM
-and 8 GiB disk under `$BUNDLE_ROOT/state-cache`. Override with `NINFER_STATE_CACHE_DIR`,
+has its own separate limits. The launcher enables retained-state caching with 8 GiB RAM
+and 50 GiB disk under `/data/ninfer-state-cache` when that data volume is available, falling back
+to `$BUNDLE_ROOT/state-cache` otherwise. Override with `NINFER_STATE_CACHE_DIR`,
 `NINFER_STATE_CACHE_RAM_MIB`, and `NINFER_STATE_CACHE_MAX_MIB`, or the corresponding
 `--state-cache-dir`, `--state-cache-ram-mib`, and `--state-cache-max-mib` flags. State capture waits
 for 1,000 ms of complete Engine idleness by default. Override it with

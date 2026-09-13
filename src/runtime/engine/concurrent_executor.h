@@ -222,10 +222,24 @@ private:
             snapshot.prefill_reused_tokens    = request->prefill_reused_tokens;
             snapshot.prefill_processed_tokens = request->prefill_processed_tokens;
         }
+        bool decode_progress_set = false;
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] == nullptr) { continue; }
             ++snapshot.running_requests;
-            if (slots_[lane]->decode_ready) { ++snapshot.decode_ready_requests; }
+            if (!slots_[lane]->decode_ready) { continue; }
+            ++snapshot.decode_ready_requests;
+            if (decode_progress_set) { continue; }
+            const auto& request = slots_[lane];
+            if (!request->budget) {
+                throw std::logic_error("decode-ready request has no generation budget");
+            }
+            snapshot.decode_request_id       = request->id;
+            snapshot.decode_prompt_tokens    = request->prefill_prompt_tokens;
+            snapshot.decode_generated_tokens =
+                static_cast<std::uint32_t>(request->generated.size());
+            snapshot.decode_output_limit =
+                snapshot.decode_generated_tokens + request->budget->remaining();
+            decode_progress_set = true;
         }
         std::lock_guard lock(stats_mutex_);
         published_stats_ = snapshot;

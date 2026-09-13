@@ -487,6 +487,12 @@ struct RuntimeStats {
     std::uint32_t prefill_prompt_tokens    = 0;
     std::uint32_t prefill_reused_tokens    = 0;
     std::uint32_t prefill_processed_tokens = 0;
+    // The lowest-lane decode-ready request is exposed for live progress dashboards. The
+    // generated count includes the first token licensed by prefill; all are zero when idle.
+    std::uint64_t decode_request_id       = 0;
+    std::uint32_t decode_prompt_tokens    = 0;
+    std::uint32_t decode_generated_tokens = 0;
+    std::uint32_t decode_output_limit     = 0;
 };
 
 struct LoadSummary {

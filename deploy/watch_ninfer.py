@@ -181,6 +181,7 @@ class WatchState:
         self.rows: deque[Row] = deque(maxlen=100)
         self.running: str = "-"
         self.prefilling: str = "-"
+        self.decode_ready: str = "-"
         self.waiting: str = "-"
         self.prefill_request_id: int | None = None
         self.prefill_prompt: int | None = None
@@ -188,6 +189,12 @@ class WatchState:
         self.prefill_done: int | None = None
         self.prefill_interval_rate: float | None = None
         self.prefill_rate_window: deque[tuple[int, float]] = deque()
+        self.decode_request_id: int | None = None
+        self.decode_prompt: int | None = None
+        self.decode_generated: int | None = None
+        self.decode_limit: int | None = None
+        self.decode_interval_rate: float | None = None
+        self.decode_rate_window: deque[tuple[int, float]] = deque()
 
     def _clear_prefill_progress(self) -> None:
         self.prefill_request_id = None
@@ -231,13 +238,57 @@ class WatchState:
             return self.prefill_interval_rate
         return sum(item[0] for item in self.prefill_rate_window) / seconds
 
+    def _clear_decode_progress(self) -> None:
+        self.decode_request_id = None
+        self.decode_prompt = None
+        self.decode_generated = None
+        self.decode_limit = None
+        self.decode_rate_window.clear()
+
+    def _feed_decode_progress(self, fields: dict[str, str]) -> None:
+        self.decode_interval_rate = numeric(fields.get("decode"), "tok/s")
+        if self.decode_ready != "1":
+            self._clear_decode_progress()
+            return
+        values = [numeric(fields.get(name)) for name in
+                  ("decode_id", "decode_prompt", "decode_done", "decode_limit")]
+        if any(value is None for value in values):
+            self._clear_decode_progress()
+            return
+        request_id, prompt, generated, limit = (int(value) for value in values)
+        if generated > limit or limit == 0:
+            self._clear_decode_progress()
+            return
+        interval = numeric(fields.get("interval"), "s")
+        if request_id != self.decode_request_id:
+            self.decode_rate_window.clear()
+            if interval and self.decode_interval_rate is not None:
+                interval_tokens = min(generated, round(self.decode_interval_rate * interval))
+                self.decode_rate_window.append((interval_tokens, interval))
+        elif self.decode_generated is not None and generated >= self.decode_generated and interval:
+            self.decode_rate_window.append((generated - self.decode_generated, interval))
+        while len(self.decode_rate_window) > 1 and sum(item[1] for item in self.decode_rate_window) > 30:
+            self.decode_rate_window.popleft()
+        self.decode_request_id = request_id
+        self.decode_prompt = prompt
+        self.decode_generated = generated
+        self.decode_limit = limit
+
+    def decode_rolling_rate(self) -> float | None:
+        seconds = sum(item[1] for item in self.decode_rate_window)
+        if seconds <= 0:
+            return self.decode_interval_rate
+        return sum(item[0] for item in self.decode_rate_window) / seconds
+
     def feed(self, line: str) -> Row | None:
         if "throughput interval=" in line:
             fields = dict(FIELDS.findall(line))
             self.running = fields.get("running", "-")
             self.prefilling = fields.get("prefilling", "-")
+            self.decode_ready = fields.get("decode_ready", "-")
             self.waiting = fields.get("waiting", "-")
             self._feed_prefill_progress(fields)
+            self._feed_decode_progress(fields)
         row = parse_request(line)
         if row:
             self.rows.append(row)
@@ -407,6 +458,8 @@ def launch_lines(args: argparse.Namespace) -> list[str]:
                      f"Prefill chunk {args.prefill_chunk}")
     if args.tool_replay_cache_mib is not None:
         lines.append(f"Replay cache {args.tool_replay_cache_mib:,} MiB")
+    if getattr(args, "state_cache_dir", None):
+        lines.append(f"State cache dir {args.state_cache_dir}")
     if getattr(args, "state_cache_max_mib", 0):
         lines.append(f"State cache RAM {args.state_cache_ram_mib:,} MiB / "
                      f"disk {args.state_cache_max_mib:,} MiB / "
@@ -450,6 +503,27 @@ def prefill_status(state: WatchState) -> str:
     return " | ".join(parts)
 
 
+def decode_status(state: WatchState) -> str:
+    if state.decode_ready != "1":
+        return ""
+    rate_value = state.decode_rolling_rate()
+    if (state.decode_request_id is None or state.decode_prompt is None or
+            state.decode_generated is None or state.decode_limit is None):
+        return ("Decode active" if rate_value is None else
+                f"Decode active | Interval {rate_value:.1f} tok/s")
+    generated = min(state.decode_generated, state.decode_limit)
+    percent = 100.0 * generated / state.decode_limit if state.decode_limit else 100.0
+    filled = min(16, max(0, round(percent * 16 / 100)))
+    parts = [f"Decode [{'=' * filled}{'.' * (16 - filled)}] {percent:.1f}%",
+             f"Generated {generated:,}/{state.decode_limit:,}",
+             f"Requests {numeric(state.decode_ready) or 0:.0f}"]
+    if rate_value is not None:
+        parts.append(f"Rolling {rate_value:.1f} tok/s")
+        if rate_value > 0 and generated < state.decode_limit:
+            parts.append(f"ETA {compact_time((state.decode_limit - generated) / rate_value)}")
+    return " | ".join(parts)
+
+
 def header(state: WatchState, gpu: GpuSnapshot, capacity: int, width: int, alive: bool,
            startup: tuple[str, ...] = (), color: bool = False, cpu: str = "CPU -") -> list[str]:
     status = runtime_status(state, gpu, capacity, alive, cpu)
@@ -460,6 +534,9 @@ def header(state: WatchState, gpu: GpuSnapshot, capacity: int, width: int, alive
         lines.extend(color_config(part, color) for part in textwrap.wrap("GPU model " + gpu.model, width))
     lines.extend(color_status(part, color) for part in textwrap.wrap(status, width))
     progress = prefill_status(state)
+    if progress:
+        lines.extend(paint(part, "rate", color) for part in textwrap.wrap(progress, width))
+    progress = decode_status(state)
     if progress:
         lines.extend(paint(part, "rate", color) for part in textwrap.wrap(progress, width))
     lines.extend([paint("Ctrl+C exits this view; it does not stop the HTTP service.", "muted", color),

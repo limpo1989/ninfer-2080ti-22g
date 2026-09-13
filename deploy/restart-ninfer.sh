@@ -24,9 +24,30 @@ DEFAULT_MAX_TOKENS=${NINFER_DEFAULT_MAX_TOKENS:-32768}
 PREFILL_CHUNK=${NINFER_PREFILL_CHUNK:-1024}
 DRAFT_TOKENS=${NINFER_DRAFT_TOKENS:-3}
 TOOL_REPLAY_CACHE_MIB=${NINFER_TOOL_REPLAY_CACHE_MIB:-1024}
-STATE_CACHE_DIR=${NINFER_STATE_CACHE_DIR:-$BUNDLE_ROOT/state-cache}
-STATE_CACHE_MAX_MIB=${NINFER_STATE_CACHE_MAX_MIB:-8192}
-STATE_CACHE_RAM_MIB=${NINFER_STATE_CACHE_RAM_MIB:-4096}
+state_cache_default_dir() {
+    # Keep retained snapshots on the dedicated data volume when it is usable. The bundle-local
+    # directory remains a portable fallback for development and hosts without /data.
+    local preferred=/data/ninfer-state-cache
+    local fallback=$BUNDLE_ROOT/state-cache
+    if [[ -n ${NINFER_STATE_CACHE_DIR:-} ]]; then
+        printf '%s\n' "$NINFER_STATE_CACHE_DIR"
+        return
+    fi
+    if [[ -d /data && -r /data && -x /data ]]; then
+        if [[ ! -d "$preferred" ]]; then
+            mkdir -p -- "$preferred" 2>/dev/null || true
+        fi
+        if [[ -d "$preferred" && -w "$preferred" && -x "$preferred" ]]; then
+            printf '%s\n' "$preferred"
+            return
+        fi
+    fi
+    printf '%s\n' "$fallback"
+}
+
+STATE_CACHE_DIR=$(state_cache_default_dir)
+STATE_CACHE_MAX_MIB=${NINFER_STATE_CACHE_MAX_MIB:-51200}
+STATE_CACHE_RAM_MIB=${NINFER_STATE_CACHE_RAM_MIB:-8192}
 STATE_CACHE_IDLE_MS=${NINFER_STATE_CACHE_IDLE_MS:-1000}
 TURBO_POWER_LIMIT_W=280
 FAN_CURVE_SERVICE=${NINFER_FAN_CURVE_SERVICE:-nvidia-fan-curve.service}
@@ -149,6 +170,8 @@ start_server() {
         sudo nvidia-smi -i 0 --power-limit="$GPU_POWER_LIMIT_W" || return 1
     fi
 
+    printf 'State cache directory: %s\n' "$STATE_CACHE_DIR"
+
     nohup setsid env LD_LIBRARY_PATH="$RUNTIME_LIBRARY_PATH" "$BIN" "$MODEL" \
         --host 0.0.0.0 --port "$PORT" --api-key "$API_KEY" \
         --max-context "$MAX_CONTEXT" --kv-capacity "$KV_CAPACITY" --kv-dtype kvarn \
@@ -211,7 +234,7 @@ watch_metrics() {
     local -a watch_args=()
     pids=$(server_pids)
     [[ -z "$pids" ]] || watch_args+=(--pid "${pids%%$'\n'*}")
-    if [[ -n "$pids" && -f "$MODE_FILE" && "$(<"$MODE_FILE")" == turbo ]]; then
+    if [[ -f "$MODE_FILE" && "$(<"$MODE_FILE")" == turbo ]]; then
         watch_args+=(--turbo)
     fi
     python3 "$SOURCE_ROOT/deploy/watch_ninfer.py" --log "$LOG" --max-concurrency 2 \

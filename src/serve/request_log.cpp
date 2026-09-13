@@ -437,6 +437,12 @@ std::string format_throughput(const ThroughputReport& report) {
             << " prefill_reused=" << report.scheduler.prefill_reused_tokens
             << " prefill_done=" << report.scheduler.prefill_processed_tokens;
     }
+    if (report.scheduler.decode_ready_requests != 0) {
+        out << " decode_id=" << report.scheduler.decode_request_id
+            << " decode_prompt=" << report.scheduler.decode_prompt_tokens
+            << " decode_done=" << report.scheduler.decode_generated_tokens
+            << " decode_limit=" << report.scheduler.decode_output_limit;
+    }
     out << " avg_decode_batch=";
     if (report.decode_rounds == 0) {
         out << "n/a";
@@ -620,6 +626,14 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
                  {"prompt_tokens", report.scheduler.prefill_prompt_tokens},
                  {"reused_tokens", report.scheduler.prefill_reused_tokens},
                  {"processed_tokens", report.scheduler.prefill_processed_tokens}};
+    }
+    record["decode_progress"] = nullptr;
+    if (report.scheduler.decode_ready_requests != 0) {
+        record["decode_progress"] =
+            Json{{"request_id", report.scheduler.decode_request_id},
+                 {"prompt_tokens", report.scheduler.decode_prompt_tokens},
+                 {"generated_tokens", report.scheduler.decode_generated_tokens},
+                 {"output_limit", report.scheduler.decode_output_limit}};
     }
     record["decode_batch"] = Json{{"rounds", report.decode_rounds},
                                   {"row_rounds", report.decode_row_rounds},

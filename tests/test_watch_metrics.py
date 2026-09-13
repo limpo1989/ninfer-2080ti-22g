@@ -11,8 +11,9 @@ import time
 import unittest
 from unittest.mock import patch
 
-from deploy.watch_ninfer import (GpuSnapshot, LogReader, ProcessCpu, RULE, WatchState, frame, gpu_status, launch_lines,
-                                 parse_request, prefill_status, process_alive, row_lines, service_pid)
+from deploy.watch_ninfer import (GpuSnapshot, LogReader, ProcessCpu, RULE, WatchState, decode_status, frame,
+                                 gpu_status, launch_lines, parse_request, prefill_status, process_alive, row_lines,
+                                 service_pid)
 
 
 DONE = ("[2026-09-10 12:00:00.001] [info] ninfer-serve: [req 7] done finish=output_limit "
@@ -96,6 +97,29 @@ class WatchMetricsTest(unittest.TestCase):
                    "running=1 prefilling=1 decode_ready=0 waiting=0 avg_decode_batch=n/a")
         self.assertEqual(prefill_status(state), "Prefill active | Interval 204.8 tok/s")
 
+    def test_live_decode_progress_has_rolling_rate_and_eta(self):
+        state = WatchState()
+        state.feed("throughput interval=5.000s prefill=0.0tok/s decode=10.0tok/s "
+                   "running=1 prefilling=0 decode_ready=1 waiting=0 decode_id=17 "
+                   "decode_prompt=10000 decode_done=50 decode_limit=200 avg_decode_batch=1.00")
+        state.feed("throughput interval=5.000s prefill=0.0tok/s decode=10.0tok/s "
+                   "running=1 prefilling=0 decode_ready=1 waiting=0 decode_id=17 "
+                   "decode_prompt=10000 decode_done=100 decode_limit=200 avg_decode_batch=1.00")
+        progress = decode_status(state)
+        self.assertIn("Decode [========........] 50.0%", progress)
+        self.assertIn("Generated 100/200", progress)
+        self.assertIn("Requests 1", progress)
+        self.assertIn("Rolling 10.0 tok/s", progress)
+        self.assertIn("ETA 10s", progress)
+        view = frame(state, GpuSnapshot(metrics="GPU 90%"), 2, 160, 30, False, True)
+        self.assertIn(progress, view)
+
+    def test_live_decode_falls_back_for_an_old_service_log(self):
+        state = WatchState()
+        state.feed("throughput interval=5.000s prefill=0.0tok/s decode=10.0tok/s "
+                   "running=1 prefilling=0 decode_ready=1 waiting=0 avg_decode_batch=1.00")
+        self.assertEqual(decode_status(state), "Decode active | Interval 10.0 tok/s")
+
     def test_log_follower_handles_partial_lines_truncation_and_rotation(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "serve.log"
@@ -124,8 +148,9 @@ class WatchMetricsTest(unittest.TestCase):
                                   model="/models/qwen.ninfer", max_context=245760,
                                   kv_capacity=245760, max_output=32768, draft_tokens=3,
                                   prefill_chunk=1024, max_concurrency=2,
-                                  tool_replay_cache_mib=1024, state_cache_max_mib=8192,
-                                  state_cache_ram_mib=4096, state_cache_idle_ms=1000,
+                                  tool_replay_cache_mib=1024, state_cache_dir="/data/ninfer-state-cache",
+                                  state_cache_max_mib=51200,
+                                  state_cache_ram_mib=8192, state_cache_idle_ms=1000,
                                   turbo=False)
         startup = tuple(launch_lines(args))
         view = frame(WatchState(), GpuSnapshot(metrics="GPU 0%"), 2, 80, 30, False, False, startup)
@@ -133,6 +158,8 @@ class WatchMetricsTest(unittest.TestCase):
         self.assertIn("Key fixture-key", view)
         self.assertIn("Max output 32,768", view)
         self.assertIn("Turbo OFF", view)
+        self.assertIn("State cache dir /data/ninfer-state-cache", view)
+        self.assertIn("RAM 8,192 MiB / disk 51,200 MiB", view)
         self.assertIn("idle 1,000 ms", view)
         self.assertTrue(all(len(line) <= 80 for line in view.splitlines()))
         args.api_key = ""
