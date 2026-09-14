@@ -493,7 +493,7 @@ performance measurements use 250 W.
 
 Driver 595.99.02 exposes manual fan control through NVML. The tested fan curve keeps the driver's
 84 C target (so temperature control does not lower clocks), runs at 45% through 40 C, and ramps to
-100% at 67 C. Install its system service with:
+100% at 70 C. Install its system service with:
 
 ```bash
 sudo install -m 0755 deploy/nvidia-fan-curve.py /usr/local/sbin/nvidia-fan-curve.py
